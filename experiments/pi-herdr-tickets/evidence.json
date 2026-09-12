@@ -1,0 +1,165 @@
+{
+  "versions": {
+    "pi": "0.85.1",
+    "herdr": "0.8.2"
+  },
+  "manualFreshness": [
+    {
+      "sessionId": "01a09522-3cb6-73f2-8d53-bda651ef6a10",
+      "sessionFile": "/home/vscode/.pi/agent/sessions/--workspaces-astraprojects-matts-course-ai-coding-crash-course--/2026-09-12T10-20-44-087Z_01a09522-3cb6-73f2-8d53-bda651ef6a10.jsonl",
+      "mode": "tui",
+      "pid": 4177789,
+      "historyEntries": 0,
+      "contextTokens": 9043,
+      "answer": "ACKNOWLEDGED."
+    },
+    {
+      "sessionId": "01a09522-e22c-75ed-9dd6-72bf1ab5c508",
+      "sessionFile": "/home/vscode/.pi/agent/sessions/--workspaces-astraprojects-matts-course-ai-coding-crash-course--/2026-09-12T10-21-26-444Z_01a09522-e22c-75ed-9dd6-72bf1ab5c508.jsonl",
+      "mode": "tui",
+      "pid": 4180456,
+      "historyEntries": 0,
+      "contextTokens": 9020,
+      "answer": "NO_PRIOR_CONTEXT"
+    }
+  ],
+  "parallel": {
+    "passed": true,
+    "jobs": 2,
+    "results": [
+      {
+        "name": "smoke-0vxz2hu4-1",
+        "status": "passed",
+        "cwd": "/workspaces/astraprojects/matts-course/ai-coding-crash-course",
+        "tab": "w1:tQ",
+        "pane": "w1:p3D",
+        "sessionFile": "/home/vscode/.pi/agent/sessions/--workspaces-astraprojects-matts-course-ai-coding-crash-course--/2026-09-12T10-25-06-065Z_01a09526-3c10-73f6-82cd-2f99524e3e63.jsonl",
+        "sessionId": "01a09526-3c10-73f6-82cd-2f99524e3e63",
+        "pid": 4194041,
+        "checks": {
+          "normal_tui": true,
+          "empty_history": true,
+          "same_session": true,
+          "session_matches_herdr": true,
+          "single_user_context": true,
+          "one_user_prompt": true,
+          "settled": true,
+          "normal_stop": true,
+          "answer": true,
+          "template_expanded": true,
+          "default_tools_present": true
+        },
+        "contextTokens": 9030,
+        "tabClosed": true
+      },
+      {
+        "name": "smoke-0vxz2hu4-2",
+        "status": "passed",
+        "cwd": "/workspaces/astraprojects/matts-course/ai-coding-crash-course",
+        "tab": "w1:tR",
+        "pane": "w1:p3E",
+        "sessionFile": "/home/vscode/.pi/agent/sessions/--workspaces-astraprojects-matts-course-ai-coding-crash-course--/2026-09-12T10-25-05-339Z_01a09526-393b-716e-8307-6c6c0c8ec718.jsonl",
+        "sessionId": "01a09526-393b-716e-8307-6c6c0c8ec718",
+        "pid": 4193942,
+        "checks": {
+          "normal_tui": true,
+          "empty_history": true,
+          "same_session": true,
+          "session_matches_herdr": true,
+          "single_user_context": true,
+          "one_user_prompt": true,
+          "settled": true,
+          "normal_stop": true,
+          "answer": true,
+          "template_expanded": true,
+          "default_tools_present": true
+        },
+        "contextTokens": 9011,
+        "tabClosed": true
+      }
+    ]
+  },
+  "parallelIntervals": [
+    [
+      "2026-09-12T10:25:09.068Z",
+      "2026-09-12T10:25:13.745Z"
+    ],
+    [
+      "2026-09-12T10:25:08.360Z",
+      "2026-09-12T10:25:11.542Z"
+    ]
+  ],
+  "parallelOverlap": true,
+  "sequential": {
+    "passed": true,
+    "jobs": 1,
+    "results": [
+      {
+        "name": "smoke-yraxpaag-1",
+        "status": "passed",
+        "cwd": "/workspaces/astraprojects/matts-course/ai-coding-crash-course",
+        "tab": "w1:tS",
+        "pane": "w1:p3F",
+        "sessionFile": "/home/vscode/.pi/agent/sessions/--workspaces-astraprojects-matts-course-ai-coding-crash-course--/2026-09-12T10-26-11-014Z_01a09527-39c5-70ba-96bb-0f595f778c7e.jsonl",
+        "sessionId": "01a09527-39c5-70ba-96bb-0f595f778c7e",
+        "pid": 4177,
+        "checks": {
+          "normal_tui": true,
+          "empty_history": true,
+          "same_session": true,
+          "session_matches_herdr": true,
+          "single_user_context": true,
+          "one_user_prompt": true,
+          "settled": true,
+          "normal_stop": true,
+          "answer": true,
+          "template_expanded": true,
+          "default_tools_present": true
+        },
+        "contextTokens": 9013,
+        "tabClosed": true
+      },
+      {
+        "name": "smoke-yraxpaag-2",
+        "status": "passed",
+        "cwd": "/workspaces/astraprojects/matts-course/ai-coding-crash-course",
+        "tab": "w1:tT",
+        "pane": "w1:p3G",
+        "sessionFile": "/home/vscode/.pi/agent/sessions/--workspaces-astraprojects-matts-course-ai-coding-crash-course--/2026-09-12T10-26-18-963Z_01a09527-58d3-74d7-8a60-a8e91e8c9a10.jsonl",
+        "sessionId": "01a09527-58d3-74d7-8a60-a8e91e8c9a10",
+        "pid": 4906,
+        "checks": {
+          "normal_tui": true,
+          "empty_history": true,
+          "same_session": true,
+          "session_matches_herdr": true,
+          "single_user_context": true,
+          "one_user_prompt": true,
+          "settled": true,
+          "normal_stop": true,
+          "answer": true,
+          "template_expanded": true,
+          "default_tools_present": true
+        },
+        "contextTokens": 9013,
+        "tabClosed": true
+      }
+    ]
+  },
+  "initialParallelFailure": {
+    "evidence": "/tmp/pi-herdr-smoke-6ws21aj1",
+    "error": "agent_pane_busy",
+    "resolution": "Inspected shell-only foreground, closed owned failed tab, added shell preflight and reran successfully."
+  },
+  "checks": {
+    "pythonUnitTests": 10,
+    "observerTypecheck": "passed"
+  },
+  "limitations": [
+    "No real ticket implemented",
+    "No GitHub mutations",
+    "No parallel code writers",
+    "No production acceptance or merge gate",
+    "Model context quality threshold not measured"
+  ]
+}
