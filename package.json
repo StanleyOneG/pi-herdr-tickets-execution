@@ -1,0 +1,37 @@
+{
+  "name": "pi-herdr-controller",
+  "version": "0.1.0",
+  "description": "Durable preparation and execution controller for fresh-context Pi ticket batches in Herdr",
+  "type": "module",
+  "keywords": ["pi-package", "pi", "herdr"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/StanleyOneG/pi-herdr-tickets-execution.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "os": ["linux", "darwin"],
+  "files": ["src", "README.md", "LICENSE"],
+  "pi": {
+    "extensions": ["./src/extension.ts"]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/**/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.85.1",
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typebox": "^1.0.0",
+    "typescript": "^5.7.0"
+  }
+}
