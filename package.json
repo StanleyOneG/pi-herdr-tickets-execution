@@ -10,7 +10,7 @@
     "url": "https://github.com/StanleyOneG/pi-herdr-tickets-execution.git"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.19.0"
   },
   "os": ["linux", "darwin"],
   "files": ["src", "README.md", "LICENSE"],

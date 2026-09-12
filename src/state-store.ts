@@ -1,19 +1,27 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import { mkdir, open, rename, unlink } from "node:fs/promises";
 import { dirname } from "node:path";
 
 import type { ControllerState, ControllerStateStore } from "./contracts.js";
+import { isControllerState } from "./state-validation.js";
+
+const MAX_STATE_BYTES = 5 * 1024 * 1024;
 
 export class JsonControllerStateStore implements ControllerStateStore {
   constructor(private readonly statePath: string) {}
 
   async load(): Promise<ControllerState> {
     try {
-      const parsed = JSON.parse(await readFile(this.statePath, "utf8")) as ControllerState;
-      if (parsed.schemaVersion !== 1 || !Array.isArray(parsed.preparations) || !Array.isArray(parsed.executionAttempts)) {
-        throw new Error("Unsupported controller state");
+      const file = await open(this.statePath, "r");
+      try {
+        const metadata = await file.stat();
+        if (metadata.size > MAX_STATE_BYTES) throw new Error("Controller state exceeds its storage bound");
+        const parsed: unknown = JSON.parse(await file.readFile("utf8"));
+        if (!isControllerState(parsed)) throw new Error("Controller state is malformed or unsupported");
+        return parsed;
+      } finally {
+        await file.close();
       }
-      return parsed;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         return { schemaVersion: 1, preparations: [], executionAttempts: [] };
@@ -23,13 +31,19 @@ export class JsonControllerStateStore implements ControllerStateStore {
   }
 
   async save(state: ControllerState): Promise<void> {
+    if (!isControllerState(state)) throw new Error("Refusing to persist invalid controller state");
+    const serialized = `${JSON.stringify(state, null, 2)}\n`;
+    if (Buffer.byteLength(serialized, "utf8") > MAX_STATE_BYTES) {
+      throw new Error("Controller state exceeds its storage bound");
+    }
+
     await mkdir(dirname(this.statePath), { recursive: true });
     const temporary = `${this.statePath}.${process.pid}.${randomUUID()}.tmp`;
     let renamed = false;
     try {
       const file = await open(temporary, "wx", 0o600);
       try {
-        await file.writeFile(`${JSON.stringify(state, null, 2)}\n`, "utf8");
+        await file.writeFile(serialized, "utf8");
         await file.sync();
       } finally {
         await file.close();

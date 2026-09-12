@@ -18,24 +18,27 @@ import {
   type BatchProposal,
   type CapturedModel,
   type ControllerResult,
+  type PreparationRecord,
 } from "./controller.js";
+import { formatPreparationPreview } from "./presentation.js";
 import { JsonControllerStateStore } from "./state-store.js";
 
-const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
-const sourceEvidenceSchema = Type.Object({
+const LOCAL_ACTOR_CAPABILITY = Symbol("Pi extension local actor");
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+const SOURCE_EVIDENCE_SCHEMA = Type.Object({
   identity: Type.String({ minLength: 1 }),
   revision: Type.String({ minLength: 1 }),
   contentDigest: Type.String({ pattern: "^[a-fA-F0-9]{64}$" }),
   retrievedAt: Type.String({ minLength: 1 }),
   references: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
 });
-const modelSchema = Type.Object({
+const MODEL_SCHEMA = Type.Object({
   provider: Type.String({ minLength: 1 }),
   id: Type.String({ minLength: 1 }),
-  thinkingLevel: StringEnum(thinkingLevels),
+  thinkingLevel: StringEnum(THINKING_LEVELS),
   contextWindow: Type.Integer({ minimum: 40_000 }),
 });
-const proposalSchema = Type.Object({
+const PROPOSAL_SCHEMA = Type.Object({
   schemaVersion: Type.Integer({ minimum: 1, maximum: 1 }),
   controllerName: Type.String({ minLength: 1 }),
   project: Type.Object({
@@ -46,7 +49,7 @@ const proposalSchema = Type.Object({
       instructionEvidenceIdentities: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
     }),
   }),
-  sourceEvidence: Type.Array(sourceEvidenceSchema, { minItems: 1 }),
+  sourceEvidence: Type.Array(SOURCE_EVIDENCE_SCHEMA, { minItems: 1 }),
   spec: Type.Object({
     identity: Type.String({ minLength: 1 }),
     title: Type.String({ minLength: 1 }),
@@ -71,7 +74,7 @@ const proposalSchema = Type.Object({
     }),
   ),
   target: Type.Object({ branch: Type.String({ minLength: 1 }), baseCommit: Type.String({ minLength: 1 }) }),
-  model: modelSchema,
+  model: MODEL_SCHEMA,
   policy: Type.Object({
     concurrency: Type.Integer({ minimum: 1 }),
     context: Type.Object({
@@ -108,19 +111,19 @@ const proposalSchema = Type.Object({
   ambiguities: Type.Array(Type.String({ minLength: 1 })),
 });
 
-const submitSchema = Type.Object({
+const SUBMIT_SCHEMA = Type.Object({
   preparationId: Type.String({ minLength: 1 }),
-  proposal: proposalSchema,
+  proposal: PROPOSAL_SCHEMA,
 });
-type SubmitInput = Static<typeof submitSchema>;
+type SubmitInput = Static<typeof SUBMIT_SCHEMA>;
 
-const preparationIdSchema = Type.Object({ preparationId: Type.String({ minLength: 1 }) });
-type PreparationIdInput = Static<typeof preparationIdSchema>;
-const approveSchema = Type.Object({
+const PREPARATION_ID_SCHEMA = Type.Object({ preparationId: Type.String({ minLength: 1 }) });
+type PreparationIdInput = Static<typeof PREPARATION_ID_SCHEMA>;
+const APPROVE_SCHEMA = Type.Object({
   preparationId: Type.String({ minLength: 1 }),
-  evidence: Type.Array(sourceEvidenceSchema, { minItems: 1 }),
+  evidence: Type.Array(SOURCE_EVIDENCE_SCHEMA, { minItems: 1 }),
 });
-type ApproveInput = Static<typeof approveSchema>;
+type ApproveInput = Static<typeof APPROVE_SCHEMA>;
 
 async function commandOutput(pi: ExtensionAPI, command: string, args: string[], cwd?: string): Promise<string | undefined> {
   try {
@@ -194,8 +197,8 @@ async function inspectAdmission(
   ]);
   const available = ctx.modelRegistry
     .getAvailable()
-    .some((item) => item.provider === model.provider && item.id === model.id);
-  const instructionFiles = (ctx.getSystemPromptOptions().contextFiles ?? []).map((file) => file.path);
+    .some((item): boolean => item.provider === model.provider && item.id === model.id);
+  const instructionFiles = (ctx.getSystemPromptOptions().contextFiles ?? []).map((file): string => file.path);
   const snapshot: AdmissionSnapshot = {
     project: {
       root: git.root,
@@ -209,7 +212,7 @@ async function inspectAdmission(
       ...(piVersion ? { piVersion } : {}),
       ...(herdrVersion ? { herdrVersion } : {}),
       projectTrusted: ctx.isProjectTrusted(),
-      skillCommands: pi.getCommands().filter((command) => command.source === "skill").map((command) => command.name),
+      skillCommands: pi.getCommands().filter((command): boolean => command.source === "skill").map((command): string => command.name),
       toolNames: pi.getActiveTools(),
     },
     model: {
@@ -223,8 +226,10 @@ async function inspectAdmission(
 
 function createController(statePath: string): PreparationController {
   return new PreparationController(new JsonControllerStateStore(statePath), {
+    actorCapability: LOCAL_ACTOR_CAPABILITY,
     now: (): Date => new Date(),
     generateId: (): string => randomUUID(),
+    formatPreview: (record: PreparationRecord): string => formatPreparationPreview(record),
   });
 }
 
@@ -287,7 +292,11 @@ export default function herdrPreparationExtension(pi: ExtensionAPI): void {
         const controllerName = await ctx.ui.input("Controller name", suggestedName);
         if (!controllerName) return;
         const record = unwrapResult(
-          await inspected.controller.prepare({ specReference, controllerName }, inspected.snapshot),
+          await inspected.controller.prepare(
+            LOCAL_ACTOR_CAPABILITY,
+            { specReference, controllerName },
+            inspected.snapshot,
+          ),
         );
         await pi.sendUserMessage(
           preparationPrompt(record.id, specReference, inspected.snapshot.project.instructionFiles),
@@ -314,15 +323,18 @@ export default function herdrPreparationExtension(pi: ExtensionAPI): void {
     description: "Show durable Herdr preparation status",
     handler: async (_args: string, ctx: ExtensionCommandContext): Promise<void> => {
       try {
-        const status = unwrapResult(await (await controllerFor(pi, ctx)).status());
+        const status = unwrapResult(
+          await (await controllerFor(pi, ctx)).status(LOCAL_ACTOR_CAPABILITY, { limit: 50 }),
+        );
         if (status.preparations.length === 0) {
           ctx.ui.notify("No Herdr preparations in this repository", "info");
           return;
         }
+        const records = status.preparations
+          .map((record): string => `${record.id} ${record.stage} ${record.controllerName}${record.proposalDigest ? ` ${record.proposalDigest.slice(0, 12)}` : ""}`)
+          .join("\n");
         ctx.ui.notify(
-          status.preparations
-            .map((record) => `${record.id} ${record.stage} ${record.controllerName}${record.proposalDigest ? ` ${record.proposalDigest.slice(0, 12)}` : ""}`)
-            .join("\n"),
+          status.hasMore ? `${records}\nMore preparations are available through the paginated controller status interface.` : records,
           "info",
         );
       } catch (error) {
@@ -335,7 +347,7 @@ export default function herdrPreparationExtension(pi: ExtensionAPI): void {
     name: "herdr_get_preparation",
     label: "Get Herdr Preparation",
     description: "Read one durable preparation so a reasoning session can inspect and revalidate its frozen proposal. Credentials and transcripts are never stored here.",
-    parameters: preparationIdSchema,
+    parameters: PREPARATION_ID_SCHEMA,
     async execute(
       _toolCallId: string,
       params: PreparationIdInput,
@@ -343,9 +355,9 @@ export default function herdrPreparationExtension(pi: ExtensionAPI): void {
       _onUpdate: AgentToolUpdateCallback<unknown> | undefined,
       ctx: ExtensionContext,
     ): Promise<AgentToolResult<unknown>> {
-      const status = unwrapResult(await (await controllerFor(pi, ctx)).status());
-      const record = status.preparations.find((item) => item.id === params.preparationId);
-      if (!record) throw new Error("Unknown preparation ID");
+      const record = unwrapResult(
+        await (await controllerFor(pi, ctx)).getPreparation(LOCAL_ACTOR_CAPABILITY, params.preparationId),
+      );
       return {
         content: [{ type: "text", text: JSON.stringify(record, null, 2) }],
         details: { preparationId: record.id, stage: record.stage },
@@ -357,7 +369,7 @@ export default function herdrPreparationExtension(pi: ExtensionAPI): void {
     name: "herdr_submit_batch_proposal",
     label: "Submit Herdr Batch Proposal",
     description: "Submit the selected spec's complete structured batch proposal for deterministic validation and durable preview. This never starts workers or mutates a tracker.",
-    parameters: submitSchema,
+    parameters: SUBMIT_SCHEMA,
     async execute(
       _toolCallId: string,
       params: SubmitInput,
@@ -367,9 +379,13 @@ export default function herdrPreparationExtension(pi: ExtensionAPI): void {
     ): Promise<AgentToolResult<unknown>> {
       const controller = await controllerFor(pi, ctx);
       const record = unwrapResult(
-        await controller.submitProposal(params.preparationId, params.proposal as unknown as BatchProposal),
+        await controller.submitProposal(
+          LOCAL_ACTOR_CAPABILITY,
+          params.preparationId,
+          params.proposal as unknown as BatchProposal,
+        ),
       );
-      const text = unwrapResult(await controller.preview(record.id));
+      const text = unwrapResult(await controller.preview(LOCAL_ACTOR_CAPABILITY, record.id));
       ctx.ui.notify(text, "info");
       return { content: [{ type: "text", text }], details: { preparationId: record.id, proposalDigest: record.proposalDigest } };
     },
@@ -379,7 +395,7 @@ export default function herdrPreparationExtension(pi: ExtensionAPI): void {
     name: "herdr_approve_batch",
     label: "Approve Herdr Batch",
     description: "Validate freshly retrieved source versions, content digests, canonical references, and retrieval ordering; show the frozen preview; ask the human for explicit approval; and durably record it. This never starts workers.",
-    parameters: approveSchema,
+    parameters: APPROVE_SCHEMA,
     async execute(
       _toolCallId: string,
       params: ApproveInput,
@@ -389,9 +405,11 @@ export default function herdrPreparationExtension(pi: ExtensionAPI): void {
     ): Promise<AgentToolResult<unknown>> {
       if (!ctx.hasUI) throw new Error("Batch approval requires an interactive Pi or RPC UI");
       const controller = await controllerFor(pi, ctx);
-      const status = unwrapResult(await controller.status());
-      const proposed = status.preparations.find((item) => item.id === params.preparationId);
-      if (!proposed?.proposal) throw new Error("Preparation has no proposal to approve");
+      const proposed = unwrapResult(
+        await controller.getPreparation(LOCAL_ACTOR_CAPABILITY, params.preparationId),
+      );
+      if (!proposed.proposal || !proposed.proposalDigest) throw new Error("Preparation has no proposal to approve");
+      const proposalDigest = proposed.proposalDigest;
       const approvedBy = await ctx.ui.input("Record approval author", "local developer");
       if (!approvedBy) {
         return { content: [{ type: "text", text: "Approval cancelled; an author is required." }], details: {} };
@@ -399,17 +417,22 @@ export default function herdrPreparationExtension(pi: ExtensionAPI): void {
       const git = await gitContext(pi, ctx.cwd);
       const request: ApprovalRequest = {
         approvedBy,
+        proposalDigest,
         projectHead: git.head,
         model: capturedModel(pi, ctx),
         evidence: params.evidence,
       };
-      const validated = unwrapResult(await controller.validateApproval(params.preparationId, request));
-      const text = unwrapResult(await controller.preview(validated.id));
+      const validated = unwrapResult(
+        await controller.validateApproval(LOCAL_ACTOR_CAPABILITY, params.preparationId, request),
+      );
+      const text = formatPreparationPreview(validated);
       const confirmed = await ctx.ui.confirm("Approve this exact Herdr batch?", text);
       if (!confirmed) {
         return { content: [{ type: "text", text: "Approval cancelled; the proposal remains unapproved." }], details: {} };
       }
-      const approved = unwrapResult(await controller.approve(params.preparationId, request));
+      const approved = unwrapResult(
+        await controller.approve(LOCAL_ACTOR_CAPABILITY, params.preparationId, request),
+      );
       const result = `Approved ${approved.controllerName} at ${approved.approved?.approvedAt}; proposal ${approved.proposalDigest}. No worker was started.`;
       return { content: [{ type: "text", text: result }], details: { preparationId: approved.id, proposalDigest: approved.proposalDigest } };
     },

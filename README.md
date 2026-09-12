@@ -7,14 +7,14 @@ A Git-installable Pi package for preparing a fixed, reviewable ticket batch befo
 The preparation extension requires:
 
 - Linux, macOS, or a compatible Linux devcontainer
-- Node.js 20 or newer
+- Node.js 22.19.0 or newer (the minimum required by Pi 0.85.1)
 - Pi `>=0.85.1` with active `read`, `bash`, `herdr_get_preparation`, `herdr_submit_batch_proposal`, and `herdr_approve_batch` tools
 - Herdr `>=0.8.2` available as `herdr`
 - a Git repository with a branch and at least one commit
 - a trusted Pi project
 - a selected, authenticated Pi model with a viable context window
 - the installed native skill commands `/skill:implement`, `/skill:tdd`, `/skill:code-review`, and `/skill:handoff`
-- a loaded project instruction chain that explains the project's tracker workflow
+- a loaded project instruction chain that explains the project's tracker workflow; Pi-loaded repository files and applicable ancestor `AGENTS*`/`CLAUDE*` files are accepted, while unrelated context files are not
 
 Preparation uses the model and thinking level effective in the current Pi session. If no session override was selected, these are Pi's global defaults. It never substitutes another model when the selected model or its authentication is unavailable.
 
@@ -87,7 +87,7 @@ Approve a proposed preparation by ID:
 /herdr-approve <preparation-id>
 ```
 
-This asks the reasoning session to re-read all approved sources through the configured tracker workflow. The controller compares the exact current source set, tracker versions, content digests, canonical references, Git base, model, thinking level, and proposal digest. Revalidation must have a newer retrieval timestamp; an equal or older timestamp is stale. New tickets, changed requirements, changed instruction/check evidence, or changed scope invalidate approval. Only after validation does the extension present the frozen preview and ask for an explicit approval and author. Approval is written atomically before success is reported.
+This asks the reasoning session to re-read all approved sources through the configured tracker workflow. The controller compares the exact current source set, tracker versions, content digests, canonical references, Git base, model, thinking level, and proposal digest. Revalidation must have a newer retrieval timestamp; an equal or older timestamp is stale. New tickets, changed requirements, changed instruction/check evidence, or changed scope invalidate approval. The approval request carries the digest loaded before the UI prompt; the final durable approval rejects the request if another proposal was submitted while Pi awaited the author or confirmation. Only after validation does the extension present that exact frozen preview and ask for explicit approval and attribution. Approval is written atomically before success is reported.
 
 Preparation and approval never invoke `/skill:implement`, start a Herdr process, modify tracker state, or create an execution attempt.
 
@@ -99,7 +99,9 @@ State is stored with mode `0600` under the repository's Git common directory:
 <git-common-dir>/herdr/controller-state.json
 ```
 
-This works for ordinary repositories and linked worktrees without adding a tracked project file. Writes use a synced temporary file and atomic rename. Proposal state stores model identity and authentication outcome only. It does not store API keys, resolved headers, credential environment, or full model transcripts. Credential-looking substrings are redacted from admission diagnostics.
+This works for ordinary repositories and linked worktrees without adding a tracked project file. Writes use a synced temporary file and atomic rename. Reads validate every persisted preparation and nested proposal before returning data; malformed, inconsistent, oversized, or unsupported state fails closed with a sanitized storage Result. The schema remains version 1, so existing valid state is preserved. To keep both storage reads and collection queries bounded in this preparation-only release, one state file accepts at most 100 preparations and 5 MiB, and the public status interface requires opaque-cursor pagination with at most 50 records per page. Further preparation is rejected explicitly at capacity; archive the state file only after retaining any approval record you need. `/herdr-status` displays the first bounded page and reports when more records exist.
+
+Proposal state stores model identity and authentication outcome only. It does not store API keys, resolved headers, credential environment, or full model transcripts. Credential-looking substrings are redacted from admission diagnostics.
 
 Back up the Git common directory if approved preparation records must survive repository loss. Restore it only with the matching repository and verify `/herdr-status` before relying on an approval.
 
@@ -123,4 +125,5 @@ pi -e . --list-models
 - Tracker evidence is collected and content-digested by the reasoning session using project-provided prose instructions. The controller deterministically compares submitted identities, versions, content digests, canonical references, and retrieval ordering. This is an epistemic guard over the evidence the model supplied; it is **not** independent backend verification, because an arbitrary prose-defined tracker has no deterministic adapter here. Human approval must assess whether the evidence and references are credible.
 - Authentication admission resolves the selected provider configuration without logging the result. It does not make an extra billable model probe; the preparation reasoning request remains the practical end-to-end provider check.
 - The preparation store assumes one local writer process. This ticket does not provide the persistent multi-process execution daemon or leases needed by worker execution.
+- Public controller operations require an in-process capability held by the installed Pi extension. This prevents model-issued calls or unrelated in-process callers from asserting an actor name; `approvedBy` remains audit attribution, not authentication. It does not add remote login, authenticate other operating-system processes, or claim an OS sandbox.
 - Platform declarations cover Linux and macOS. Native Windows is not supported.

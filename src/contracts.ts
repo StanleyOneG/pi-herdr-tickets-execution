@@ -128,13 +128,26 @@ export interface PreparationRecord {
   approved?: ApprovalRecord;
 }
 
+export const MAX_PREPARATIONS = 100;
+export const MAX_STATUS_PAGE_SIZE = 50;
+
 export interface ControllerState {
   schemaVersion: 1;
   preparations: PreparationRecord[];
   executionAttempts: never[];
 }
 
-export type ControllerStatus = ControllerState;
+export interface PaginationRequest {
+  limit: number;
+  cursor?: string;
+}
+
+export interface ControllerStatus {
+  preparations: PreparationRecord[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  executionAttempts: never[];
+}
 
 export interface ControllerStateStore {
   load(): Promise<ControllerState>;
@@ -143,12 +156,19 @@ export interface ControllerStateStore {
 
 export interface ApprovalRequest {
   approvedBy: string;
+  proposalDigest: string;
   projectHead: string;
   model: CapturedModel;
   evidence: SourceEvidence[];
 }
 
-export type ControllerErrorCode = "admission" | "proposal-validation" | "stale-approval" | "storage";
+export type ControllerErrorCode =
+  | "admission"
+  | "authorization"
+  | "proposal-validation"
+  | "query-validation"
+  | "stale-approval"
+  | "storage";
 
 export interface ControllerError {
   code: ControllerErrorCode;
@@ -159,7 +179,11 @@ export type ControllerResult<T> =
   | { ok: true; value: T }
   | { ok: false; error: ControllerError };
 
+export type LocalActorCapability = symbol;
+
 export interface ControllerDependencies {
+  actorCapability: LocalActorCapability;
   now: () => Date;
   generateId: () => string;
+  formatPreview: (record: PreparationRecord) => string;
 }

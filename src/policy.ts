@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { isAbsolute, normalize, relative } from "node:path";
+import { basename, dirname, isAbsolute, normalize, relative } from "node:path";
 
 import type {
   AdmissionSnapshot,
@@ -24,14 +24,22 @@ export const REQUIRED_SKILL_COMMANDS = [
   "skill:tdd",
 ] as const;
 
+const INSTRUCTION_FILE_NAMES = new Set([
+  "AGENTS.override.md",
+  "AGENTS.md",
+  "AGENTS.MD",
+  "CLAUDE.md",
+  "CLAUDE.MD",
+]);
+
 export function digest(value: unknown): string {
   function canonical(item: unknown): unknown {
     if (Array.isArray(item)) return item.map(canonical);
     if (item && typeof item === "object") {
       return Object.fromEntries(
         Object.entries(item as Record<string, unknown>)
-          .sort(([left], [right]) => left.localeCompare(right))
-          .map(([key, child]) => [key, canonical(child)]),
+          .sort(([left], [right]): number => left.localeCompare(right))
+          .map(([key, child]): [string, unknown] => [key, canonical(child)]),
       );
     }
     return item;
@@ -41,6 +49,19 @@ export function digest(value: unknown): string {
 
 export function normalizeControllerName(name: string): string {
   return name.normalize("NFKC").trim().replace(/\s+/g, " ").toLocaleLowerCase("en-US");
+}
+
+export function hasApprovedControllerNameCollision(
+  preparations: PreparationRecord[],
+  controllerName: string,
+  excludedPreparationId?: string,
+): boolean {
+  const normalizedName = normalizeControllerName(controllerName);
+  return preparations.some((item): boolean =>
+    item.id !== excludedPreparationId &&
+    item.stage === "approved" &&
+    normalizeControllerName(item.controllerName) === normalizedName
+  );
 }
 
 export function calculateContextLimit(
@@ -61,15 +82,23 @@ export function validateAdmission(snapshot: AdmissionSnapshot): string[] {
   if (snapshot.runtime.platform !== "linux" && snapshot.runtime.platform !== "darwin") {
     failures.push(`Unsupported platform: ${snapshot.runtime.platform as string}`);
   }
-  const missingSkills = REQUIRED_SKILL_COMMANDS.filter((command) => !snapshot.runtime.skillCommands.includes(command));
+  const missingSkills = REQUIRED_SKILL_COMMANDS.filter(
+    (command): boolean => !snapshot.runtime.skillCommands.includes(command),
+  );
   if (missingSkills.length > 0) {
-    failures.push(`Missing native skill commands: ${missingSkills.map((name) => `/${name}`).join(", ")}`);
+    failures.push(`Missing native skill commands: ${missingSkills.map((name): string => `/${name}`).join(", ")}`);
   }
-  const missingTools = REQUIRED_TOOL_NAMES.filter((tool) => !snapshot.runtime.toolNames.includes(tool));
+  const missingTools = REQUIRED_TOOL_NAMES.filter(
+    (tool): boolean => !snapshot.runtime.toolNames.includes(tool),
+  );
   if (missingTools.length > 0) failures.push(`Missing required Pi tools: ${missingTools.join(", ")}`);
-  const hasProjectInstruction = snapshot.project.instructionFiles.some((file) => {
+  const hasProjectInstruction = snapshot.project.instructionFiles.some((file): boolean => {
+    if (!INSTRUCTION_FILE_NAMES.has(basename(file))) return false;
     const projectRelative = relative(snapshot.project.root, file);
-    return projectRelative !== "" && !projectRelative.startsWith("..") && !isAbsolute(projectRelative);
+    const projectContainsFile = projectRelative !== "" && !projectRelative.startsWith("..") && !isAbsolute(projectRelative);
+    const instructionRelative = relative(dirname(file), snapshot.project.root);
+    const fileDirectoryContainsProject = !instructionRelative.startsWith("..") && !isAbsolute(instructionRelative);
+    return projectContainsFile || fileDirectoryContainsProject;
   });
   if (!hasProjectInstruction) failures.push("No execution-project instruction file was loaded");
   if (!snapshot.model.authenticated) {
@@ -162,19 +191,26 @@ export function approvalFailures(
   }
   const failures: string[] = [];
   if (!request.approvedBy.trim()) failures.push("Approval author is required");
+  if (request.proposalDigest !== record.proposalDigest) {
+    failures.push("Proposal changed after the approval preview; review and confirm the current proposal");
+  }
   if (request.projectHead !== record.project.head) failures.push("Git base changed since proposal");
   if (digest(request.model) !== digest(record.model)) failures.push("Selected model or thinking level changed since proposal");
-  const normalizedName = normalizeControllerName(record.controllerName);
-  if (
-    preparations.some(
-      (item) => item.id !== record.id && item.stage === "approved" && normalizeControllerName(item.controllerName) === normalizedName,
-    )
-  ) {
+  if (hasApprovedControllerNameCollision(preparations, record.controllerName, record.id)) {
     failures.push(`Controller name collides with an approved batch: ${record.controllerName}`);
   }
 
-  const expected = uniqueEvidence(collectProposalEvidence(record.proposal));
-  const current = uniqueEvidence(request.evidence, failures);
+  failures.push(...approvalEvidenceFailures(record.proposal.sourceEvidence, request.evidence));
+  return failures;
+}
+
+export function approvalEvidenceFailures(
+  proposalEvidence: SourceEvidence[],
+  approvalEvidence: SourceEvidence[],
+): string[] {
+  const failures: string[] = [];
+  const expected = uniqueEvidence(proposalEvidence);
+  const current = uniqueEvidence(approvalEvidence, failures);
   for (const [identity, source] of expected) {
     const observed = current.get(identity);
     if (!observed) {
@@ -197,18 +233,8 @@ export function approvalFailures(
   for (const identity of current.keys()) {
     if (!expected.has(identity)) failures.push(`Approval evidence includes unapproved scope: ${identity}`);
   }
-  for (const source of request.evidence) failures.push(...evidenceFailures(`Approval source ${source.identity}`, source));
+  for (const source of approvalEvidence) failures.push(...evidenceFailures(`Approval source ${source.identity}`, source));
   return failures;
-}
-
-export function collectProposalEvidence(proposal: BatchProposal): SourceEvidence[] {
-  return proposal.sourceEvidence;
-}
-
-export function formatSetupOperation(operation: BatchProposal["policy"]["setupOperations"][number]): string {
-  if (operation.kind === "dependency-install") return `${operation.packageManager} install (${operation.mode})`;
-  if (operation.kind === "environment-template") return `copy template ${operation.source} -> ${operation.destination}`;
-  return `${operation.packageManager} run ${operation.script} (${operation.environment})`;
 }
 
 function uniqueEvidence(evidence: SourceEvidence[], failures?: string[]): Map<string, SourceEvidence> {
@@ -224,10 +250,10 @@ function sourceReferenceFailures(proposal: BatchProposal, sourceIds: Set<string>
   const failures: string[] = [];
   const referenced = [
     proposal.spec.evidenceIdentity,
-    ...proposal.tickets.map((ticket) => ticket.evidenceIdentity),
+    ...proposal.tickets.map((ticket): string => ticket.evidenceIdentity),
     ...proposal.project.tracker.instructionEvidenceIdentities,
-    ...proposal.dependencies.flatMap((dependency) => dependency.evidenceIdentity ? [dependency.evidenceIdentity] : []),
-    ...proposal.policy.checks.map((check) => check.evidenceIdentity),
+    ...proposal.dependencies.flatMap((dependency): string[] => dependency.evidenceIdentity ? [dependency.evidenceIdentity] : []),
+    ...proposal.policy.checks.map((check): string => check.evidenceIdentity),
   ];
   for (const identity of new Set(referenced)) {
     if (!sourceIds.has(identity)) failures.push(`Missing source evidence identity: ${identity}`);
