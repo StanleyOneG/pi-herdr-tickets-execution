@@ -6,12 +6,37 @@ export const WORKER_BRIDGE_AGENT_ENV = "HERDR_WORKER_BRIDGE_AGENT_NAME";
 export const WORKER_DECISION_REQUEST_DIRECTORY_ENV = "HERDR_WORKER_DECISION_REQUEST_DIRECTORY";
 export const WORKER_DECISION_RESPONSE_DIRECTORY_ENV = "HERDR_WORKER_DECISION_RESPONSE_DIRECTORY";
 export const WORKER_READINESS_COMMAND = "/herdr-worker-ready";
+export const WORKER_REVIEW_ENDPOINT_ENV = "HERDR_WORKER_REVIEW_ENDPOINT";
+export const WORKER_REVIEW_NONCE_ENV = "HERDR_WORKER_REVIEW_NONCE";
 
 export interface WorkerBridgeChannel {
   endpoint: string;
   nonce: string;
   requestDirectory?: string;
   responseDirectory?: string;
+  lifecycleEndpoint?: string;
+  reviewEndpoint?: string;
+}
+
+export interface WorkerLifecycleReceipt {
+  schemaVersion: 1;
+  nonce: string;
+  sessionId: string;
+  state: "working" | "settled";
+  observedAt: string;
+  outstandingJobs: string[];
+}
+
+export interface WorkerReviewReceipt {
+  schemaVersion: 1;
+  nonce: string;
+  sessionId: string;
+  kind: "standards" | "spec";
+  verdict: "passed" | "blocked";
+  candidateCommit: string;
+  reviewBase: string;
+  findings: string[];
+  completedAt: string;
 }
 
 export interface WorkerDecisionRequest {
@@ -74,4 +99,6 @@ export interface WorkerBridgeTransport {
   nextDecisionRequest?(channel: WorkerBridgeChannel): Promise<WorkerDecisionRequest | undefined>;
   acknowledgeDecisionRequest?(channel: WorkerBridgeChannel, decisionId: string): Promise<void>;
   deliverDecision?(channel: WorkerBridgeChannel, answer: WorkerDecisionAnswer): Promise<void>;
+  readLifecycle?(channel: WorkerBridgeChannel): Promise<WorkerLifecycleReceipt | undefined>;
+  waitForReview?(channel: WorkerBridgeChannel, timeoutMs: number): Promise<WorkerReviewReceipt>;
 }

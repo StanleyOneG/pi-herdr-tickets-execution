@@ -1,6 +1,6 @@
 # Pi Herdr controller
 
-A Git-installable Pi package for preparing a fixed, reviewable ticket batch and durably controlling one approved ticket attempt. The package includes a detached local controller daemon, private IPC client, production Git and Herdr/Pi adapters, an attempt-bound readiness and decision bridge, and Pi dashboard commands for execution and takeover. The controller does **not** integrate branches, accept completed work, update tickets, or mutate a parent spec.
+A Git-installable Pi package for preparing a fixed, reviewable ticket batch, durably controlling approved ticket attempts, and accepting exact candidates through serialized batch integration. The package includes a detached local controller daemon, private IPC client, production Git and Herdr/Pi adapters, independent gate execution, attempt-bound lifecycle/review/decision bridges, and Pi dashboard commands. Acceptance never updates or closes tracker issues, mutates a parent spec, repairs conflicts automatically, or merges a final delivery request.
 
 ## Runtime support
 
@@ -93,11 +93,12 @@ Preparation and approval never invoke `/skill:implement`, start a Herdr process,
 
 ## Durable execution controller interface
 
-`PreparationController` preserves the preparation API and adds one capability-gated execution seam:
+`PreparationController` preserves the preparation API and adds one capability-gated execution and acceptance seam:
 
 - `startTicket`, `attachAttempt`, `pauseAttempt`, and `resumeAttempt`;
 - `takeOverAttempt` and `returnAttempt`;
 - `answerDecision` and `recordWorkerObservation`;
+- `captureCandidate` and `acceptCandidate`;
 - `controllerRestarted`; and
 - the existing cursor-bounded `status`, now including bounded execution attempts, decisions, diagnostics, session identities, and artifact references.
 
@@ -137,6 +138,8 @@ pauseAttempt(request) / resumeAttempt(request)
 takeOverAttempt(request) / returnAttempt(request)
 answerDecision(request)
 recordWorkerObservation(request)
+captureCandidate(request)
+acceptCandidate(request)
 ```
 
 On every daemon-process start, previously executing attempts move to `restart-required` without any Git, Herdr, Pi, or model action. Only an explicit `resumeAttempt` or `returnAttempt` can continue automation, after the controller rechecks exact Git and worker ownership. A startup or dispatch whose result is ambiguous remains non-executing and requires later recovery rather than an inferred retry.
@@ -151,6 +154,7 @@ Run execution commands from a normal interactive Pi session in the approved proj
 
 ```text
 /herdr-start <preparation-id> <approved-ticket-identity>
+/herdr-accept <attempt-id>
 /herdr-status
 /herdr-questions [attempt-id]
 /herdr-attach <attempt-id>
@@ -164,6 +168,12 @@ Run execution commands from a normal interactive Pi session in the approved proj
 `/herdr-status` shows a bounded, human-readable page of preparation and attempt lifecycles, exact worktree/Herdr/session references, artifacts, diagnostics, and unresolved decisions. It updates a Pi footer status and widget and uses local UI notifications; routine controller events are not appended to the model conversation. `/herdr-questions` narrows that view to unresolved questions with their context, options, and recommendation. `/herdr-answer` asks for answer attribution, then records the first explicit answer durably before the daemon attempts delivery.
 
 `/herdr-attach` validates Git and exact worker ownership through the daemon and focuses the owned Herdr agent without changing automation state. It also prints the non-takeover `herdr agent attach <owned-name>` command for a separate terminal. `/herdr-takeover` first durably pauses automation for that attempt, focuses the exact worker, and prints `herdr agent attach <owned-name> --takeover`; automation stays paused until `/herdr-return`. `/herdr-pause` is a durable automation pause, not a promise that an already-running model turn was killed. Resume and return recheck current Git, pane, process, and saved-session ownership before delivering any retained answer.
+
+`/herdr-accept` first asks the daemon to capture a stable candidate receipt from actual Git state. Capture includes the immutable source base, HEAD/branch, staged and unstaged diff digests, status, untracked-file content fingerprints, proposal/spec revision, batch/ticket/attempt/session identities, and existing artifact references. It succeeds only after the exact worker reports Pi's `agent_settled` lifecycle with no outstanding jobs; Herdr `idle`/`done`, prompt success, or completion prose alone is insufficient. The dashboard then starts a bounded reasoning turn that locates the native implementation-skill test and review artifacts for that exact candidate and submits them through `herdr_accept_candidate`. Missing, failed, or candidate-mismatched evidence is rejected before integration.
+
+The daemon creates one dedicated `herdr/batch-*` integration worktree per preparation plus an isolated `herdr/stage-*` worktree per candidate. It applies committed, staged, unstaged, and untracked candidate changes to the latest accepted batch HEAD, executes every approved check itself in staging, and retains exit codes, output digests, and private logs. Separate fresh Pi TUI sessions perform Standards and Spec reviews against the staged commit and resolvable review base; their session IDs, findings, verdicts, and structured receipts are retained. A candidate or batch-base change invalidates the evidence. Only a clean, current staged candidate advances the batch branch by fast-forward, records the exact integrated commit, and closes the exact settled owned worker tab while retaining saved sessions and evidence. A check/review/conflict/infrastructure failure records `integration-blocked`, leaves the prior accepted batch HEAD unchanged, and preserves source and staging worktrees for investigation.
+
+An accepted in-batch prerequisite releases successors from the controller's dependency gate only while its recorded commit remains present on the owned batch branch. The implementation prompt includes that accepted-commit evidence even if the tracker issue remains open. The controller performs no tracker close operation.
 
 Every dashboard operation uses `connectOrStartLocalController` and the authenticated `ControllerClient`. Closing the dashboard Pi process or terminal does not stop the detached daemon, cancel a worker, or erase a pending decision. A daemon-process restart is different: active attempts become `restart-required` and remain non-executing until explicit resume.
 
@@ -199,7 +209,7 @@ pi -e . --list-models
 
 ## Current limitations
 
-- The durable controller, detached daemon/private IPC, real Git and constrained setup adapters, production Herdr/Pi runtime, Pi readiness/local-decision bridge, and execution dashboard commands are implemented. Handoff, review execution, integration, comprehensive recovery, and Telegram routing are not yet wired.
+- The durable controller, detached daemon/private IPC, real Git and constrained setup adapters, production Herdr/Pi runtime, Pi readiness/lifecycle/review/local-decision bridge, independent checks, serialized acceptance integration, and dashboard commands are implemented. Handoff replacement, automatic conflict repair, comprehensive recovery, final delivery requests, and Telegram routing are not yet wired.
 - Tracker evidence is collected and content-digested by the reasoning session using project-provided prose instructions. The controller deterministically compares submitted identities, versions, content digests, canonical references, and retrieval ordering. This is an epistemic guard over the evidence the model supplied; it is **not** independent backend verification, because an arbitrary prose-defined tracker has no deterministic adapter here. Human approval must assess whether the evidence and references are credible.
 - Authentication admission resolves the selected provider configuration without logging the result. It does not make an extra billable model probe; the preparation reasoning request remains the practical end-to-end provider check.
 - The daemon enforces one local writer for supported clients. The private socket/token and ownership record are local-user controls, not authentication between mutually hostile processes running as the same OS account and not an OS sandbox.

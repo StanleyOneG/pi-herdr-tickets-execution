@@ -37,6 +37,7 @@ import type {
   WorkerBridgeTransport,
   WorkerDecisionRequest,
   WorkerReadinessReceipt,
+  WorkerReviewReceipt,
 } from "../src/worker-bridge-protocol.js";
 import { formatPreparationPreview } from "../src/presentation.js";
 import { LocalSetupRuntime } from "../src/setup-runtime.js";
@@ -749,7 +750,7 @@ test("idle, done, and completion text can only produce completed-unaccepted life
   const completed = value(await running.controller.recordWorkerObservation(actor, monitoredObservation(
     running.attempt,
     {
-      identity: running.attempt.worker!, status: "done", artifactReferences: ["/evidence/summary.txt"],
+      identity: running.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: ["/evidence/summary.txt"],
       completionText: "Everything is accepted and the issue can close.",
     },
   )));
@@ -831,6 +832,8 @@ test("worker completion cannot hide an unresolved local decision", async (): Pro
     {
       identity: running.attempt.worker!,
       status: "done",
+      settled: true,
+      outstandingJobs: [],
       artifactReferences: ["/evidence/early-summary.txt"],
       completionText: "Done despite the unanswered question.",
     },
@@ -868,8 +871,11 @@ class ControlledBridge implements WorkerBridgeTransport {
     nonce: "fresh-nonce",
     requestDirectory: "/tmp/herdr-worker-decisions/requests",
     responseDirectory: "/tmp/herdr-worker-decisions/responses",
+    lifecycleEndpoint: "/tmp/herdr-worker-lifecycle.json",
+    reviewEndpoint: "/tmp/herdr-worker-review.json",
   };
   receiptFactory: (() => WorkerReadinessReceipt) | undefined;
+  reviewReceiptFactory: (() => WorkerReviewReceipt) | undefined;
 
   async openChannel(): Promise<WorkerBridgeChannel> {
     return this.channel;
@@ -878,6 +884,11 @@ class ControlledBridge implements WorkerBridgeTransport {
   async waitForReadiness(): Promise<WorkerReadinessReceipt> {
     if (!this.receiptFactory) throw new Error("missing receipt");
     return this.receiptFactory();
+  }
+
+  async waitForReview(): Promise<WorkerReviewReceipt> {
+    if (!this.reviewReceiptFactory) throw new Error("missing review receipt");
+    return this.reviewReceiptFactory();
   }
 }
 
@@ -907,7 +918,9 @@ class ControlledHerdr implements HerdrCommandExecutor {
     if (args[0] === "agent" && args[1] === "prompt" && args[3] === "/herdr-worker-ready") {
       return response({ agent: herdrAgent("idle") });
     }
+    if (args[0] === "agent" && args[1] === "prompt" && args.includes("--wait")) return response({ agent: herdrAgent("done") });
     if (args[0] === "agent" && args[1] === "focus") return response({ agent: herdrAgent("idle") });
+    if (args[0] === "tab" && args[1] === "close") return response({ closed: true });
     throw new Error(`unexpected Herdr command: ${args.join(" ")}`);
   }
 }
@@ -1537,6 +1550,43 @@ test("production Herdr runtime rejects stale startup, model, cwd, pane, session,
     assert.equal(attempt.lifecycle, "needs-attention");
     assert.equal(executor.calls.some((call): boolean => call.args[3]?.startsWith("/skill:implement") === true), false);
   }
+});
+
+test("production Herdr acceptance review starts a fresh Pi session and retains structured candidate binding", async (): Promise<void> => {
+  const executor = new ControlledHerdr();
+  const bridge = new ControlledBridge();
+  const runtime = herdrRuntime(executor, bridge);
+  bridge.receiptFactory = (): WorkerReadinessReceipt => receiptFor(executor);
+  bridge.reviewReceiptFactory = (): WorkerReviewReceipt => ({
+    schemaVersion: 1,
+    nonce: bridge.channel.nonce,
+    sessionId: "session-1",
+    kind: "standards",
+    verdict: "passed",
+    candidateCommit: "b".repeat(40),
+    reviewBase: "a".repeat(40),
+    findings: [],
+    completedAt: "2026-09-12T15:00:00.000Z",
+  });
+
+  const review = await runtime.review({
+    kind: "standards",
+    workspaceId: "workspace-1",
+    cwd: "/candidate/staging",
+    reviewBase: "a".repeat(40),
+    candidateCommit: "b".repeat(40),
+    model: { provider: "test", id: "reasoner", thinkingLevel: "high", contextWindow: 220_000 },
+    evidenceReferences: ["/evidence/standards.md"],
+  });
+
+  assert.equal(review.verdict, "passed");
+  assert.equal(review.freshSessionId, "session-1");
+  assert.equal(review.evidenceReference, bridge.channel.reviewEndpoint);
+  const startCall = executor.calls.find((call): boolean => call.args[0] === "agent" && call.args[1] === "start")!;
+  assert.equal(startCall.args.some((arg): boolean => ["--continue", "--resume", "--fork", "--session"].includes(arg)), false);
+  const reviewPrompt = executor.calls.find((call): boolean => call.args[0] === "agent" && call.args[1] === "prompt" && call.args.includes("--wait"))!;
+  assert.match(reviewPrompt.args[3]!, /git diff a{40}\.\.b{40}/);
+  assert.equal(executor.calls.some((call): boolean => call.args[0] === "tab" && call.args[1] === "close"), true);
 });
 
 test("ambiguous implementation prompt failure is recorded once without duplicate retry", async (): Promise<void> => {

@@ -1,9 +1,12 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import type {
+  AcceptanceReviewPort,
+  AcceptanceReviewRecord,
   CapturedModel,
   WorkerAllocation,
   WorkerDispatchAcknowledgement,
@@ -19,6 +22,8 @@ import {
   WORKER_DECISION_REQUEST_DIRECTORY_ENV,
   WORKER_DECISION_RESPONSE_DIRECTORY_ENV,
   WORKER_READINESS_COMMAND,
+  WORKER_REVIEW_ENDPOINT_ENV,
+  WORKER_REVIEW_NONCE_ENV,
   type WorkerBridgeChannel,
   type WorkerDecisionRequest,
   type WorkerBridgeTransport,
@@ -76,7 +81,7 @@ export interface HerdrWorkerRuntimeOptions {
 }
 
 /** Production WorkerRuntimePort adapter for an owned ordinary interactive Pi TUI in Herdr. */
-export class HerdrWorkerRuntime implements WorkerRuntimePort {
+export class HerdrWorkerRuntime implements WorkerRuntimePort, AcceptanceReviewPort {
   private readonly channels = new Map<string, WorkerBridgeChannel>();
   private readonly shellReadyTimeoutMs: number;
   private readonly agentStartTimeoutMs: number;
@@ -120,6 +125,8 @@ export class HerdrWorkerRuntime implements WorkerRuntimePort {
       "--env", `${WORKER_BRIDGE_AGENT_ENV}=${input.agentName}`,
       "--env", `${WORKER_DECISION_REQUEST_DIRECTORY_ENV}=${channel.requestDirectory}`,
       "--env", `${WORKER_DECISION_RESPONSE_DIRECTORY_ENV}=${channel.responseDirectory}`,
+      ...(channel.reviewEndpoint ? ["--env", `${WORKER_REVIEW_ENDPOINT_ENV}=${channel.reviewEndpoint}`] : []),
+      "--env", `${WORKER_REVIEW_NONCE_ENV}=${channel.nonce}`,
       "--no-focus",
     ], 15_000);
     const tab = object(result.tab);
@@ -166,14 +173,35 @@ export class HerdrWorkerRuntime implements WorkerRuntimePort {
   async inspect(identity: WorkerIdentity): Promise<WorkerObservation> {
     const current = parseAgent(await this.command(["agent", "get", identity.agentName], 10_000));
     assertOwnedAgent(current, identity);
-    return { identity: structuredClone(identity), status: agentStatus(current), artifactReferences: [] };
+    let lifecycle: Awaited<ReturnType<NonNullable<WorkerBridgeTransport["readLifecycle"]>>>;
+    if (this.options.bridge.channelForAgent && this.options.bridge.readLifecycle) {
+      const channel = await this.options.bridge.channelForAgent(identity.agentName);
+      lifecycle = await this.options.bridge.readLifecycle(channel);
+    }
+    const settled = lifecycle?.sessionId === identity.sessionId && lifecycle.state === "settled";
+    return {
+      identity: structuredClone(identity),
+      status: agentStatus(current),
+      artifactReferences: [],
+      settled,
+      outstandingJobs: settled ? lifecycle!.outstandingJobs : ["Pi has not reported agent_settled"],
+    };
   }
 
-  async dispatchImplementation(identity: WorkerIdentity, ticketReference: string): Promise<WorkerDispatchAcknowledgement> {
-    if (!bounded(ticketReference) || /[\r\n\0]/.test(ticketReference)) throw new Error("Ticket reference is unsafe for interactive dispatch");
+  async dispatchImplementation(
+    identity: WorkerIdentity,
+    ticketReference: string,
+    prerequisiteEvidence: string[],
+  ): Promise<WorkerDispatchAcknowledgement> {
+    if (!bounded(ticketReference) || /[\r\n\0]/.test(ticketReference) || !validStringArray(prerequisiteEvidence, 50, false) ||
+      prerequisiteEvidence.some((item): boolean => /[\r\0]/.test(item))
+    ) throw new Error("Ticket reference or prerequisite evidence is unsafe for interactive dispatch");
     await this.assertDispatchable(identity);
+    const prompt = prerequisiteEvidence.length === 0
+      ? `/skill:implement ${ticketReference}`
+      : `/skill:implement ${ticketReference}\n\nThe controller verified these in-batch prerequisites as accepted and present on the batch branch even though tracker issues may remain open:\n${prerequisiteEvidence.map((item): string => `- ${item}`).join("\n")}`;
     const result = await this.command([
-      "agent", "prompt", identity.agentName, `/skill:implement ${ticketReference}`,
+      "agent", "prompt", identity.agentName, prompt,
     ], this.promptTimeoutMs);
     const agent = parseAgent(result);
     assertOwnedAgent(agent, identity);
@@ -211,6 +239,61 @@ export class HerdrWorkerRuntime implements WorkerRuntimePort {
     }
     const channel = await this.options.bridge.channelForAgent(identity.agentName);
     await this.options.bridge.acknowledgeDecisionRequest(channel, decisionId);
+  }
+
+  async close(identity: WorkerIdentity): Promise<void> {
+    const current = parseAgent(await this.command(["agent", "get", identity.agentName], 10_000));
+    assertOwnedAgent(current, identity);
+    if (!["idle", "done"].includes(agentStatus(current))) throw new Error("Owned worker is not settled for cleanup");
+    await this.command(["tab", "close", identity.tabId], 10_000);
+  }
+
+  async review(input: Parameters<AcceptanceReviewPort["review"]>[0]): Promise<AcceptanceReviewRecord> {
+    if (!this.options.bridge.waitForReview) throw new Error("Structured review transport is unavailable");
+    const digest = createHash("sha256")
+      .update(`${input.kind}\0${input.candidateCommit}\0${input.reviewBase}`)
+      .digest("hex").slice(0, 20);
+    const allocation = await this.allocate({ workspaceId: input.workspaceId, agentName: `review-${digest}`, cwd: input.cwd });
+    let identity: WorkerIdentity | undefined;
+    try {
+      identity = await this.start({ allocation, cwd: input.cwd, model: input.model });
+      const channel = this.channels.get(allocationKey(allocation));
+      if (!channel) throw new Error("Review bridge channel is unavailable");
+      const prompt = [
+        `Perform a fresh-context ${input.kind} acceptance review of the staged candidate.`,
+        `Review base: ${input.reviewBase}`,
+        `Candidate commit: ${input.candidateCommit}`,
+        `Inspect the actual diff with git diff ${input.reviewBase}..${input.candidateCommit}.`,
+        input.kind === "standards"
+          ? "Read and apply the project's coding standards and normal review guidance."
+          : "Read the approved spec/ticket evidence and verify every applicable requirement without widening scope.",
+        `Approved evidence references: ${input.evidenceReferences.join(", ")}`,
+        "Do not edit files, repair findings, reuse another review, or claim a pass with unresolved blockers.",
+        "Finish by calling herdr_submit_acceptance_review exactly once with this kind, review base, candidate commit, verdict, and all blocking findings.",
+      ].join("\n\n");
+      await this.command([
+        "agent", "prompt", identity.agentName, prompt,
+        "--wait", "--until", "idle", "--until", "done", "--until", "blocked", "--timeout", "300000",
+      ], 305_000);
+      const receipt = await this.options.bridge.waitForReview(channel, 10_000);
+      if (receipt.nonce !== channel.nonce || receipt.sessionId !== identity.sessionId || receipt.kind !== input.kind ||
+        receipt.candidateCommit !== input.candidateCommit || receipt.reviewBase !== input.reviewBase
+      ) throw new Error("Fresh review receipt is stale or mismatched");
+      return {
+        kind: receipt.kind,
+        verdict: receipt.verdict,
+        candidateCommit: receipt.candidateCommit,
+        reviewBase: receipt.reviewBase,
+        freshSessionId: receipt.sessionId,
+        findings: receipt.findings,
+        evidenceReference: channel.reviewEndpoint!,
+        completedAt: receipt.completedAt,
+      };
+    } finally {
+      if (identity) {
+        try { await this.close(identity); } catch { /* Preserve the saved review session even if tab cleanup fails. */ }
+      }
+    }
   }
 
   async focus(identity: WorkerIdentity): Promise<void> {

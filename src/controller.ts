@@ -1,11 +1,14 @@
 import { isAbsolute } from "node:path";
 
 import type {
+  AcceptCandidateRequest,
   AdmissionSnapshot,
   AnswerDecisionRequest,
   ApprovalRequest,
   AttemptRequest,
   BatchProposal,
+  CandidateReceipt,
+  CaptureCandidateRequest,
   CapturedModel,
   ControllerDependencies,
   ControllerErrorCode,
@@ -31,6 +34,7 @@ import type {
 import {
   MAX_ATTEMPT_DECISIONS,
   MAX_ATTEMPT_REFERENCES,
+  MAX_CANDIDATE_RECEIPTS,
   MAX_EXECUTION_ATTEMPTS,
   MAX_PREPARATIONS,
   MAX_STATUS_PAGE_SIZE,
@@ -44,11 +48,17 @@ import {
   validateProposal,
 } from "./policy.js";
 export type {
+  AcceptCandidateRequest,
+  AcceptanceReviewPort,
+  AcceptanceReviewRecord,
   AdmissionSnapshot,
   AnswerDecisionRequest,
   ApprovalRequest,
   AttemptRequest,
   BatchProposal,
+  CandidateGitState,
+  CandidateReceipt,
+  CaptureCandidateRequest,
   CapturedModel,
   ControllerError,
   ControllerResult,
@@ -59,8 +69,11 @@ export type {
   ExecutionAttempt,
   ExecutionControllerDependencies,
   ExecutionLifecycle,
+  GateCheckPort,
+  GateCheckRecord,
   GitWorktreePort,
   LocalActorCapability,
+  NativeEvidenceRecord,
   OriginalCheckoutSnapshot,
   PaginationRequest,
   PreparationRecord,
@@ -69,6 +82,7 @@ export type {
   SetupOperationRecord,
   SetupRuntimePort,
   SourceEvidence,
+  StagedIntegrationCandidate,
   StartTicketRequest,
   ThinkingLevel,
   TicketWorktreePlan,
@@ -268,6 +282,18 @@ export class PreparationController {
     );
   }
 
+  async captureCandidate(actor: LocalActorCapability, request: CaptureCandidateRequest): Promise<ControllerResult<CandidateReceipt>> {
+    return this.serializeMutation((): Promise<ControllerResult<CandidateReceipt>> =>
+      this.captureCandidateOperation(actor, request)
+    );
+  }
+
+  async acceptCandidate(actor: LocalActorCapability, request: AcceptCandidateRequest): Promise<ControllerResult<ExecutionAttempt>> {
+    return this.serializeMutation((): Promise<ControllerResult<ExecutionAttempt>> =>
+      this.acceptCandidateOperation(actor, request)
+    );
+  }
+
   async attachAttempt(actor: LocalActorCapability, request: AttemptRequest): Promise<ControllerResult<ExecutionAttempt>> {
     return this.serializeMutation((): Promise<ControllerResult<ExecutionAttempt>> =>
       this.attachAttemptOperation(actor, request)
@@ -349,14 +375,40 @@ export class PreparationController {
     if (ticket.claimedBy !== null) {
       return failure("execution-conflict", [`Ticket has a foreign tracker claim: ${request.ticketIdentity}`]);
     }
-    const blockedBy = preparation.proposal.dependencies
-      .filter((dependency): boolean =>
-        dependency.ticketIdentity === ticket.identity && dependency.kind === "ticket" && dependency.status === "in-batch"
-      )
-      .map((dependency): string => dependency.prerequisiteIdentity)
-      .sort();
+    const prerequisiteEvidence: string[] = [];
+    const blockedBy: string[] = [];
+    let executionBaseCommit = preparation.proposal.target.baseCommit;
+    for (const dependency of preparation.proposal.dependencies.filter((item): boolean =>
+      item.ticketIdentity === ticket.identity && item.kind === "ticket" && item.status === "in-batch"
+    )) {
+      const prerequisite = loaded.value.executionAttempts.find((attempt): boolean =>
+        attempt.preparationId === request.preparationId && attempt.ticketIdentity === dependency.prerequisiteIdentity &&
+        attempt.lifecycle === "accepted" && attempt.acceptedCommit !== undefined
+      );
+      const acceptedReceipt = prerequisite?.candidateReceipts?.find((receipt): boolean =>
+        receipt.state === "accepted" && receipt.integration?.integratedCommit === prerequisite.acceptedCommit
+      );
+      let present = false;
+      if (prerequisite && acceptedReceipt?.integration && prerequisite.acceptedCommit) {
+        try {
+          const integration = await execution.git.inspectWorktree(acceptedReceipt.integration.worktree.path);
+          present = integration.branch === acceptedReceipt.integration.worktree.branch &&
+            await execution.git.isCommitAncestor(integration.path, prerequisite.acceptedCommit, integration.head);
+          if (present) executionBaseCommit = integration.head;
+        } catch {
+          present = false;
+        }
+      }
+      if (present) {
+        prerequisiteEvidence.push(
+          `${dependency.prerequisiteIdentity} accepted as ${prerequisite!.acceptedCommit} on ${acceptedReceipt!.integration!.worktree.branch}`,
+        );
+      } else {
+        blockedBy.push(dependency.prerequisiteIdentity);
+      }
+    }
     if (blockedBy.length > 0) {
-      return failure("execution-conflict", [`Ticket is blocked by in-batch prerequisites: ${blockedBy.join(", ")}`]);
+      return failure("execution-conflict", [`Ticket is blocked by in-batch prerequisites: ${blockedBy.sort().join(", ")}`]);
     }
     if (loaded.value.executionAttempts.some((attempt): boolean =>
       attempt.preparationId === request.preparationId && isExecuting(attempt.lifecycle)
@@ -418,12 +470,12 @@ export class PreparationController {
 
       const worktree = await execution.git.createTicketWorktree({
         originalRoot: original.root,
-        baseCommit: preparation.proposal.target.baseCommit,
+        baseCommit: executionBaseCommit,
         plan,
       });
       if (
         worktree.path !== plan.path || worktree.branch !== plan.branch ||
-        worktree.head !== preparation.proposal.target.baseCommit || worktree.commonDir !== original.commonDir
+        worktree.head !== executionBaseCommit || worktree.commonDir !== original.commonDir
       ) {
         return this.attention(loaded.value, attempt, "Created ticket worktree identity does not match its durable plan");
       }
@@ -465,7 +517,7 @@ export class PreparationController {
       if (!guardedBeforeDispatch.ok || guardedBeforeDispatch.value.lifecycle === "needs-attention") return guardedBeforeDispatch;
       const ownership = await this.verifyWorkerOwnership(loaded.value, attempt);
       if (!ownership.ok || ownership.value.lifecycle === "needs-attention") return ownership;
-      const acknowledgement = await execution.worker.dispatchImplementation(worker, ticket.identity);
+      const acknowledgement = await execution.worker.dispatchImplementation(worker, ticket.identity, prerequisiteEvidence);
       return this.applyDispatchAcknowledgement(loaded.value, attempt, acknowledgement);
     } catch {
       return this.attention(loaded.value, attempt, "Execution infrastructure returned an error or ambiguous timeout");
@@ -507,6 +559,203 @@ export class PreparationController {
       }
     }
     return success(structuredClone(attempt));
+  }
+
+  private async captureCandidateOperation(
+    actor: LocalActorCapability,
+    request: CaptureCandidateRequest,
+  ): Promise<ControllerResult<CandidateReceipt>> {
+    const context = await this.mutableAttempt(actor, request.attemptId);
+    if (!context.ok) return context;
+    const { state, attempt, execution } = context.value;
+    if (attempt.lifecycle !== "completed-unaccepted" && attempt.lifecycle !== "integration-blocked") {
+      return failure("execution-conflict", [`Candidate cannot be captured from ${attempt.lifecycle}`]);
+    }
+    if (!attempt.worker || !attempt.worktree) return failure("execution-validation", ["Candidate identity is incomplete"]);
+    const receipts = attempt.candidateReceipts ??= [];
+    if (receipts.length >= MAX_CANDIDATE_RECEIPTS) {
+      return failure("execution-validation", [`Candidate receipt capacity of ${MAX_CANDIDATE_RECEIPTS} was reached`]);
+    }
+    const preparation = state.preparations.find((record): boolean => record.id === attempt.preparationId)!;
+    try {
+      const guarded = await this.verifyOwnedWorkerAndGit(state, attempt);
+      if (!guarded.ok || guarded.value.lifecycle === "needs-attention") {
+        return failure("execution-conflict", guarded.ok ? guarded.value.diagnostics : guarded.error.diagnostics);
+      }
+      const observation = await execution.worker.inspect(attempt.worker);
+      if (!sameWorker(observation.identity, attempt.worker) || !observation.settled ||
+        (observation.status !== "idle" && observation.status !== "done") ||
+        !Array.isArray(observation.outstandingJobs) || observation.outstandingJobs.length > 0
+      ) return failure("execution-conflict", ["Candidate requires a settled Pi lifecycle with no outstanding jobs"]);
+      const candidate = await execution.git.captureCandidate({ path: attempt.worktree.path, sourceBase: attempt.worktree.head });
+      const specEvidence = preparation.proposal!.sourceEvidence.find(
+        (evidence): boolean => evidence.identity === preparation.proposal!.spec.evidenceIdentity,
+      )!;
+      const receipt: CandidateReceipt = {
+        id: this.dependencies.generateId(),
+        state: "captured",
+        capturedAt: this.dependencies.now().toISOString(),
+        proposalDigest: attempt.proposalDigest,
+        specIdentity: preparation.proposal!.spec.identity,
+        specRevision: specEvidence.revision,
+        preparationId: attempt.preparationId,
+        ticketIdentity: attempt.ticketIdentity,
+        attemptId: attempt.id,
+        sessionId: attempt.worker.sessionId,
+        sessionFile: attempt.worker.sessionFile,
+        candidate,
+        nativeEvidence: [],
+        checks: [],
+        reviews: [],
+        findings: [],
+        evidenceReferences: uniqueReferences([...attempt.artifactReferences, ...specEvidence.references]),
+      };
+      receipts.push(receipt);
+      const saved = await this.persistAttempt(state, attempt);
+      return saved.ok ? success(structuredClone(receipt)) : saved;
+    } catch {
+      return failure("infrastructure", ["Candidate Git capture or lifecycle verification failed"]);
+    }
+  }
+
+  private async acceptCandidateOperation(
+    actor: LocalActorCapability,
+    request: AcceptCandidateRequest,
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    const context = await this.mutableAttempt(actor, request.attemptId);
+    if (!context.ok) return context;
+    const { state, attempt, execution } = context.value;
+    const acceptance = execution.acceptance;
+    if (!acceptance) return failure("infrastructure", ["Acceptance adapters are not configured"]);
+    if (attempt.lifecycle !== "completed-unaccepted" && attempt.lifecycle !== "integration-blocked") {
+      return failure("execution-conflict", [`Candidate cannot be accepted from ${attempt.lifecycle}`]);
+    }
+    const receipt = attempt.candidateReceipts?.find(
+      (item): boolean => item.candidate.candidateDigest === request.candidateDigest && item.state === "captured",
+    );
+    if (!receipt) return failure("execution-validation", ["A current captured candidate receipt is required"]);
+    const evidenceFailure = validateNativeEvidence(request.nativeEvidence, receipt);
+    if (evidenceFailure) return failure("execution-validation", [evidenceFailure]);
+    const preparation = state.preparations.find((record): boolean => record.id === attempt.preparationId)!;
+    const proposal = preparation.proposal!;
+    receipt.nativeEvidence = structuredClone(request.nativeEvidence);
+    receipt.evidenceReferences = uniqueReferences([
+      ...receipt.evidenceReferences,
+      ...request.nativeEvidence.map((item): string => item.evidenceReference),
+    ]);
+    attempt.lifecycle = "accepting";
+    const accepting = await this.persistAttempt(state, attempt);
+    if (!accepting.ok) return accepting;
+
+    try {
+      const current = await execution.git.captureCandidate({ path: attempt.worktree!.path, sourceBase: receipt.candidate.sourceBase });
+      if (current.candidateDigest !== receipt.candidate.candidateDigest) {
+        return this.blockAcceptance(state, attempt, receipt, "Candidate changed after evidence capture");
+      }
+      const integration = await execution.git.prepareIntegrationWorktree({
+        originalRoot: preparation.project.root,
+        preparationId: preparation.id,
+        targetBase: proposal.target.baseCommit,
+      });
+      const latestAcceptedBase = state.executionAttempts
+        .filter((item): boolean => item.preparationId === preparation.id)
+        .flatMap((item): CandidateReceipt[] => item.candidateReceipts ?? [])
+        .filter((item): boolean => item.state === "accepted" && item.integration?.integratedCommit !== undefined)
+        .at(-1)?.integration?.integratedCommit ?? proposal.target.baseCommit;
+      if (integration.head !== latestAcceptedBase) {
+        return this.blockAcceptance(state, attempt, receipt, "Batch integration worktree moved outside recorded acceptance");
+      }
+      const staging = await execution.git.stageCandidate({
+        originalRoot: preparation.project.root,
+        preparationId: preparation.id,
+        attemptId: attempt.id,
+        receiptId: receipt.id,
+        integration,
+        sourcePath: attempt.worktree!.path,
+        candidate: receipt.candidate,
+      });
+      receipt.integration = { worktree: structuredClone(integration), staging: structuredClone(staging) };
+      const staged = await this.persistAttempt(state, attempt);
+      if (!staged.ok) return staged;
+
+      for (const check of proposal.policy.checks) {
+        const result = await acceptance.checks.execute({ cwd: staging.path, command: check.command, candidateCommit: staging.candidateCommit });
+        if (!validCheckResult(result, check.command, staging.candidateCommit)) {
+          return this.blockAcceptance(state, attempt, receipt, "Approved check returned malformed or stale evidence");
+        }
+        receipt.checks.push(structuredClone(result));
+        receipt.evidenceReferences = uniqueReferences([...receipt.evidenceReferences, result.logReference]);
+        const checked = await this.persistAttempt(state, attempt);
+        if (!checked.ok) return checked;
+        if (result.exitCode !== 0) return this.blockAcceptance(state, attempt, receipt, `Approved check failed: ${check.command}`);
+      }
+
+      for (const kind of proposal.policy.requiredReviews) {
+        const review = await acceptance.reviewer.review({
+          kind,
+          workspaceId: attempt.workspaceId,
+          cwd: staging.path,
+          reviewBase: staging.baseCommit,
+          candidateCommit: staging.candidateCommit,
+          model: proposal.model,
+          evidenceReferences: proposal.sourceEvidence.flatMap((source): string[] => source.references),
+        });
+        if (!validReview(review, kind, staging.baseCommit, staging.candidateCommit) ||
+          review.freshSessionId === attempt.worker?.sessionId ||
+          receipt.reviews.some((existing): boolean => existing.freshSessionId === review.freshSessionId)
+        ) {
+          return this.blockAcceptance(state, attempt, receipt, `${kind} review returned malformed, stale, or non-fresh evidence`);
+        }
+        receipt.reviews.push(structuredClone(review));
+        receipt.evidenceReferences = uniqueReferences([...receipt.evidenceReferences, review.evidenceReference]);
+        receipt.findings.push(...review.findings);
+        const reviewed = await this.persistAttempt(state, attempt);
+        if (!reviewed.ok) return reviewed;
+        if (review.verdict !== "passed" || review.findings.length > 0) {
+          return this.blockAcceptance(state, attempt, receipt, `${kind} review has unresolved blocking findings`);
+        }
+      }
+      if (!proposal.policy.requiredReviews.every((kind): boolean => receipt.reviews.some((review): boolean => review.kind === kind && review.verdict === "passed"))) {
+        return this.blockAcceptance(state, attempt, receipt, "Required reviews are incomplete");
+      }
+      const afterReview = await execution.git.captureCandidate({ path: attempt.worktree!.path, sourceBase: receipt.candidate.sourceBase });
+      if (afterReview.candidateDigest !== receipt.candidate.candidateDigest) {
+        return this.blockAcceptance(state, attempt, receipt, "Candidate changed while acceptance evidence was collected");
+      }
+      const integratedCommit = await execution.git.advanceIntegration({ integration, staging });
+      if (integratedCommit !== staging.candidateCommit) {
+        return this.blockAcceptance(state, attempt, receipt, "Integration returned a mismatched accepted commit");
+      }
+      receipt.integration.integratedCommit = integratedCommit;
+      receipt.state = "accepted";
+      receipt.acceptedAt = this.dependencies.now().toISOString();
+      attempt.acceptedCommit = integratedCommit;
+      attempt.lifecycle = "accepted";
+      const integrated = await this.persistAttempt(state, attempt);
+      if (!integrated.ok) return integrated;
+      if (!execution.worker.close || !attempt.worker || hasPendingDecision(attempt)) return integrated;
+      try {
+        await execution.worker.close(attempt.worker);
+        receipt.cleanup = "closed";
+      } catch {
+        receipt.cleanup = "failed";
+      }
+      return this.persistAttempt(state, attempt);
+    } catch {
+      return this.blockAcceptance(state, attempt, receipt, "Integration, independent check, or review infrastructure failed");
+    }
+  }
+
+  private async blockAcceptance(
+    state: ControllerState,
+    attempt: ExecutionAttempt,
+    receipt: CandidateReceipt,
+    finding: string,
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    receipt.state = "blocked";
+    receipt.findings = uniqueReferences([...receipt.findings, finding]);
+    attempt.lifecycle = "integration-blocked";
+    return this.persistAttempt(state, attempt);
   }
 
   private async attachAttemptOperation(
@@ -963,9 +1212,13 @@ export class PreparationController {
         attempt.workerActiveAt = this.dependencies.now().toISOString();
       }
     }
+    const settledCompletion = observation.settled === true && Array.isArray(observation.outstandingJobs) &&
+      observation.outstandingJobs.length === 0 && (observation.status === "idle" || observation.status === "done");
+    if (settledCompletion && attempt.workerActiveAt === undefined) {
+      attempt.workerActiveAt = this.dependencies.now().toISOString();
+    }
     if (
-      observation.status !== "blocked" &&
-      (observation.status === "idle" || observation.status === "done") && attempt.workerActiveAt !== undefined &&
+      observation.status !== "blocked" && settledCompletion &&
       attempt.lifecycle !== "paused" && attempt.lifecycle !== "takeover" && attempt.lifecycle !== "restart-required"
     ) {
       attempt.lifecycle = hasPendingDecision(attempt) ? "pending-decision" : "completed-unaccepted";
@@ -1019,7 +1272,7 @@ function advanceControlGeneration(attempt: ExecutionAttempt): void {
 }
 
 function isExecuting(lifecycle: ExecutionAttempt["lifecycle"]): boolean {
-  return lifecycle !== "completed-unaccepted" && lifecycle !== "needs-attention";
+  return !["completed-unaccepted", "integration-blocked", "accepted", "needs-attention"].includes(lifecycle);
 }
 
 function hasPendingDecision(attempt: ExecutionAttempt): boolean {
@@ -1092,6 +1345,43 @@ function hasOnlyKeys(value: unknown, allowed: string[]): value is Record<string,
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const keys = new Set(allowed);
   return Object.keys(value).every((key): boolean => keys.has(key));
+}
+
+function validateNativeEvidence(evidence: import("./contracts.js").NativeEvidenceRecord[], receipt: CandidateReceipt): string | undefined {
+  if (!Array.isArray(evidence) || evidence.length < 2 || evidence.length > 20) return "Native implementation evidence is incomplete";
+  if (!evidence.some((item): boolean => item.kind === "tests") || !evidence.some((item): boolean => item.kind === "reviews")) {
+    return "Native implementation tests and reviews must both be preserved";
+  }
+  for (const item of evidence) {
+    if (item.status !== "passed" || item.candidateDigest !== receipt.candidate.candidateDigest ||
+      !validBoundedText(item.evidenceReference, 4_096) || containsCredential(item.evidenceReference) ||
+      !Number.isFinite(Date.parse(item.completedAt))
+    ) return "Native implementation evidence is malformed, failed, or stale";
+  }
+  return undefined;
+}
+
+function validCheckResult(
+  result: import("./contracts.js").GateCheckRecord,
+  command: string,
+  candidateCommit: string,
+): boolean {
+  return result.command === command && result.candidateCommit === candidateCommit && Number.isSafeInteger(result.exitCode) &&
+    /^[a-f0-9]{64}$/i.test(result.outputDigest) && validBoundedText(result.logReference, 4_096) &&
+    !containsCredential(result.logReference) && Number.isFinite(Date.parse(result.completedAt));
+}
+
+function validReview(
+  review: import("./contracts.js").AcceptanceReviewRecord,
+  kind: "standards" | "spec",
+  reviewBase: string,
+  candidateCommit: string,
+): boolean {
+  return review.kind === kind && review.reviewBase === reviewBase && review.candidateCommit === candidateCommit &&
+    (review.verdict === "passed" || review.verdict === "blocked") && validBoundedText(review.freshSessionId, 4_096) &&
+    validBoundedText(review.evidenceReference, 4_096) && !containsCredential(review.evidenceReference) &&
+    validStringCollection(review.findings, 50) && review.findings.every((finding): boolean => !containsCredential(finding)) &&
+    Number.isFinite(Date.parse(review.completedAt));
 }
 
 function validReferences(references: string[]): boolean {

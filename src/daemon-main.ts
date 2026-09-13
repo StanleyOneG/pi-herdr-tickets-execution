@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 
 import { PreparationController } from "./controller.js";
 import { FileWorkerBridgeTransport } from "./file-worker-bridge.js";
+import { LocalGateCheckAdapter } from "./gate-checks.js";
 import { RealGitWorktreeAdapter } from "./git-worktrees.js";
 import { ExecFileHerdrCommandExecutor, HerdrWorkerRuntime } from "./herdr-runtime.js";
 import { LocalControllerDaemon, localDaemonPaths, readOrCreateToken } from "./local-daemon.js";
@@ -27,6 +28,10 @@ export async function runDaemon(argv: string[]): Promise<void> {
       git: new RealGitWorktreeAdapter(),
       worker,
       setup: new LocalSetupRuntime(),
+      acceptance: {
+        reviewer: worker,
+        checks: new LocalGateCheckAdapter(paths.evidenceDirectory),
+      },
     },
   });
   const daemon = new LocalControllerDaemon(controller, actor, paths.socketPath, token, worker);

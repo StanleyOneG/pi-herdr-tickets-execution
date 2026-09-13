@@ -7,12 +7,15 @@ import { createConnection, createServer, type Server, type Socket } from "node:n
 import { spawn } from "node:child_process";
 
 import type {
+  AcceptCandidateRequest,
   AdmissionSnapshot,
   AnswerDecisionRequest,
   ApprovalRequest,
   AttemptRequest,
   BatchProposal,
   ControllerResult,
+  CandidateReceipt,
+  CaptureCandidateRequest,
   ControllerStatus,
   ExecutionAttempt,
   PaginationRequest,
@@ -41,6 +44,7 @@ export interface LocalDaemonPaths {
   socketPath: string;
   tokenPath: string;
   workerBridgeDirectory: string;
+  evidenceDirectory: string;
 }
 
 export interface ControllerClient {
@@ -51,6 +55,8 @@ export interface ControllerClient {
   getPreparation(preparationId: string): Promise<ControllerResult<PreparationRecord>>;
   validateApproval(preparationId: string, request: ApprovalRequest): Promise<ControllerResult<PreparationRecord>>;
   startTicket(request: import("./contracts.js").StartTicketRequest): Promise<ControllerResult<ExecutionAttempt>>;
+  captureCandidate(request: CaptureCandidateRequest): Promise<ControllerResult<CandidateReceipt>>;
+  acceptCandidate(request: AcceptCandidateRequest): Promise<ControllerResult<ExecutionAttempt>>;
   attachAttempt(request: AttemptRequest): Promise<ControllerResult<ExecutionAttempt>>;
   pauseAttempt(request: AttemptRequest): Promise<ControllerResult<ExecutionAttempt>>;
   resumeAttempt(request: AttemptRequest): Promise<ControllerResult<ExecutionAttempt>>;
@@ -300,6 +306,8 @@ export class LocalControllerDaemon {
       case "getPreparation": return this.controller.getPreparation(this.actor, params[0] as string);
       case "validateApproval": return this.controller.validateApproval(this.actor, params[0] as string, params[1] as ApprovalRequest);
       case "startTicket": return this.controller.startTicket(this.actor, params[0] as import("./contracts.js").StartTicketRequest);
+      case "captureCandidate": return this.controller.captureCandidate(this.actor, params[0] as CaptureCandidateRequest);
+      case "acceptCandidate": return this.controller.acceptCandidate(this.actor, params[0] as AcceptCandidateRequest);
       case "attachAttempt": return this.controller.attachAttempt(this.actor, params[0] as AttemptRequest);
       case "pauseAttempt": return this.controller.pauseAttempt(this.actor, params[0] as AttemptRequest);
       case "resumeAttempt": return this.controller.resumeAttempt(this.actor, params[0] as AttemptRequest);
@@ -323,6 +331,8 @@ export class UnixControllerClient implements ControllerClient {
   getPreparation(preparationId: string): Promise<ControllerResult<PreparationRecord>> { return this.call("getPreparation", [preparationId]); }
   validateApproval(preparationId: string, request: ApprovalRequest): Promise<ControllerResult<PreparationRecord>> { return this.call("validateApproval", [preparationId, request]); }
   startTicket(request: import("./contracts.js").StartTicketRequest): Promise<ControllerResult<ExecutionAttempt>> { return this.call("startTicket", [request]); }
+  captureCandidate(request: CaptureCandidateRequest): Promise<ControllerResult<CandidateReceipt>> { return this.call("captureCandidate", [request]); }
+  acceptCandidate(request: AcceptCandidateRequest): Promise<ControllerResult<ExecutionAttempt>> { return this.call("acceptCandidate", [request]); }
   attachAttempt(request: AttemptRequest): Promise<ControllerResult<ExecutionAttempt>> { return this.call("attachAttempt", [request]); }
   pauseAttempt(request: AttemptRequest): Promise<ControllerResult<ExecutionAttempt>> { return this.call("pauseAttempt", [request]); }
   resumeAttempt(request: AttemptRequest): Promise<ControllerResult<ExecutionAttempt>> { return this.call("resumeAttempt", [request]); }
@@ -370,6 +380,7 @@ export function localDaemonPaths(statePath: string): LocalDaemonPaths {
     socketPath: join(socketDirectory, `${identity}.sock`),
     tokenPath: join(stateDirectory, "controller-ipc-token"),
     workerBridgeDirectory: join(stateDirectory, "worker-bridge"),
+    evidenceDirectory: join(stateDirectory, "acceptance-evidence"),
   };
 }
 
@@ -429,7 +440,7 @@ function parseRequest(record: string): IpcRequest {
   const request = value as Partial<IpcRequest>;
   const methods = new Set<RequestMethod>([
     "ping", "prepare", "submitProposal", "approve", "preview", "getPreparation", "validateApproval",
-    "startTicket", "attachAttempt", "pauseAttempt", "resumeAttempt", "takeOverAttempt", "returnAttempt", "answerDecision",
+    "startTicket", "captureCandidate", "acceptCandidate", "attachAttempt", "pauseAttempt", "resumeAttempt", "takeOverAttempt", "returnAttempt", "answerDecision",
     "recordWorkerObservation", "status",
   ]);
   if (typeof request.id !== "string" || request.id.length > 200 || typeof request.token !== "string" ||
@@ -448,6 +459,8 @@ function validateMethodParams(method: RequestMethod, params: unknown[]): void {
     case "preview":
     case "getPreparation": valid = params.length === 1 && boundedText(params[0]); break;
     case "startTicket": valid = params.length === 1 && isStartTicketRequest(params[0]); break;
+    case "captureCandidate": valid = params.length === 1 && isAttemptRequest(params[0]); break;
+    case "acceptCandidate": valid = params.length === 1 && isAcceptCandidateRequest(params[0]); break;
     case "attachAttempt":
     case "pauseAttempt":
     case "resumeAttempt":
@@ -506,6 +519,17 @@ function isAnswerDecisionRequest(value: unknown): value is AnswerDecisionRequest
     boundedText(value.answeredBy, 500);
 }
 
+function isAcceptCandidateRequest(value: unknown): value is AcceptCandidateRequest {
+  if (!isObjectWithKeys(value, ["attemptId", "candidateDigest", "nativeEvidence"]) || !boundedText(value.attemptId) ||
+    !digestText(value.candidateDigest) || !Array.isArray(value.nativeEvidence) || value.nativeEvidence.length > 20
+  ) return false;
+  return value.nativeEvidence.every((item): boolean => isObjectWithKeys(item, [
+    "kind", "status", "candidateDigest", "evidenceReference", "completedAt",
+  ]) && (item.kind === "tests" || item.kind === "reviews") && item.status === "passed" &&
+    digestText(item.candidateDigest) && boundedText(item.evidenceReference) &&
+    typeof item.completedAt === "string" && Number.isFinite(Date.parse(item.completedAt)));
+}
+
 function isRecordWorkerObservationRequest(value: unknown): value is RecordWorkerObservationRequest {
   return isObjectWithKeys(value, ["attemptId", "controlGeneration", "observation"]) && boundedText(value.attemptId) &&
     typeof value.controlGeneration === "number" && Number.isSafeInteger(value.controlGeneration) &&
@@ -513,11 +537,13 @@ function isRecordWorkerObservationRequest(value: unknown): value is RecordWorker
 }
 
 function isWorkerObservation(value: unknown): value is WorkerObservation {
-  if (!isObjectWithKeys(value, ["identity", "status", "artifactReferences", "decision", "diagnostic", "completionText"])) return false;
+  if (!isObjectWithKeys(value, ["identity", "status", "artifactReferences", "decision", "diagnostic", "completionText", "settled", "outstandingJobs"])) return false;
   if (!isWorkerIdentity(value.identity) || !["ready", "working", "idle", "done", "blocked", "missing", "unknown"].includes(value.status as string)) return false;
   if (!boundedStringArray(value.artifactReferences, 50, true)) return false;
   if (value.diagnostic !== undefined && !boundedText(value.diagnostic, 4_096)) return false;
   if (value.completionText !== undefined && !boundedText(value.completionText, 64_000)) return false;
+  if (value.settled !== undefined && typeof value.settled !== "boolean") return false;
+  if (value.outstandingJobs !== undefined && !boundedStringArray(value.outstandingJobs, 50, true)) return false;
   if (value.decision === undefined) return true;
   const decision = value.decision;
   return isObjectWithKeys(decision, ["transportId", "question", "context", "options", "recommendation"]) &&

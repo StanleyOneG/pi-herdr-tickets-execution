@@ -1,14 +1,17 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { createReadStream } from "node:fs";
-import { lstat, mkdir, readlink, realpath, stat } from "node:fs/promises";
+import { copyFile, lstat, mkdir, readlink, realpath, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import type {
+  CandidateGitState,
   GitFileFingerprint,
   GitWorktreePort,
+  IntegrationWorktreeIdentity,
   OriginalCheckoutSnapshot,
+  StagedIntegrationCandidate,
   TicketWorktreePlan,
   WorktreeIdentity,
 } from "./contracts.js";
@@ -151,6 +154,135 @@ export class RealGitWorktreeAdapter implements GitWorktreePort {
     }
   }
 
+  async captureCandidate(input: { path: string; sourceBase: string }): Promise<CandidateGitState> {
+    const root = await this.repositoryRoot(input.path);
+    const capture = async (): Promise<Omit<CandidateGitState, "candidateDigest">> => {
+      const [head, branch, status, indexDiff, worktreeDiff, untrackedOutput] = await Promise.all([
+        this.gitText(root, ["rev-parse", "HEAD"]),
+        this.gitText(root, ["branch", "--show-current"]),
+        this.gitBuffer(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
+        this.gitBuffer(root, ["diff", "--binary", "--no-ext-diff", "--cached"]),
+        this.gitBuffer(root, ["diff", "--binary", "--no-ext-diff"]),
+        this.gitBuffer(root, ["ls-files", "--others", "--exclude-standard", "-z"]),
+      ]);
+      if (!branch || !await this.isCommitAncestor(root, input.sourceBase, head)) {
+        throw new Error("Candidate does not descend from its source base");
+      }
+      const untrackedPaths = splitNul(untrackedOutput).sort();
+      if (untrackedPaths.length > MAX_UNTRACKED_FILES) throw new Error("Candidate has too many untracked paths");
+      return {
+        sourceBase: input.sourceBase,
+        head,
+        branch,
+        statusDigest: hash(status),
+        indexDiffDigest: hash(indexDiff),
+        worktreeDiffDigest: hash(worktreeDiff),
+        untrackedFiles: await fingerprintPaths(root, untrackedPaths),
+      };
+    };
+    const first = await capture();
+    const second = await capture();
+    if (hash(JSON.stringify(first)) !== hash(JSON.stringify(second))) {
+      throw new Error("Candidate changed while its Git state was captured");
+    }
+    return { ...first, candidateDigest: hash(JSON.stringify(first)) };
+  }
+
+  async prepareIntegrationWorktree(input: {
+    originalRoot: string;
+    preparationId: string;
+    targetBase: string;
+  }): Promise<IntegrationWorktreeIdentity> {
+    const originalRoot = await this.repositoryRoot(input.originalRoot);
+    const repositoryName = basename(originalRoot).replace(/[^A-Za-z0-9._-]+/g, "-") || "repository";
+    const identity = hash(`${originalRoot}\0${input.preparationId}`).slice(0, 20);
+    const path = join(dirname(originalRoot), `.${repositoryName}-herdr-worktrees`, `batch-${identity}`);
+    const branch = `herdr/batch-${identity}`;
+    try {
+      const existing = await this.inspectWorktree(path);
+      if (existing.branch !== branch || !await this.isCommitAncestor(path, input.targetBase, existing.head)) {
+        throw new Error("Existing batch integration worktree is mismatched");
+      }
+      return { ...existing, preparationId: input.preparationId };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        try { await stat(path); } catch (pathError) {
+          if ((pathError as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+      }
+    }
+    await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+    await assertOrdinaryDirectory(dirname(path));
+    await assertMissing(path);
+    await this.gitText(originalRoot, ["worktree", "add", "-b", branch, "--", path, input.targetBase]);
+    const created = await this.inspectWorktree(path);
+    if (created.head !== input.targetBase || created.branch !== branch) throw new Error("Batch integration worktree is mismatched");
+    return { ...created, preparationId: input.preparationId };
+  }
+
+  async stageCandidate(input: {
+    originalRoot: string;
+    preparationId: string;
+    attemptId: string;
+    receiptId: string;
+    integration: IntegrationWorktreeIdentity;
+    sourcePath: string;
+    candidate: CandidateGitState;
+  }): Promise<StagedIntegrationCandidate> {
+    const currentCandidate = await this.captureCandidate({ path: input.sourcePath, sourceBase: input.candidate.sourceBase });
+    if (currentCandidate.candidateDigest !== input.candidate.candidateDigest) throw new Error("Candidate changed after evidence capture");
+    const currentIntegration = await this.inspectWorktree(input.integration.path);
+    if (currentIntegration.head !== input.integration.head || currentIntegration.branch !== input.integration.branch) {
+      throw new Error("Accepted batch base moved before staging");
+    }
+    const stageIdentity = hash(`${input.preparationId}\0${input.attemptId}\0${input.receiptId}\0${input.candidate.candidateDigest}`).slice(0, 20);
+    const path = join(dirname(input.integration.path), `stage-${stageIdentity}`);
+    const branch = `herdr/stage-${stageIdentity}`;
+    await assertMissing(path);
+    await this.gitText(input.originalRoot, ["worktree", "add", "-b", branch, "--", path, input.integration.head]);
+    const commits = (await this.gitText(input.sourcePath, ["rev-list", "--reverse", `${input.candidate.sourceBase}..${input.candidate.head}`]))
+      .split("\n").filter(Boolean);
+    for (const commit of commits) await this.gitText(path, ["cherry-pick", commit]);
+    await this.applyCandidatePatch(input.sourcePath, path, ["diff", "--binary", "--no-ext-diff", "--cached"]);
+    await this.applyCandidatePatch(input.sourcePath, path, ["diff", "--binary", "--no-ext-diff"]);
+    for (const file of input.candidate.untrackedFiles) await copyCandidatePath(input.sourcePath, path, file.path);
+    await this.gitText(path, ["add", "-A"]);
+    const hasStaged = (await this.gitBuffer(path, ["diff", "--cached", "--quiet"]).catch((error): Buffer => {
+      if ((error as NodeJS.ErrnoException & { code?: number }).code === 1) return Buffer.from("changed");
+      throw error;
+    })).length > 0;
+    if (hasStaged) {
+      await this.gitText(path, ["-c", "user.name=Pi Herdr Controller", "-c", "user.email=pi-herdr@localhost", "commit", "-m", `Integrate candidate ${input.attemptId}`]);
+    }
+    const candidateCommit = await this.gitText(path, ["rev-parse", "HEAD"]);
+    if (candidateCommit === input.integration.head) throw new Error("Candidate contains no changes to integrate");
+    return { path, branch, baseCommit: input.integration.head, candidateCommit };
+  }
+
+  async advanceIntegration(input: {
+    integration: IntegrationWorktreeIdentity;
+    staging: StagedIntegrationCandidate;
+  }): Promise<string> {
+    const current = await this.inspectWorktree(input.integration.path);
+    if (current.head !== input.staging.baseCommit || current.branch !== input.integration.branch) {
+      throw new Error("Accepted batch base moved before integration advance");
+    }
+    await this.gitText(input.integration.path, ["merge", "--ff-only", input.staging.candidateCommit]);
+    return this.gitText(input.integration.path, ["rev-parse", "HEAD"]);
+  }
+
+  private async applyCandidatePatch(sourcePath: string, destinationPath: string, args: string[]): Promise<void> {
+    const patch = await this.gitBuffer(sourcePath, args);
+    if (patch.length === 0) return;
+    const patchPath = join(destinationPath, `.herdr-${hash(patch).slice(0, 12)}.patch`);
+    await writeFile(patchPath, patch, { mode: 0o600 });
+    try {
+      await this.gitText(destinationPath, ["apply", "--binary", "--", patchPath]);
+    } finally {
+      await unlink(patchPath).catch((): void => {});
+    }
+  }
+
   private async repositoryRoot(cwd: string): Promise<string> {
     return realpath(await this.gitText(cwd, ["rev-parse", "--show-toplevel"]));
   }
@@ -231,6 +363,19 @@ function parseWorktreeList(value: Buffer): Array<Record<string, string>> {
 
 function hash(value: Buffer | string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+async function copyCandidatePath(sourceRoot: string, destinationRoot: string, relativePath: string): Promise<void> {
+  const source = join(sourceRoot, relativePath);
+  const destination = join(destinationRoot, relativePath);
+  const metadata = await lstat(source);
+  await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
+  if (metadata.isSymbolicLink()) {
+    await symlink(await readlink(source), destination);
+    return;
+  }
+  if (!metadata.isFile()) throw new Error("Candidate untracked path is not a regular file or symbolic link");
+  await copyFile(source, destination);
 }
 
 async function fingerprintPaths(root: string, paths: string[]): Promise<GitFileFingerprint[]> {

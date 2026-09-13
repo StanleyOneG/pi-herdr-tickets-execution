@@ -134,6 +134,7 @@ export const MAX_STATUS_PAGE_SIZE = 50;
 export const MAX_ATTEMPT_DECISIONS = 50;
 export const MAX_ATTEMPT_REFERENCES = 50;
 export const MAX_ATTEMPT_DIAGNOSTICS = 20;
+export const MAX_CANDIDATE_RECEIPTS = 10;
 
 export type ExecutionLifecycle =
   | "claimed"
@@ -144,6 +145,9 @@ export type ExecutionLifecycle =
   | "pending-decision"
   | "takeover"
   | "completed-unaccepted"
+  | "accepting"
+  | "integration-blocked"
+  | "accepted"
   | "needs-attention"
   | "restart-required";
 
@@ -219,6 +223,86 @@ export interface WorkerObservation extends WorkerDispatchAcknowledgement {
   decision?: PendingDecisionInput;
   diagnostic?: string;
   completionText?: string;
+  /** True only after Pi reports agent_settled, not merely an idle-looking Herdr process. */
+  settled?: boolean;
+  outstandingJobs?: string[];
+}
+
+export interface CandidateGitState {
+  sourceBase: string;
+  head: string;
+  branch: string;
+  statusDigest: string;
+  indexDiffDigest: string;
+  worktreeDiffDigest: string;
+  untrackedFiles: GitFileFingerprint[];
+  candidateDigest: string;
+}
+
+export interface NativeEvidenceRecord {
+  kind: "tests" | "reviews";
+  status: "passed";
+  candidateDigest: string;
+  evidenceReference: string;
+  completedAt: string;
+}
+
+export interface GateCheckRecord {
+  command: string;
+  exitCode: number;
+  outputDigest: string;
+  logReference: string;
+  candidateCommit: string;
+  completedAt: string;
+}
+
+export interface AcceptanceReviewRecord {
+  kind: "standards" | "spec";
+  verdict: "passed" | "blocked";
+  candidateCommit: string;
+  reviewBase: string;
+  freshSessionId: string;
+  findings: string[];
+  evidenceReference: string;
+  completedAt: string;
+}
+
+export interface IntegrationWorktreeIdentity extends WorktreeIdentity {
+  preparationId: string;
+}
+
+export interface StagedIntegrationCandidate {
+  path: string;
+  branch: string;
+  baseCommit: string;
+  candidateCommit: string;
+}
+
+export interface CandidateReceipt {
+  id: string;
+  state: "captured" | "blocked" | "accepted";
+  capturedAt: string;
+  acceptedAt?: string;
+  proposalDigest: string;
+  specIdentity: string;
+  specRevision: string;
+  preparationId: string;
+  ticketIdentity: string;
+  attemptId: string;
+  sessionId: string;
+  sessionFile: string;
+  candidate: CandidateGitState;
+  nativeEvidence: NativeEvidenceRecord[];
+  checks: GateCheckRecord[];
+  reviews: AcceptanceReviewRecord[];
+  findings: string[];
+  evidenceReferences: string[];
+  integration?: {
+    worktree: IntegrationWorktreeIdentity;
+    staging: StagedIntegrationCandidate;
+    integratedCommit?: string;
+  };
+  cleanup?: "closed" | "failed";
 }
 
 export interface DecisionRecord extends PendingDecisionInput {
@@ -264,6 +348,8 @@ export interface ExecutionAttempt {
   decisions: DecisionRecord[];
   artifactReferences: string[];
   diagnostics: string[];
+  candidateReceipts?: CandidateReceipt[];
+  acceptedCommit?: string;
 }
 
 export interface StartTicketRequest {
@@ -287,6 +373,13 @@ export interface RecordWorkerObservationRequest extends AttemptRequest {
   observation: WorkerObservation;
 }
 
+export interface CaptureCandidateRequest extends AttemptRequest {}
+
+export interface AcceptCandidateRequest extends AttemptRequest {
+  candidateDigest: string;
+  nativeEvidence: NativeEvidenceRecord[];
+}
+
 export interface GitWorktreePort {
   planTicketWorktree(input: {
     originalRoot: string;
@@ -301,6 +394,41 @@ export interface GitWorktreePort {
   }): Promise<WorktreeIdentity>;
   inspectWorktree(path: string): Promise<WorktreeIdentity>;
   isCommitAncestor(path: string, ancestor: string, descendant: string): Promise<boolean>;
+  captureCandidate(input: { path: string; sourceBase: string }): Promise<CandidateGitState>;
+  prepareIntegrationWorktree(input: {
+    originalRoot: string;
+    preparationId: string;
+    targetBase: string;
+  }): Promise<IntegrationWorktreeIdentity>;
+  stageCandidate(input: {
+    originalRoot: string;
+    preparationId: string;
+    attemptId: string;
+    receiptId: string;
+    integration: IntegrationWorktreeIdentity;
+    sourcePath: string;
+    candidate: CandidateGitState;
+  }): Promise<StagedIntegrationCandidate>;
+  advanceIntegration(input: {
+    integration: IntegrationWorktreeIdentity;
+    staging: StagedIntegrationCandidate;
+  }): Promise<string>;
+}
+
+export interface AcceptanceReviewPort {
+  review(input: {
+    kind: "standards" | "spec";
+    workspaceId: string;
+    cwd: string;
+    reviewBase: string;
+    candidateCommit: string;
+    model: CapturedModel;
+    evidenceReferences: string[];
+  }): Promise<AcceptanceReviewRecord>;
+}
+
+export interface GateCheckPort {
+  execute(input: { cwd: string; command: string; candidateCommit: string }): Promise<GateCheckRecord>;
 }
 
 export interface WorkerRuntimePort {
@@ -315,9 +443,10 @@ export interface WorkerRuntimePort {
     model: CapturedModel;
   }): Promise<WorkerIdentity>;
   inspect(identity: WorkerIdentity): Promise<WorkerObservation>;
-  dispatchImplementation(identity: WorkerIdentity, ticketReference: string): Promise<WorkerDispatchAcknowledgement>;
+  dispatchImplementation(identity: WorkerIdentity, ticketReference: string, prerequisiteEvidence: string[]): Promise<WorkerDispatchAcknowledgement>;
   deliverDecision(identity: WorkerIdentity, decisionId: string, answer: string): Promise<WorkerObservation>;
   focus(identity: WorkerIdentity): Promise<void>;
+  close?(identity: WorkerIdentity): Promise<void>;
 }
 
 export interface SetupRuntimePort {
@@ -329,6 +458,10 @@ export interface ExecutionControllerDependencies {
   git: GitWorktreePort;
   worker: WorkerRuntimePort;
   setup?: SetupRuntimePort;
+  acceptance?: {
+    reviewer: AcceptanceReviewPort;
+    checks: GateCheckPort;
+  };
 }
 
 export interface ControllerState {

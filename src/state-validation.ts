@@ -1,7 +1,10 @@
 import { isAbsolute } from "node:path";
 
 import type {
+  AcceptanceReviewRecord,
   BatchProposal,
+  CandidateGitState,
+  CandidateReceipt,
   CapturedModel,
   ControllerState,
   DecisionRecord,
@@ -19,6 +22,7 @@ import {
   MAX_ATTEMPT_DECISIONS,
   MAX_ATTEMPT_DIAGNOSTICS,
   MAX_ATTEMPT_REFERENCES,
+  MAX_CANDIDATE_RECEIPTS,
   MAX_EXECUTION_ATTEMPTS,
   MAX_PREPARATIONS,
 } from "./contracts.js";
@@ -37,7 +41,7 @@ const RESOURCE_KINDS = new Set(["dependencies", "environment", "database", "port
 const ISOLATION_LEVELS = new Set(["isolated", "shared-safe", "serial-only", "unknown", "unsafe"]);
 const EXECUTION_LIFECYCLES = new Set([
   "claimed", "preparing-worktree", "starting", "running", "paused", "pending-decision",
-  "takeover", "completed-unaccepted", "needs-attention", "restart-required",
+  "takeover", "completed-unaccepted", "accepting", "integration-blocked", "accepted", "needs-attention", "restart-required",
 ]);
 const DECISION_STATES = new Set(["pending", "answered", "delivered"]);
 const REQUIRED_WORKER_SKILLS = ["skill:implement", "skill:tdd", "skill:code-review", "skill:handoff"];
@@ -77,6 +81,38 @@ export function isControllerState(value: unknown): value is ControllerState {
       attempt.originalCheckout.branch !== preparation.proposal.target.branch
     )) return false;
     if (attempt.worker && digest(attempt.worker.model) !== digest(preparation.proposal.model)) return false;
+    const receipts = attempt.candidateReceipts ?? [];
+    const receiptIds = receipts.map((receipt): string => receipt.id);
+    if (new Set(receiptIds).size !== receiptIds.length) return false;
+    const specEvidence = preparation.proposal.sourceEvidence.find(
+      (evidence): boolean => evidence.identity === preparation.proposal!.spec.evidenceIdentity,
+    );
+    if (!specEvidence || receipts.some((receipt): boolean =>
+      receipt.preparationId !== attempt.preparationId || receipt.ticketIdentity !== attempt.ticketIdentity ||
+      receipt.attemptId !== attempt.id || receipt.sessionId !== attempt.worker?.sessionId ||
+      receipt.sessionFile !== attempt.worker?.sessionFile ||
+      receipt.proposalDigest !== attempt.proposalDigest || receipt.specIdentity !== preparation.proposal!.spec.identity ||
+      receipt.specRevision !== specEvidence.revision || receipt.candidate.sourceBase !== attempt.worktree?.head ||
+      receipt.candidate.branch !== attempt.worktree?.branch ||
+      (receipt.integration !== undefined && (
+        receipt.integration.worktree.preparationId !== preparation.id ||
+        receipt.integration.worktree.commonDir !== attempt.worktree?.commonDir
+      ))
+    )) return false;
+    const acceptedReceipt = receipts.find((receipt): boolean => receipt.state === "accepted");
+    if (acceptedReceipt && (
+      !acceptedReceipt.nativeEvidence.some((item): boolean => item.kind === "tests") ||
+      !acceptedReceipt.nativeEvidence.some((item): boolean => item.kind === "reviews") ||
+      acceptedReceipt.nativeEvidence.some((item): boolean => item.candidateDigest !== acceptedReceipt.candidate.candidateDigest) ||
+      preparation.proposal.policy.checks.some((check): boolean => !acceptedReceipt.checks.some((record): boolean =>
+        record.command === check.command && record.exitCode === 0 && record.candidateCommit === acceptedReceipt.integration?.staging.candidateCommit
+      )) ||
+      preparation.proposal.policy.requiredReviews.some((kind): boolean => !acceptedReceipt.reviews.some((review): boolean =>
+        review.kind === kind && review.verdict === "passed" && review.findings.length === 0 &&
+        review.candidateCommit === acceptedReceipt.integration?.staging.candidateCommit &&
+        review.reviewBase === acceptedReceipt.integration?.staging.baseCommit
+      ))
+    )) return false;
   }
   const activeByPreparation = new Set<string>();
   for (const attempt of attempts.filter((item): boolean => isExecutingLifecycle(item.lifecycle))) {
@@ -94,6 +130,7 @@ function isExecutionAttempt(value: unknown): value is ExecutionAttempt {
     "id", "preparationId", "proposalDigest", "ticketIdentity", "workspaceId", "lifecycle", "owner",
     "createdAt", "updatedAt", "originalCheckout", "worktreePlan", "worktree", "candidateHead", "workerAllocation",
     "worker", "workerActiveAt", "controlGeneration", "setupOperations", "suspendedFrom", "decisions", "artifactReferences", "diagnostics",
+    "candidateReceipts", "acceptedCommit",
   ])) return false;
   if (
     !isBoundedString(value.id) || !isBoundedString(value.preparationId) || !isDigest(value.proposalDigest) ||
@@ -120,6 +157,15 @@ function isExecutionAttempt(value: unknown): value is ExecutionAttempt {
   if (new Set(value.artifactReferences).size !== value.artifactReferences.length) return false;
   if (!isSafeTextArray(value.diagnostics, MAX_ATTEMPT_DIAGNOSTICS, false)) return false;
   if (value.lifecycle === "needs-attention" ? value.diagnostics.length === 0 : value.diagnostics.length !== 0) return false;
+  if (value.candidateReceipts !== undefined && (
+    !Array.isArray(value.candidateReceipts) || value.candidateReceipts.length > MAX_CANDIDATE_RECEIPTS ||
+    !value.candidateReceipts.every(isCandidateReceipt)
+  )) return false;
+  if (value.acceptedCommit !== undefined && !isBoundedString(value.acceptedCommit)) return false;
+  if (value.acceptedCommit !== undefined && !value.candidateReceipts?.some((receipt): boolean =>
+    receipt.state === "accepted" && receipt.integration?.integratedCommit === value.acceptedCommit
+  )) return false;
+  if (value.lifecycle === "accepted" ? value.acceptedCommit === undefined : value.acceptedCommit !== undefined) return false;
   if (
     value.suspendedFrom !== undefined && value.lifecycle !== "paused" &&
     value.lifecycle !== "takeover" && value.lifecycle !== "restart-required"
@@ -151,11 +197,79 @@ function isExecutionAttempt(value: unknown): value is ExecutionAttempt {
   if (value.lifecycle === "starting") {
     return value.originalCheckout !== undefined && value.worktree !== undefined && value.decisions.length === 0;
   }
-  if (["running", "paused", "pending-decision", "takeover", "completed-unaccepted"].includes(value.lifecycle as string)) {
+  if (["running", "paused", "pending-decision", "takeover", "completed-unaccepted", "accepting", "integration-blocked", "accepted"].includes(value.lifecycle as string)) {
     return value.originalCheckout !== undefined && value.worktree !== undefined &&
       value.workerAllocation !== undefined && value.worker !== undefined;
   }
   return true;
+}
+
+function isCandidateReceipt(value: unknown): value is CandidateReceipt {
+  if (!isObject(value) || !hasOnlyKeys(value, [
+    "id", "state", "capturedAt", "acceptedAt", "proposalDigest", "specIdentity", "specRevision", "preparationId",
+    "ticketIdentity", "attemptId", "sessionId", "sessionFile", "candidate", "nativeEvidence", "checks", "reviews", "findings",
+    "evidenceReferences", "integration", "cleanup",
+  ])) return false;
+  if (!isBoundedString(value.id) || !["captured", "blocked", "accepted"].includes(value.state as string) ||
+    !isTimestamp(value.capturedAt) || (value.acceptedAt !== undefined && !isTimestamp(value.acceptedAt)) ||
+    !isDigest(value.proposalDigest) || !isBoundedString(value.specIdentity) ||
+    !isBoundedString(value.specRevision) || !isBoundedString(value.preparationId) || !isBoundedString(value.ticketIdentity) ||
+    !isBoundedString(value.attemptId) || !isBoundedString(value.sessionId) || !isBoundedString(value.sessionFile) ||
+    !isAbsolute(value.sessionFile) || !isCandidateGitState(value.candidate) ||
+    !Array.isArray(value.nativeEvidence) || value.nativeEvidence.length > 20 || !value.nativeEvidence.every(isNativeEvidence) ||
+    !Array.isArray(value.checks) || value.checks.length > 50 || !value.checks.every(isGateCheck) ||
+    !Array.isArray(value.reviews) || value.reviews.length > 10 || !value.reviews.every(isAcceptanceReview) ||
+    !isSafeTextArray(value.findings, 100, false) || !isSafeTextArray(value.evidenceReferences, 200, false)
+  ) return false;
+  if (value.integration !== undefined && (!isObject(value.integration) || !hasOnlyKeys(value.integration, ["worktree", "staging", "integratedCommit"]) ||
+    !isIntegrationWorktree(value.integration.worktree) || !isStagedCandidate(value.integration.staging) ||
+    (value.integration.integratedCommit !== undefined && !isBoundedString(value.integration.integratedCommit)))) return false;
+  if (value.cleanup !== undefined && value.cleanup !== "closed" && value.cleanup !== "failed") return false;
+  const integration = value.integration as CandidateReceipt["integration"];
+  return value.state === "accepted"
+    ? value.acceptedAt !== undefined && Date.parse(value.acceptedAt as string) >= Date.parse(value.capturedAt as string) &&
+      integration?.integratedCommit === integration?.staging.candidateCommit
+    : value.acceptedAt === undefined && integration?.integratedCommit === undefined;
+}
+
+function isCandidateGitState(value: unknown): value is CandidateGitState {
+  return isObject(value) && hasOnlyKeys(value, [
+    "sourceBase", "head", "branch", "statusDigest", "indexDiffDigest", "worktreeDiffDigest", "untrackedFiles", "candidateDigest",
+  ]) && isBoundedString(value.sourceBase) && isBoundedString(value.head) && isBoundedString(value.branch) &&
+    isDigest(value.statusDigest) && isDigest(value.indexDiffDigest) && isDigest(value.worktreeDiffDigest) &&
+    isFileFingerprints(value.untrackedFiles) && isDigest(value.candidateDigest);
+}
+
+function isNativeEvidence(value: unknown): boolean {
+  return isObject(value) && hasOnlyKeys(value, ["kind", "status", "candidateDigest", "evidenceReference", "completedAt"]) &&
+    (value.kind === "tests" || value.kind === "reviews") && value.status === "passed" && isDigest(value.candidateDigest) &&
+    isSafeText(value.evidenceReference, 4_096) && isTimestamp(value.completedAt);
+}
+
+function isGateCheck(value: unknown): boolean {
+  return isObject(value) && hasOnlyKeys(value, ["command", "exitCode", "outputDigest", "logReference", "candidateCommit", "completedAt"]) &&
+    typeof value.command === "string" && value.command.length <= 4_096 && isNonnegativeInteger(value.exitCode) &&
+    isDigest(value.outputDigest) && isSafeText(value.logReference, 4_096) && isBoundedString(value.candidateCommit) && isTimestamp(value.completedAt);
+}
+
+function isAcceptanceReview(value: unknown): value is AcceptanceReviewRecord {
+  return isObject(value) && hasOnlyKeys(value, [
+    "kind", "verdict", "candidateCommit", "reviewBase", "freshSessionId", "findings", "evidenceReference", "completedAt",
+  ]) && (value.kind === "standards" || value.kind === "spec") && (value.verdict === "passed" || value.verdict === "blocked") &&
+    isBoundedString(value.candidateCommit) && isBoundedString(value.reviewBase) && isBoundedString(value.freshSessionId) &&
+    isSafeTextArray(value.findings, 50, false) && isSafeText(value.evidenceReference, 4_096) && isTimestamp(value.completedAt);
+}
+
+function isIntegrationWorktree(value: unknown): boolean {
+  return isObject(value) && hasOnlyKeys(value, ["path", "branch", "commonDir", "head", "preparationId"]) &&
+    isBoundedString(value.path) && isAbsolute(value.path) && isBoundedString(value.branch) &&
+    isBoundedString(value.commonDir) && isAbsolute(value.commonDir) && isBoundedString(value.head) && isBoundedString(value.preparationId);
+}
+
+function isStagedCandidate(value: unknown): boolean {
+  return isObject(value) && hasOnlyKeys(value, ["path", "branch", "baseCommit", "candidateCommit"]) &&
+    isBoundedString(value.path) && isAbsolute(value.path) && isBoundedString(value.branch) &&
+    isBoundedString(value.baseCommit) && isBoundedString(value.candidateCommit);
 }
 
 function isSetupOperationRecord(value: unknown): boolean {
@@ -265,7 +379,7 @@ function isDecision(value: unknown): value is DecisionRecord {
 }
 
 function isExecutingLifecycle(lifecycle: ExecutionAttempt["lifecycle"]): boolean {
-  return lifecycle !== "completed-unaccepted" && lifecycle !== "needs-attention";
+  return !["completed-unaccepted", "integration-blocked", "accepted", "needs-attention"].includes(lifecycle);
 }
 
 function isPreparationRecord(value: unknown): value is PreparationRecord {

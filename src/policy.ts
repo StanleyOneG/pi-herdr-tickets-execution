@@ -167,6 +167,9 @@ export function validateProposal(record: PreparationRecord, proposal: BatchPropo
   if (!proposal.policy.requiredReviews.includes("standards") || !proposal.policy.requiredReviews.includes("spec")) {
     failures.push("Standards and spec reviews are required");
   }
+  if (new Set(proposal.policy.requiredReviews).size !== proposal.policy.requiredReviews.length) {
+    failures.push("Required reviews must be unique");
+  }
   if (!proposal.policy.implementationSkillTestingRequired) failures.push("Batch policy cannot weaken implementation-skill testing");
   for (const check of proposal.policy.checks) {
     if (!check.command.trim() || !check.source.trim()) failures.push("Optional checks require a command and coding-standards source");

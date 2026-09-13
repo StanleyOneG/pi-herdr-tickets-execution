@@ -8,7 +8,9 @@ import type {
   WorkerBridgeTransport,
   WorkerDecisionAnswer,
   WorkerDecisionRequest,
+  WorkerLifecycleReceipt,
   WorkerReadinessReceipt,
+  WorkerReviewReceipt,
 } from "./worker-bridge-protocol.js";
 
 const MAX_RECEIPT_BYTES = 256 * 1024;
@@ -58,6 +60,8 @@ export class FileWorkerBridgeTransport implements WorkerBridgeTransport {
       nonce,
       requestDirectory,
       responseDirectory,
+      lifecycleEndpoint: join(channelDirectory, "lifecycle.json"),
+      reviewEndpoint: join(channelDirectory, "review.json"),
     };
     await atomicWritePrivateFile(join(this.directory, `${agentName}.channel.json`), `${JSON.stringify(channel)}\n`);
     return channel;
@@ -111,6 +115,34 @@ export class FileWorkerBridgeTransport implements WorkerBridgeTransport {
     await atomicWritePrivateFile(join(channel.responseDirectory!, `${answer.id}.json`), `${JSON.stringify(answer)}\n`);
   }
 
+  async readLifecycle(channel: WorkerBridgeChannel): Promise<WorkerLifecycleReceipt | undefined> {
+    this.assertOwnedChannel(channel);
+    try {
+      const parsed: unknown = JSON.parse(await readBounded(channel.lifecycleEndpoint!));
+      if (!isLifecycleReceipt(parsed) || parsed.nonce !== channel.nonce) throw new Error("Worker lifecycle receipt is malformed or stale");
+      return parsed;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+  }
+
+  async waitForReview(channel: WorkerBridgeChannel, timeoutMs: number): Promise<WorkerReviewReceipt> {
+    this.assertOwnedChannel(channel);
+    const deadline = this.now() + timeoutMs;
+    for (;;) {
+      try {
+        const parsed: unknown = JSON.parse(await readBounded(channel.reviewEndpoint!));
+        if (!isReviewReceipt(parsed) || parsed.nonce !== channel.nonce) throw new Error("Worker review receipt is malformed or stale");
+        return parsed;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      if (this.now() >= deadline) throw new Error("Worker review receipt timed out");
+      await this.sleep(this.pollIntervalMs);
+    }
+  }
+
   private async prepareRoot(): Promise<void> {
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
     await chmod(this.directory, 0o700);
@@ -127,7 +159,9 @@ export class FileWorkerBridgeTransport implements WorkerBridgeTransport {
       basename(channelDirectory).endsWith(`-${channel.nonce}`) &&
       channel.endpoint === join(channelDirectory, "readiness.json") &&
       channel.requestDirectory === join(channelDirectory, "requests") &&
-      channel.responseDirectory === join(channelDirectory, "responses");
+      channel.responseDirectory === join(channelDirectory, "responses") &&
+      channel.lifecycleEndpoint === join(channelDirectory, "lifecycle.json") &&
+      channel.reviewEndpoint === join(channelDirectory, "review.json");
   }
 }
 
@@ -140,7 +174,8 @@ async function readBounded(path: string): Promise<string> {
 function isChannel(value: unknown): value is Required<WorkerBridgeChannel> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const channel = value as WorkerBridgeChannel;
-  return [channel.endpoint, channel.requestDirectory, channel.responseDirectory].every((path): boolean => typeof path === "string" && isAbsolute(path)) &&
+  return [channel.endpoint, channel.requestDirectory, channel.responseDirectory, channel.lifecycleEndpoint, channel.reviewEndpoint]
+    .every((path): boolean => typeof path === "string" && isAbsolute(path)) &&
     typeof channel.nonce === "string" && SAFE_ID.test(channel.nonce);
 }
 
@@ -151,6 +186,25 @@ function isDecisionRequest(value: unknown): value is WorkerDecisionRequest {
     Number.isFinite(Date.parse(request.requestedAt)) && safeText(request.question, 4_000) && safeText(request.context, 4_000) &&
     Array.isArray(request.options) && request.options.length >= 1 && request.options.length <= 20 &&
     request.options.every((option): boolean => safeText(option, 1_000)) && safeText(request.recommendation, 4_000);
+}
+
+function isLifecycleReceipt(value: unknown): value is WorkerLifecycleReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const receipt = value as WorkerLifecycleReceipt;
+  return receipt.schemaVersion === 1 && SAFE_ID.test(receipt.nonce) && safeText(receipt.sessionId, 4_096) &&
+    (receipt.state === "working" || receipt.state === "settled") && Number.isFinite(Date.parse(receipt.observedAt)) &&
+    Array.isArray(receipt.outstandingJobs) && receipt.outstandingJobs.length <= 50 &&
+    receipt.outstandingJobs.every((job): boolean => safeText(job, 4_096));
+}
+
+function isReviewReceipt(value: unknown): value is WorkerReviewReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const receipt = value as WorkerReviewReceipt;
+  return receipt.schemaVersion === 1 && SAFE_ID.test(receipt.nonce) && safeText(receipt.sessionId, 4_096) &&
+    (receipt.kind === "standards" || receipt.kind === "spec") && (receipt.verdict === "passed" || receipt.verdict === "blocked") &&
+    safeText(receipt.candidateCommit, 4_096) && safeText(receipt.reviewBase, 4_096) &&
+    Array.isArray(receipt.findings) && receipt.findings.length <= 50 && receipt.findings.every((finding): boolean => safeText(finding, 4_000)) &&
+    Number.isFinite(Date.parse(receipt.completedAt));
 }
 
 function isDecisionAnswer(value: unknown): value is WorkerDecisionAnswer {

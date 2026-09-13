@@ -13,7 +13,9 @@ import { Type, type Static } from "typebox";
 import {
   type AdmissionSnapshot,
   type ApprovalRequest,
+  type AcceptCandidateRequest,
   type BatchProposal,
+  type CandidateReceipt,
   type CapturedModel,
   type ControllerResult,
   type ControllerStatus,
@@ -114,6 +116,18 @@ const SUBMIT_SCHEMA = Type.Object({
 });
 type SubmitInput = Static<typeof SUBMIT_SCHEMA>;
 
+const ACCEPT_CANDIDATE_SCHEMA = Type.Object({
+  attemptId: Type.String({ minLength: 1 }),
+  candidateDigest: Type.String({ pattern: "^[a-fA-F0-9]{64}$" }),
+  nativeEvidence: Type.Array(Type.Object({
+    kind: StringEnum(["tests", "reviews"] as const),
+    status: StringEnum(["passed"] as const),
+    candidateDigest: Type.String({ pattern: "^[a-fA-F0-9]{64}$" }),
+    evidenceReference: Type.String({ minLength: 1, maxLength: 4_096 }),
+    completedAt: Type.String({ minLength: 1 }),
+  }), { minItems: 2, maxItems: 20 }),
+});
+type AcceptCandidateInput = Static<typeof ACCEPT_CANDIDATE_SCHEMA>;
 const PREPARATION_ID_SCHEMA = Type.Object({ preparationId: Type.String({ minLength: 1 }) });
 type PreparationIdInput = Static<typeof PREPARATION_ID_SCHEMA>;
 const APPROVE_SCHEMA = Type.Object({
@@ -261,6 +275,11 @@ function attemptSummary(attempt: ExecutionAttempt, status: ControllerStatus): st
     lines.push(`    recommendation: ${decision.recommendation}`);
   }
   for (const reference of attempt.artifactReferences) lines.push(`  artifact ${reference}`);
+  for (const receipt of attempt.candidateReceipts ?? []) {
+    lines.push(`  candidate ${receipt.id} ${receipt.state} ${receipt.candidate.candidateDigest.slice(0, 12)}`);
+    if (receipt.integration?.integratedCommit) lines.push(`    integrated ${receipt.integration.integratedCommit}`);
+    for (const finding of receipt.findings) lines.push(`    finding ${finding}`);
+  }
   for (const diagnostic of attempt.diagnostics) lines.push(`  attention ${diagnostic}`);
   return lines;
 }
@@ -277,7 +296,7 @@ function renderControllerStatus(ctx: ExtensionContext, status: ControllerStatus)
   ];
   if (lines.length === 0) lines.push("No Herdr preparations or attempts in this repository");
   const activeCount = status.executionAttempts.filter(
-    (attempt): boolean => !["completed-unaccepted", "needs-attention"].includes(attempt.lifecycle),
+    (attempt): boolean => !["completed-unaccepted", "integration-blocked", "accepted", "needs-attention"].includes(attempt.lifecycle),
   ).length;
   const decisionCount = status.executionAttempts.reduce(
     (count, attempt): number => count + attempt.decisions.filter((decision): boolean => decision.state !== "delivered").length,
@@ -368,6 +387,21 @@ function preparationPrompt(preparationId: string, specReference: string, instruc
   ].join("\n\n");
 }
 
+function acceptancePrompt(receipt: CandidateReceipt): string {
+  return [
+    "Assess the native implementation-skill evidence for this already captured candidate; do not edit code or mutate the tracker.",
+    `Attempt: ${receipt.attemptId}`,
+    `Ticket: ${receipt.ticketIdentity}`,
+    `Candidate digest captured from actual Git state: ${receipt.candidate.candidateDigest}`,
+    `Source base: ${receipt.candidate.sourceBase}`,
+    `Worker saved session: ${receipt.sessionId} at ${receipt.sessionFile}`,
+    `Existing evidence references: ${receipt.evidenceReferences.join(", ") || "none"}`,
+    "Inspect the saved worker session and referenced artifacts. Identify explicit successful native implementation-skill test evidence and native review evidence that correspond to this exact candidate, including uncommitted state. Do not turn a completion sentence, successful prompt submission, idle status, or worker-reported hash into evidence.",
+    "Call herdr_accept_candidate exactly once with separate tests and reviews records, each bound to the candidate digest and its retained evidence reference. If either is missing, stale, failed, or ambiguous, report that acceptance is blocked and do not call the tool.",
+    "The controller will independently execute approved checks and separate fresh Standards and Spec reviews in isolated integration staging before advancing the batch branch. It will not close tracker issues.",
+  ].join("\n\n");
+}
+
 function approvalPrompt(preparationId: string): string {
   return [
     `Revalidate preparation ${preparationId} for explicit approval; do not implement any ticket.`,
@@ -432,6 +466,21 @@ export function registerHerdrExtension(
         return;
       }
       await pi.sendUserMessage(approvalPrompt(preparationId));
+    },
+  });
+
+  pi.registerCommand("herdr-accept", {
+    description: "Capture a settled candidate and start evidence-bound acceptance reasoning",
+    handler: async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
+      try {
+        const values = commandArguments(args, 1);
+        if (!values) throw new Error("Usage: /herdr-accept <attempt-id>");
+        const controller = await controllerFor(pi, ctx, dependencies);
+        const receipt = unwrapResult(await controller.captureCandidate({ attemptId: values[0]! }));
+        await pi.sendUserMessage(acceptancePrompt(receipt));
+      } catch (error) {
+        reportError(ctx, error);
+      }
     },
   });
 
@@ -566,6 +615,32 @@ export function registerHerdrExtension(
       } catch (error) {
         reportError(ctx, error);
       }
+    },
+  });
+
+  pi.registerTool({
+    name: "herdr_accept_candidate",
+    label: "Accept Herdr Candidate",
+    description: "Submit candidate-bound evidence from the native implementation skill. The daemon independently stages, checks, reviews, and integrates the exact captured candidate; failures leave the accepted batch branch unchanged.",
+    parameters: ACCEPT_CANDIDATE_SCHEMA,
+    async execute(
+      _toolCallId: string,
+      params: AcceptCandidateInput,
+      _signal: AbortSignal | undefined,
+      _onUpdate: AgentToolUpdateCallback<unknown> | undefined,
+      ctx: ExtensionContext,
+    ): Promise<AgentToolResult<unknown>> {
+      const accepted = unwrapResult(await (await controllerFor(pi, ctx, dependencies)).acceptCandidate(
+        params as unknown as AcceptCandidateRequest,
+      ));
+      const status: ControllerStatus = { preparations: [], executionAttempts: [accepted], nextCursor: null, hasMore: false };
+      renderControllerStatus(ctx, status);
+      return {
+        content: [{ type: "text", text: accepted.lifecycle === "accepted"
+          ? `Accepted ${accepted.ticketIdentity} as ${accepted.acceptedCommit}. Tracker issues remain unchanged.`
+          : `Candidate is ${accepted.lifecycle}; inspect its retained findings and evidence.` }],
+        details: { attemptId: accepted.id, lifecycle: accepted.lifecycle, acceptedCommit: accepted.acceptedCommit },
+      };
     },
   });
 

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, unlink } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 
+import { StringEnum } from "@earendil-works/pi-ai";
 import type {
   AgentToolResult,
   AgentToolUpdateCallback,
@@ -19,12 +20,22 @@ import {
   WORKER_BRIDGE_NONCE_ENV,
   WORKER_DECISION_REQUEST_DIRECTORY_ENV,
   WORKER_DECISION_RESPONSE_DIRECTORY_ENV,
+  WORKER_REVIEW_ENDPOINT_ENV,
+  WORKER_REVIEW_NONCE_ENV,
   type WorkerDecisionAnswer,
   type WorkerDecisionRequest,
   type WorkerReadinessReceipt,
 } from "./worker-bridge-protocol.js";
 
 const HISTORY_ENTRY_TYPES = new Set(["message", "custom_message", "compaction", "branch_summary"]);
+const REVIEW_SCHEMA = Type.Object({
+  kind: StringEnum(["standards", "spec"] as const),
+  verdict: StringEnum(["passed", "blocked"] as const),
+  candidateCommit: Type.String({ minLength: 1, maxLength: 4_096 }),
+  reviewBase: Type.String({ minLength: 1, maxLength: 4_096 }),
+  findings: Type.Array(Type.String({ minLength: 1, maxLength: 4_000 }), { maxItems: 50 }),
+});
+type ReviewInput = Static<typeof REVIEW_SCHEMA>;
 const DECISION_SCHEMA = Type.Object({
   question: Type.String({ minLength: 1, maxLength: 4_000 }),
   context: Type.String({ minLength: 1, maxLength: 4_000 }),
@@ -39,12 +50,44 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   pi.on("session_start", (event, _ctx): void => {
     sessionStartReason = event.reason;
   });
+  pi.on("agent_start", async (_event, ctx): Promise<void> => {
+    await writeLifecycle(ctx, "working");
+  });
+  pi.on("agent_settled", async (_event, ctx): Promise<void> => {
+    await writeLifecycle(ctx, "settled");
+  });
 
   pi.registerCommand("herdr-worker-ready", {
     description: "Report attempt-bound Pi identity and normal resource readiness to the local Herdr controller",
     handler: async (_args: string, ctx: ExtensionCommandContext): Promise<void> => {
       const receipt = collectWorkerReadiness(pi, ctx);
       await writeReceipt(receipt);
+    },
+  });
+
+  pi.registerTool({
+    name: "herdr_submit_acceptance_review",
+    label: "Submit Acceptance Review",
+    description: "Submit the final structured result for an attempt-bound fresh Standards or Spec review. Use blocked whenever any blocking finding remains.",
+    parameters: REVIEW_SCHEMA,
+    async execute(
+      _toolCallId: string,
+      params: ReviewInput,
+      _signal: AbortSignal | undefined,
+      _onUpdate: AgentToolUpdateCallback<unknown> | undefined,
+      ctx: ExtensionContext,
+    ): Promise<AgentToolResult<unknown>> {
+      const endpoint = process.env[WORKER_REVIEW_ENDPOINT_ENV];
+      const nonce = process.env[WORKER_REVIEW_NONCE_ENV];
+      if (!endpoint || !isAbsolute(endpoint) || !nonce) throw new Error("Attempt-bound review channel is incomplete");
+      await atomicWritePrivateFile(endpoint, `${JSON.stringify({
+        schemaVersion: 1,
+        nonce,
+        sessionId: ctx.sessionManager.getSessionId(),
+        completedAt: new Date().toISOString(),
+        ...params,
+      })}\n`);
+      return { content: [{ type: "text", text: `Recorded ${params.kind} review as ${params.verdict}.` }], details: { kind: params.kind, verdict: params.verdict }, terminate: true };
     },
   });
 
@@ -152,6 +195,21 @@ export async function requestLocalDecision(input: DecisionInput, signal?: AbortS
     }
     await new Promise((resolve): void => { setTimeout(resolve, 100); });
   }
+}
+
+async function writeLifecycle(ctx: ExtensionContext, state: "working" | "settled"): Promise<void> {
+  const endpoint = process.env[WORKER_BRIDGE_ENDPOINT_ENV];
+  const nonce = process.env[WORKER_BRIDGE_NONCE_ENV];
+  if (!endpoint || !nonce || !isAbsolute(endpoint)) return;
+  const lifecycleEndpoint = join(dirname(endpoint), "lifecycle.json");
+  await atomicWritePrivateFile(lifecycleEndpoint, `${JSON.stringify({
+    schemaVersion: 1,
+    nonce,
+    sessionId: ctx.sessionManager.getSessionId(),
+    state,
+    observedAt: new Date().toISOString(),
+    outstandingJobs: [],
+  })}\n`);
 }
 
 async function writeReceipt(receipt: WorkerReadinessReceipt): Promise<void> {
