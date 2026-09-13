@@ -59,6 +59,29 @@ interface NativeExecutionProof {
   codeStateDigest: string;
   completedAt: string;
   executionReference: string;
+  sourceArtifact?: { reference: string; digest: string };
+}
+interface PendingSubagentLaunch {
+  toolCallId: string;
+  cwd: string;
+  sourceSessionId: string;
+  sourceSessionIdentities: Set<string>;
+  codeStateDigest: string;
+  args: unknown;
+  launchedAt: number;
+}
+interface AsyncStartObservation {
+  runId: string;
+  sessionId: string;
+  completionOwnerId: string;
+  mode: "parallel" | "workflow";
+  agents: string[];
+  cwd: string;
+  asyncDir: string;
+}
+interface AsyncReviewLaunch extends PendingSubagentLaunch {
+  runId: string;
+  start: AsyncStartObservation;
 }
 let sessionStartReason: WorkerReadinessReceipt["sessionStartReason"] | undefined;
 
@@ -68,6 +91,13 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   const observedCommandDigests: string[] = [];
   const nativeTestDiagnostics: string[] = [];
   const activeSubagentRuns = new Set<string>();
+  const pendingSubagentLaunches = new Map<string, PendingSubagentLaunch>();
+  const asyncStartObservations = new Map<string, AsyncStartObservation>();
+  const asyncReviewLaunches = new Map<string, AsyncReviewLaunch>();
+  const pendingAsyncCompletions = new Map<string, unknown>();
+  const terminalAsyncReviewRuns = new Set<string>();
+  const consumedReviewerSessions = new Set<string>();
+  const activeAsyncReviewCaptures = new Set<string>();
   const nativeExecutions = new Map<string, NativeExecutionProof>();
   let failedBashCommand = false;
   let mutationToolUsed = false;
@@ -82,19 +112,50 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   const outstandingJobs = (): string[] => [
     ...(isAgentRunning ? ["pi-agent-run"] : []),
     ...[...activeTools].sort().map((id): string => `pi-tool:${id}`),
+    ...[...activeAsyncReviewCaptures].sort().map((id): string => `native-async-review-capture:${id}`),
   ];
+  const consumeAsyncReviewCompletion = (runId: string, payload: unknown): void => {
+    const launch = asyncReviewLaunches.get(runId);
+    if (!launch || terminalAsyncReviewRuns.has(runId)) {
+      if (!launch && !terminalAsyncReviewRuns.has(runId) && asyncStartObservations.has(runId)) {
+        pendingAsyncCompletions.set(runId, payload);
+      }
+      return;
+    }
+    terminalAsyncReviewRuns.add(runId);
+    asyncReviewLaunches.delete(runId);
+    pendingAsyncCompletions.delete(runId);
+    activeAsyncReviewCaptures.add(runId);
+    void retainAsyncNativeReview(nativeExecutions, consumedReviewerSessions, launch, payload)
+      .catch(async (): Promise<void> => {
+        await invalidateNativeExecutions(nativeExecutions, "reviews", launch.cwd);
+      })
+      .finally((): void => { activeAsyncReviewCaptures.delete(runId); });
+  };
   pi.events.on("subagent:async-started", (payload: unknown): void => {
     const id = eventIdentity(payload);
-    if (id) activeSubagentRuns.add(id);
+    if (!id) return;
+    activeSubagentRuns.add(id);
+    const observation = parseAsyncReviewStart(payload);
+    if (observation) asyncStartObservations.set(id, observation);
   });
   pi.events.on("subagent:async-complete", (payload: unknown): void => {
     const id = eventIdentity(payload);
-    if (id) activeSubagentRuns.delete(id);
+    if (!id) return;
+    activeSubagentRuns.delete(id);
+    consumeAsyncReviewCompletion(id, payload);
   });
   pi.on("session_start", (event, _ctx): void => {
     sessionStartReason = event.reason;
     activeTools.clear();
     activeSubagentRuns.clear();
+    pendingSubagentLaunches.clear();
+    asyncStartObservations.clear();
+    asyncReviewLaunches.clear();
+    pendingAsyncCompletions.clear();
+    terminalAsyncReviewRuns.clear();
+    consumedReviewerSessions.clear();
+    activeAsyncReviewCaptures.clear();
     observedCommandDigests.length = 0;
     nativeTestDiagnostics.length = 0;
     failedBashCommand = false;
@@ -108,6 +169,21 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   pi.on("tool_execution_start", async (event, ctx): Promise<void> => {
     activeTools.add(event.toolCallId);
     if (event.toolName === "edit" || event.toolName === "write") mutationToolUsed = true;
+    if (event.toolName === "subagent") {
+      const sourceSessionId = ctx.sessionManager.getSessionId();
+      if (sourceSessionId) {
+        const sessionFile = ctx.sessionManager.getSessionFile?.();
+        pendingSubagentLaunches.set(event.toolCallId, {
+          toolCallId: event.toolCallId,
+          cwd: ctx.cwd,
+          sourceSessionId,
+          sourceSessionIdentities: new Set([sourceSessionId, ...(sessionFile ? [sessionFile] : [])]),
+          codeStateDigest: await captureCodeStateDigest(ctx.cwd),
+          args: event.args,
+          launchedAt: Date.now(),
+        });
+      }
+    }
     await writeLifecycle(ctx, "working", outstandingJobs());
   });
   pi.on("tool_result", async (event, ctx): Promise<void> => {
@@ -134,12 +210,30 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   });
   pi.on("tool_execution_end", async (event, ctx): Promise<void> => {
     activeTools.delete(event.toolCallId);
+    const pendingLaunch = pendingSubagentLaunches.get(event.toolCallId);
+    pendingSubagentLaunches.delete(event.toolCallId);
+    if (event.toolName === "subagent" && event.isError && pendingLaunch && looksLikeAnyReviewRequest(pendingLaunch.args)) {
+      await invalidateNativeExecutions(nativeExecutions, "reviews", ctx.cwd);
+    }
     if (event.toolName === "subagent" && !event.isError) {
-      const reviewResult = classifyNativeReviewResult(event.result);
-      if (reviewResult === "passed") {
-        await retainNativeExecution(nativeExecutions, event.toolCallId, "reviews", ctx.cwd, ctx.sessionManager.getSessionId(), "subagent:structured-acceptance:no-blockers");
-      } else if (reviewResult === "blocked") {
+      const asyncResult = parseAsyncLaunchResult(event.result);
+      const asyncStart = asyncResult ? asyncStartObservations.get(asyncResult.runId) : undefined;
+      if (pendingLaunch && looksLikeReviewRequest(pendingLaunch.args) && (asyncResult || isAsyncLaunchLike(event.result))) {
         await invalidateNativeExecutions(nativeExecutions, "reviews", ctx.cwd);
+        if (asyncResult && asyncStart && isBoundAsyncReviewLaunch(pendingLaunch, asyncStart, asyncResult)) {
+          asyncReviewLaunches.set(asyncResult.runId, { ...pendingLaunch, runId: asyncResult.runId, start: asyncStart });
+          asyncStartObservations.delete(asyncResult.runId);
+          const pendingCompletion = pendingAsyncCompletions.get(asyncResult.runId);
+          if (pendingCompletion) consumeAsyncReviewCompletion(asyncResult.runId, pendingCompletion);
+        }
+      } else {
+        const reviewResult = classifyNativeReviewResult(event.result);
+        if (reviewResult === "passed") {
+          await invalidateNativeExecutions(nativeExecutions, "reviews", ctx.cwd);
+          await retainNativeExecution(nativeExecutions, event.toolCallId, "reviews", ctx.cwd, ctx.sessionManager.getSessionId(), "subagent:structured-acceptance:no-blockers");
+        } else if (reviewResult === "blocked") {
+          await invalidateNativeExecutions(nativeExecutions, "reviews", ctx.cwd);
+        }
       }
     }
     await writeLifecycle(ctx, "working", outstandingJobs());
@@ -168,7 +262,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   });
 
   pi.on("before_agent_start", (event): { systemPrompt: string } => ({
-    systemPrompt: `${event.systemPrompt}\n\nHerdr native evidence requirements: run project-native tests through one directly executed bash test command after the final edit; shell wrappers, chaining, output claims, status masking, help/version/list/collect-only/no-run/dry-run modes, typecheck, and lint do not count as tests. Rerun an obligation successfully if a later test fails or review blocks on the same code state. Perform the implementation skill's final review with the installed subagent tool in foreground mode and require a structured acceptance report whose reviewFindings explicitly says no blockers. The live worker bridge automatically captures both execution-backed results when Pi settles on the unchanged final code state. Do not manufacture receipt files or substitute a prose completion claim.`,
+    systemPrompt: `${event.systemPrompt}\n\nHerdr native evidence requirements: run project-native tests through one directly executed bash test command after the final edit; shell wrappers, chaining, output claims, status masking, help/version/list/collect-only/no-run/dry-run modes, typecheck, and lint do not count as tests. Rerun an obligation successfully if a later test fails or review blocks on the same code state. Perform the implementation skill's final review with the installed subagent tool. Its ordinary asynchronous parallel code-review workflow is supported when every reviewer uses a fresh context, retains its output artifact, and ends with exactly one "Merge verdict: BLOCK", "Merge verdict: OK", or "Merge verdict: OK with notes" line. Foreground reviews remain supported when they return structured no-blocker acceptance metadata. The live worker bridge automatically captures execution-backed results when Pi settles on the unchanged final code state. Do not manufacture receipt files or substitute a prose completion claim.`,
   }));
 
   pi.registerTool({
@@ -485,19 +579,23 @@ async function produceNativeEvidence(
   const nativeEvidence: NativeEvidenceRecord[] = [];
   for (const selectedProof of selected) {
     const [, proof] = selectedProof!;
-    const completedAt = new Date().toISOString();
+    const completedAt = proof.completedAt;
     const id = randomUUID();
-    const sourcePath = join(evidenceDirectory, `${proof.kind}-${id}-execution.json`);
-    const source = `${JSON.stringify({
-      schemaVersion: 1,
-      producer: "pi-native-skill",
-      kind: proof.kind,
-      status: "passed",
-      codeStateDigest: candidate.codeStateDigest,
-      completedAt,
-      executionReferences: [proof.executionReference],
-    })}\n`;
-    await atomicWritePrivateFile(sourcePath, source);
+    let sourceArtifact = proof.sourceArtifact;
+    if (!sourceArtifact) {
+      const sourcePath = join(evidenceDirectory, `${proof.kind}-${id}-execution.json`);
+      const source = `${JSON.stringify({
+        schemaVersion: 1,
+        producer: "pi-native-skill",
+        kind: proof.kind,
+        status: "passed",
+        codeStateDigest: candidate.codeStateDigest,
+        completedAt,
+        executionReferences: [proof.executionReference],
+      })}\n`;
+      await atomicWritePrivateFile(sourcePath, source);
+      sourceArtifact = { reference: sourcePath, digest: createHash("sha256").update(source).digest("hex") };
+    }
     const manifestPath = join(evidenceDirectory, `${proof.kind}-${id}-receipt.json`);
     const manifest = `${JSON.stringify({
       schemaVersion: 1,
@@ -505,7 +603,7 @@ async function produceNativeEvidence(
       status: "passed",
       codeStateDigest: candidate.codeStateDigest,
       completedAt,
-      artifacts: [{ reference: sourcePath, digest: createHash("sha256").update(source).digest("hex") }],
+      artifacts: [sourceArtifact],
     })}\n`;
     await atomicWritePrivateFile(manifestPath, manifest);
     nativeEvidence.push({
@@ -553,6 +651,17 @@ async function invalidateNativeExecutions(
   for (const [toolCallId, proof] of executions) {
     if (proof.kind === kind && proof.codeStateDigest === codeStateDigest) executions.delete(toolCallId);
   }
+  await revokePublishedNativeEvidence();
+}
+
+async function revokePublishedNativeEvidence(): Promise<void> {
+  const endpoint = process.env[WORKER_BRIDGE_ENDPOINT_ENV];
+  if (!endpoint || !isAbsolute(endpoint)) return;
+  try {
+    await unlink(join(dirname(endpoint), "native-evidence", "latest.json"));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
 }
 
 async function captureCodeStateDigest(cwd: string): Promise<string> {
@@ -560,6 +669,174 @@ async function captureCodeStateDigest(cwd: string): Promise<string> {
   const worktree = await git.inspectWorktree(cwd);
   const candidate = await git.captureCandidate({ path: cwd, sourceBase: worktree.head });
   return candidate.codeStateDigest;
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function serializeBoundedToolArgs(args: unknown): string | undefined {
+  try {
+    const serialized = JSON.stringify(args);
+    return serialized.length <= 128 * 1024 ? serialized : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function looksLikeAnyReviewRequest(args: unknown): boolean {
+  const serialized = serializeBoundedToolArgs(args);
+  return Boolean(serialized && /review/i.test(serialized));
+}
+
+function looksLikeReviewRequest(args: unknown): boolean {
+  const serialized = serializeBoundedToolArgs(args);
+  // Start events redact tasks, so intent is later joined to resolved reviewer identities and the host result.
+  return Boolean(serialized && /review/i.test(serialized) &&
+    ((/standards/i.test(serialized) && /\bspec\b/i.test(serialized)) ||
+      (serialized.match(/reviewer/gi)?.length ?? 0) >= 2));
+}
+
+function parseAsyncReviewStart(value: unknown): AsyncStartObservation | undefined {
+  const event = objectRecord(value);
+  if (!event || event.lifecycleArtifactVersion !== 3 || !["parallel", "workflow"].includes(String(event.mode)) ||
+    typeof event.sessionId !== "string" || !event.sessionId ||
+    typeof event.completionOwnerId !== "string" || !event.completionOwnerId ||
+    typeof event.cwd !== "string" || !isAbsolute(event.cwd) ||
+    typeof event.asyncDir !== "string" || !isAbsolute(event.asyncDir) || !Array.isArray(event.agents)
+  ) return undefined;
+  const agents = event.agents;
+  if (agents.length < 2 || agents.length > 8 || !agents.every((agent): agent is string =>
+    typeof agent === "string" && agent.toLowerCase() === "reviewer")) return undefined;
+  const runId = eventIdentity(event);
+  if (!runId) return undefined;
+  return {
+    runId,
+    sessionId: event.sessionId,
+    completionOwnerId: event.completionOwnerId,
+    mode: event.mode as "parallel" | "workflow",
+    agents,
+    cwd: event.cwd,
+    asyncDir: event.asyncDir,
+  };
+}
+
+function isAsyncLaunchLike(value: unknown): boolean {
+  const details = objectRecord(objectRecord(value)?.details);
+  return Boolean(details && typeof details.runId === "string" && Array.isArray(details.results) && details.results.length === 0);
+}
+
+function parseAsyncLaunchResult(value: unknown): { runId: string; mode: string; asyncDir: string } | undefined {
+  const details = objectRecord(objectRecord(value)?.details);
+  if (!details || typeof details.runId !== "string" || eventIdentity({ id: details.runId }) !== details.runId ||
+    typeof details.mode !== "string" || typeof details.asyncDir !== "string" || !isAbsolute(details.asyncDir)
+  ) return undefined;
+  return { runId: details.runId, mode: details.mode, asyncDir: details.asyncDir };
+}
+
+function isBoundAsyncReviewLaunch(
+  pending: PendingSubagentLaunch,
+  started: AsyncStartObservation,
+  result: { runId: string; mode: string; asyncDir: string },
+): boolean {
+  return looksLikeReviewRequest(pending.args) && result.runId === started.runId &&
+    result.mode === started.mode && result.asyncDir === started.asyncDir &&
+    pending.cwd === started.cwd && pending.sourceSessionIdentities.has(started.sessionId);
+}
+
+async function retainAsyncNativeReview(
+  executions: Map<string, NativeExecutionProof>,
+  consumedReviewerSessions: Set<string>,
+  launch: AsyncReviewLaunch,
+  value: unknown,
+): Promise<void> {
+  const completion = objectRecord(value);
+  if (!completion || completion.lifecycleArtifactVersion !== 3 || completion.id !== launch.runId ||
+    completion.runId !== launch.runId || completion.mode !== launch.start.mode || completion.success !== true ||
+    completion.state !== "complete" || completion.exitCode !== 0 || completion.cwd !== launch.cwd ||
+    completion.asyncDir !== launch.start.asyncDir || completion.sessionId !== launch.start.sessionId ||
+    completion.completionOwnerId !== launch.start.completionOwnerId || !Number.isFinite(completion.timestamp) ||
+    Number(completion.timestamp) < launch.launchedAt || !Array.isArray(completion.results) ||
+    completion.results.length !== launch.start.agents.length
+  ) throw new Error("Asynchronous native review completion was stale, unrelated, or incomplete");
+  if (await captureCodeStateDigest(launch.cwd) !== launch.codeStateDigest) {
+    throw new Error("Asynchronous native review did not complete on its launch code state");
+  }
+  const reviewerSessions = new Set<string>();
+  const reviewArtifacts: Array<{
+    reviewerSession: string;
+    reference: string;
+    digest: string;
+    launchContractDigest: string;
+    verdict: "OK" | "OK with notes";
+    report: string;
+  }> = [];
+  for (let index = 0; index < completion.results.length; index += 1) {
+    const result = objectRecord(completion.results[index]);
+    const artifactPaths = objectRecord(result?.artifactPaths);
+    if (!result || result.agent !== launch.start.agents[index] || result.context !== "fresh" ||
+      result.success !== true || result.status !== "completed" || result.outputState !== "present" ||
+      result.index !== index || typeof result.sessionFile !== "string" || !isAbsolute(result.sessionFile) ||
+      reviewerSessions.has(result.sessionFile) || consumedReviewerSessions.has(result.sessionFile) ||
+      result.sessionFile === launch.start.sessionId ||
+      typeof result.launchContractDigest !== "string" || !/^[a-f0-9]{64}$/i.test(result.launchContractDigest) ||
+      typeof artifactPaths?.outputPath !== "string" || !isAbsolute(artifactPaths.outputPath)
+    ) throw new Error("Asynchronous native review child identity or artifact was incomplete");
+    await assertRegularFile(result.sessionFile);
+    const report = await readBoundedRegularFile(artifactPaths.outputPath);
+    const verdicts = [...report.matchAll(/^Merge verdict:\s*(BLOCK|OK with notes|OK)\s*\.?\s*$/gim)];
+    if (verdicts.length !== 1 || verdicts[0]![1]!.toUpperCase() === "BLOCK") {
+      throw new Error("Asynchronous native review reported a blocker or omitted its merge verdict");
+    }
+    reviewerSessions.add(result.sessionFile);
+    consumedReviewerSessions.add(result.sessionFile);
+    const verdict = /^OK with notes$/i.test(verdicts[0]![1]!) ? "OK with notes" : "OK";
+    reviewArtifacts.push({
+      reviewerSession: result.sessionFile,
+      reference: artifactPaths.outputPath,
+      digest: createHash("sha256").update(report).digest("hex"),
+      launchContractDigest: result.launchContractDigest,
+      verdict,
+      report,
+    });
+  }
+  const completedAt = new Date(Number(completion.timestamp)).toISOString();
+  const endpoint = process.env[WORKER_BRIDGE_ENDPOINT_ENV];
+  if (!endpoint || !isAbsolute(endpoint)) throw new Error("Attempt-bound worker bridge endpoint is unavailable");
+  const evidenceDirectory = join(dirname(endpoint), "native-evidence");
+  await mkdir(evidenceDirectory, { recursive: true, mode: 0o700 });
+  const sourcePath = join(evidenceDirectory, `reviews-${randomUUID()}-async-execution.json`);
+  const executionReference = `pi-session:${launch.sourceSessionId}:tool:${launch.toolCallId}:subagent:async:${launch.runId}`;
+  const source = `${JSON.stringify({
+    schemaVersion: 1,
+    producer: "pi-native-skill",
+    kind: "reviews",
+    status: "passed",
+    codeStateDigest: launch.codeStateDigest,
+    completedAt,
+    executionReferences: [executionReference],
+    reviewArtifacts,
+  })}\n`;
+  await atomicWritePrivateFile(sourcePath, source);
+  executions.set(launch.toolCallId, {
+    kind: "reviews",
+    codeStateDigest: launch.codeStateDigest,
+    completedAt,
+    executionReference,
+    sourceArtifact: { reference: sourcePath, digest: createHash("sha256").update(source).digest("hex") },
+  });
+}
+
+async function assertRegularFile(path: string): Promise<void> {
+  const file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+  try {
+    const metadata = await file.stat();
+    if (!metadata.isFile() || metadata.size <= 0) throw new Error("Reviewer session identity is not a regular file");
+  } finally {
+    await file.close();
+  }
 }
 
 function classifyNativeReviewResult(result: unknown): "passed" | "blocked" | "unrelated" {

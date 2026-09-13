@@ -88,12 +88,30 @@ function isProducerReceipt(
 ): boolean {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const receipt = value as Record<string, unknown>;
-  return Object.keys(receipt).length === 7 && receipt.schemaVersion === 1 && receipt.producer === "pi-native-skill" &&
+  const hasReviewArtifacts = Object.hasOwn(receipt, "reviewArtifacts");
+  const reviewArtifactsValid = !hasReviewArtifacts || (receipt.kind === "reviews" &&
+    Array.isArray(receipt.reviewArtifacts) && receipt.reviewArtifacts.length >= 2 && receipt.reviewArtifacts.length <= 8 &&
+    receipt.reviewArtifacts.every(isRetainedReviewArtifact));
+  return Object.keys(receipt).length === (hasReviewArtifacts ? 8 : 7) &&
+    receipt.schemaVersion === 1 && receipt.producer === "pi-native-skill" &&
     receipt.kind === manifest.kind && receipt.status === manifest.status && receipt.codeStateDigest === manifest.codeStateDigest &&
     receipt.completedAt === manifest.completedAt && Array.isArray(receipt.executionReferences) &&
     receipt.executionReferences.length > 0 && receipt.executionReferences.length <= 20 &&
     receipt.executionReferences.every((reference): boolean => typeof reference === "string" &&
-      reference.trim().length > 0 && reference.length <= 4_096);
+      reference.trim().length > 0 && reference.length <= 4_096) && reviewArtifactsValid;
+}
+
+function isRetainedReviewArtifact(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const artifact = value as Record<string, unknown>;
+  return Object.keys(artifact).length === 6 && typeof artifact.reviewerSession === "string" &&
+    isAbsolute(artifact.reviewerSession) && artifact.reviewerSession.length <= 4_096 &&
+    typeof artifact.reference === "string" && isAbsolute(artifact.reference) && artifact.reference.length <= 4_096 &&
+    typeof artifact.digest === "string" && /^[a-f0-9]{64}$/i.test(artifact.digest) &&
+    typeof artifact.launchContractDigest === "string" && /^[a-f0-9]{64}$/i.test(artifact.launchContractDigest) &&
+    (artifact.verdict === "OK" || artifact.verdict === "OK with notes") &&
+    typeof artifact.report === "string" && artifact.report.length > 0 &&
+    createHash("sha256").update(artifact.report).digest("hex") === artifact.digest;
 }
 
 async function readBoundedRegularFile(path: string): Promise<Buffer> {

@@ -1688,22 +1688,37 @@ test("ordinary implementation tool events produce candidate-bound native test an
       codeStateDigest: candidate.codeStateDigest,
       findings: [],
     }, undefined, undefined, context);
+    const nativeEvidenceModule = await import("../src/native-evidence.js");
+    const latestEvidencePath = join(bridgeDirectory, "native-evidence", "latest.json");
+    const expectedEvidence = { sessionId: "native-session", codeStateDigest: candidate.codeStateDigest };
+    await hostHandlers.get("agent_settled")!({}, context);
+    const firstPublishedRecords = await nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence);
+    const immutableArtifacts = firstPublishedRecords.flatMap((record) => [record.evidenceReference]);
+
     await hostHandlers.get("tool_result")!({
       toolCallId: "failed-test-rerun",
       toolName: "bash",
       input: { command: "node --import tsx --test test/execution-controller.test.ts" },
       isError: true,
     }, context);
+    await assert.rejects(nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence), /ENOENT/);
+    await Promise.all(immutableArtifacts.map((artifact) => readFile(artifact)));
     await assert.rejects(
       tools.get("herdr_capture_native_evidence")!.execute("stale-test-capture", {}, undefined, undefined, context),
       /lacks observed successful native tests/i,
     );
+    await hostHandlers.get("agent_settled")!({}, context);
+    await assert.rejects(nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence), /ENOENT/);
+
     await hostHandlers.get("tool_result")!({
       toolCallId: "successful-test-rerun",
       toolName: "bash",
       input: { command: "node --import tsx --test test/execution-controller.test.ts" },
       isError: false,
     }, context);
+    await hostHandlers.get("agent_settled")!({}, context);
+    await nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence);
+
     await hostHandlers.get("tool_execution_start")!({
       toolCallId: "blocking-review-rerun",
       toolName: "subagent",
@@ -1721,10 +1736,14 @@ test("ordinary implementation tool events produce candidate-bound native test an
         },
       }] } },
     }, context);
+    await assert.rejects(nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence), /ENOENT/);
     await assert.rejects(
       tools.get("herdr_capture_native_evidence")!.execute("stale-review-capture", {}, undefined, undefined, context),
       /structured no-blocker review/i,
     );
+    await hostHandlers.get("agent_settled")!({}, context);
+    await assert.rejects(nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence), /ENOENT/);
+
     await hostHandlers.get("tool_execution_start")!({
       toolCallId: "passing-review-rerun",
       toolName: "subagent",
@@ -1743,11 +1762,7 @@ test("ordinary implementation tool events produce candidate-bound native test an
       }] } },
     }, context);
     await hostHandlers.get("agent_settled")!({}, context);
-    const nativeEvidenceModule = await import("../src/native-evidence.js");
-    const records = await nativeEvidenceModule.readProducedNativeEvidence(
-      join(bridgeDirectory, "native-evidence", "latest.json"),
-      { sessionId: "native-session", codeStateDigest: candidate.codeStateDigest },
-    );
+    const records = await nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence);
     assert.deepEqual(records.map((record): string => record.kind).sort(), ["reviews", "tests"]);
     for (const record of records) {
       await new nativeEvidenceModule.FileNativeEvidenceAdapter().verify({ record, candidate });
@@ -1761,6 +1776,270 @@ test("ordinary implementation tool events produce candidate-bound native test an
     else process.env.HERDR_WORKER_NATIVE_VERIFICATION_ENDPOINT = previousVerificationEndpoint;
     if (previousReviewNonce === undefined) delete process.env.HERDR_WORKER_REVIEW_NONCE;
     else process.env.HERDR_WORKER_REVIEW_NONCE = previousReviewNonce;
+  }
+});
+
+test("ordinary asynchronous parallel native reviews produce candidate-bound evidence from fresh reviewer artifacts", async (): Promise<void> => {
+  const repo = await repository();
+  const bridgeDirectory = join(repo.root, ".git", "herdr", "async-native-producer");
+  await mkdir(bridgeDirectory, { recursive: true });
+  const previousEndpoint = process.env.HERDR_WORKER_BRIDGE_ENDPOINT;
+  const previousNonce = process.env.HERDR_WORKER_BRIDGE_NONCE;
+  process.env.HERDR_WORKER_BRIDGE_ENDPOINT = join(bridgeDirectory, "readiness.json");
+  process.env.HERDR_WORKER_BRIDGE_NONCE = "async-native-producer-nonce";
+  const hostHandlers = new Map<string, (event: any, ctx: any) => unknown>();
+  const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
+  const eventHandlers = new Map<string, Array<(payload: unknown) => void>>();
+  const events = {
+    on(name: string, handler: (payload: unknown) => void): () => void {
+      const handlers = eventHandlers.get(name) ?? [];
+      handlers.push(handler);
+      eventHandlers.set(name, handlers);
+      return (): void => { eventHandlers.set(name, (eventHandlers.get(name) ?? []).filter((item): boolean => item !== handler)); };
+    },
+    emit(name: string, payload: unknown): void {
+      if (name === "subagents:rpc:v1:request") {
+        const request = payload as { requestId: string };
+        this.emit(`subagents:rpc:v1:reply:${request.requestId}`, {
+          version: 1,
+          requestId: request.requestId,
+          method: "status",
+          success: true,
+          data: {
+            asyncSnapshot: {
+              kind: "pi-subagents.async-status-snapshot",
+              version: 1,
+              generatedAt: Date.now(),
+              caps: { maxRuns: 20, maxChildrenPerNode: 8, maxDepth: 3, maxStringLength: 160, maxSerializedBytes: 32 * 1024 },
+              omitted: { runs: 0, children: 0, byteLimitExceeded: false },
+              runs: [],
+            },
+          },
+        });
+        return;
+      }
+      for (const handler of eventHandlers.get(name) ?? []) handler(payload);
+    },
+  };
+  const fakePi = {
+    events,
+    on(name: string, handler: (event: any, ctx: any) => unknown): void { hostHandlers.set(name, handler); },
+    registerCommand(): void {},
+    registerTool(tool: { name: string; execute: (...args: any[]) => Promise<any> }): void { tools.set(tool.name, tool); },
+    getAllTools: (): Array<{ name: string }> => [{ name: "subagent" }],
+  } as unknown as ExtensionAPI;
+  const parentSessionFile = join(bridgeDirectory, "parent-session.jsonl");
+  const context = {
+    cwd: repo.root,
+    sessionManager: {
+      getSessionId: (): string => "native-session",
+      getSessionFile: (): string => parentSessionFile,
+    },
+    hasPendingMessages: (): boolean => false,
+  };
+  const standardsSession = join(bridgeDirectory, "standards-session.jsonl");
+  const specSession = join(bridgeDirectory, "spec-session.jsonl");
+  const standardsReport = join(bridgeDirectory, "standards-report.md");
+  const specReport = join(bridgeDirectory, "spec-report.md");
+  const blockingStandardsSession = join(bridgeDirectory, "blocking-standards-session.jsonl");
+  const blockingSpecSession = join(bridgeDirectory, "blocking-spec-session.jsonl");
+  const blockingOkayReport = join(bridgeDirectory, "blocking-okay-report.md");
+  const blockingReport = join(bridgeDirectory, "blocking-report.md");
+  await writeFile(parentSessionFile, "parent\n");
+  await writeFile(standardsSession, "standards reviewer\n");
+  await writeFile(specSession, "spec reviewer\n");
+  await writeFile(blockingStandardsSession, "blocking standards reviewer\n");
+  await writeFile(blockingSpecSession, "blocking spec reviewer\n");
+  await writeFile(standardsReport, "## Review\n- Correct: standards pass.\n\nMerge verdict: OK with notes\n");
+  await writeFile(specReport, "## Review\nNo issues found.\n\nMerge verdict: OK\n");
+  await writeFile(blockingOkayReport, "## Review\nNo issues found.\n\nMerge verdict: OK\n");
+  await writeFile(blockingReport, "## Review\n- Finding: P1 blocker remains.\n\nMerge verdict: BLOCK\n");
+  try {
+    herdrWorkerBridge(fakePi);
+    await hostHandlers.get("tool_result")!({
+      toolCallId: "native-tests",
+      toolName: "bash",
+      input: { command: "node --import tsx --test test/execution-controller.test.ts" },
+      isError: false,
+    }, context);
+    const workflowScript = `return runs.all([\n  { key: "standards", agent: "reviewer", task: "Review standards" },\n  { key: "spec", agent: "reviewer", task: "Review spec" }\n]);`;
+    await hostHandlers.get("tool_execution_start")!({
+      toolCallId: "async-review-tool",
+      toolName: "subagent",
+      args: { workflowScript, context: "fresh" },
+    }, context);
+    events.emit("subagent:async-started", {
+      lifecycleArtifactVersion: 3,
+      id: "async-review-run",
+      pid: 4242,
+      sessionId: parentSessionFile,
+      completionOwnerId: "completion-owner",
+      mode: "workflow",
+      agent: "reviewer",
+      agents: ["reviewer", "reviewer"],
+      task: "[redacted]",
+      goal: "[redacted]",
+      chain: ["[reviewer+reviewer]"],
+      chainStepCount: 1,
+      parallelGroups: [{ start: 0, count: 2, stepIndex: 0 }],
+      cwd: repo.root,
+      asyncDir: join(bridgeDirectory, "async-review-run"),
+    });
+    await hostHandlers.get("tool_execution_end")!({
+      toolCallId: "async-review-tool",
+      toolName: "subagent",
+      isError: false,
+      result: {
+        content: [{ type: "text", text: "Async workflow started" }],
+        details: {
+          mode: "workflow",
+          runId: "async-review-run",
+          asyncId: "async-review-run",
+          asyncDir: join(bridgeDirectory, "async-review-run"),
+          results: [],
+        },
+      },
+    }, context);
+    const passingCompletion = {
+      lifecycleArtifactVersion: 3,
+      id: "async-review-run",
+      runId: "async-review-run",
+      mode: "workflow",
+      success: true,
+      state: "complete",
+      results: [
+        {
+          agent: "reviewer", context: "fresh", outputState: "present", success: true, status: "completed", index: 0,
+          sessionFile: standardsSession, artifactPaths: { outputPath: standardsReport }, launchContractDigest: "a".repeat(64),
+        },
+        {
+          agent: "reviewer", context: "fresh", outputState: "present", success: true, status: "completed", index: 1,
+          sessionFile: specSession, artifactPaths: { outputPath: specReport }, launchContractDigest: "b".repeat(64),
+        },
+      ],
+      exitCode: 0,
+      timestamp: Date.now(),
+      cwd: repo.root,
+      asyncDir: join(bridgeDirectory, "async-review-run"),
+      sessionId: parentSessionFile,
+      completionOwnerId: "completion-owner",
+    };
+    events.emit("subagent:async-complete", passingCompletion);
+    const candidate = await new RealGitWorktreeAdapter().captureCandidate({ path: repo.root, sourceBase: repo.head });
+    const nativeEvidenceModule = await import("../src/native-evidence.js");
+    const latestEvidencePath = join(bridgeDirectory, "native-evidence", "latest.json");
+    let records: Awaited<ReturnType<typeof nativeEvidenceModule.readProducedNativeEvidence>> | undefined;
+    for (let attempt = 0; attempt < 20 && !records; attempt += 1) {
+      await hostHandlers.get("agent_settled")!({}, context);
+      try {
+        records = await nativeEvidenceModule.readProducedNativeEvidence(
+          latestEvidencePath,
+          { sessionId: "native-session", codeStateDigest: candidate.codeStateDigest },
+        );
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        await new Promise((resolveWait): void => { setTimeout(resolveWait, 20); });
+      }
+    }
+    assert.ok(records, "settlement should publish retained asynchronous review evidence");
+    assert.deepEqual(records.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+    for (const record of records) await new nativeEvidenceModule.FileNativeEvidenceAdapter().verify({ record, candidate });
+    await rm(standardsReport);
+    await rm(specReport);
+    for (const record of records) await new nativeEvidenceModule.FileNativeEvidenceAdapter().verify({ record, candidate });
+
+    events.emit("subagent:async-complete", {
+      ...passingCompletion,
+      timestamp: Date.now(),
+      results: [{ ...passingCompletion.results[0], status: "failed", success: false }],
+    });
+    await hostHandlers.get("agent_settled")!({}, context);
+    const afterReplay = await nativeEvidenceModule.readProducedNativeEvidence(
+      latestEvidencePath,
+      { sessionId: "native-session", codeStateDigest: candidate.codeStateDigest },
+    );
+    assert.deepEqual(afterReplay.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+
+    const blockingRunId = "blocking-async-review-run";
+    const blockingAsyncDir = join(bridgeDirectory, blockingRunId);
+    await hostHandlers.get("tool_execution_start")!({
+      toolCallId: "blocking-async-review-tool",
+      toolName: "subagent",
+      args: { workflowScript, context: "fresh" },
+    }, context);
+    events.emit("subagent:async-started", {
+      lifecycleArtifactVersion: 3,
+      id: blockingRunId,
+      pid: 4243,
+      sessionId: parentSessionFile,
+      completionOwnerId: "blocking-completion-owner",
+      mode: "workflow",
+      agent: "reviewer",
+      agents: ["reviewer", "reviewer"],
+      task: "[redacted]",
+      goal: "[redacted]",
+      chain: ["[reviewer+reviewer]"],
+      chainStepCount: 1,
+      parallelGroups: [{ start: 0, count: 2, stepIndex: 0 }],
+      cwd: repo.root,
+      asyncDir: blockingAsyncDir,
+    });
+    await hostHandlers.get("tool_execution_end")!({
+      toolCallId: "blocking-async-review-tool",
+      toolName: "subagent",
+      isError: false,
+      result: {
+        details: {
+          mode: "workflow",
+          runId: blockingRunId,
+          asyncId: blockingRunId,
+          asyncDir: blockingAsyncDir,
+          results: [],
+        },
+      },
+    }, context);
+    events.emit("subagent:async-complete", {
+      ...passingCompletion,
+      id: blockingRunId,
+      runId: blockingRunId,
+      asyncDir: blockingAsyncDir,
+      completionOwnerId: "blocking-completion-owner",
+      timestamp: Date.now(),
+      results: [
+        {
+          ...passingCompletion.results[0],
+          sessionFile: blockingStandardsSession,
+          artifactPaths: { outputPath: blockingOkayReport },
+          launchContractDigest: "c".repeat(64),
+        },
+        {
+          ...passingCompletion.results[1],
+          sessionFile: blockingSpecSession,
+          artifactPaths: { outputPath: blockingReport },
+          launchContractDigest: "d".repeat(64),
+        },
+      ],
+    });
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await hostHandlers.get("agent_settled")!({}, context);
+      const lifecycle = JSON.parse(await readFile(join(bridgeDirectory, "lifecycle.json"), "utf8")) as {
+        outstandingJobs: string[];
+      };
+      if (!lifecycle.outstandingJobs.some((job): boolean => job.startsWith("native-async-review-capture:"))) break;
+      await new Promise((resolveWait): void => { setTimeout(resolveWait, 20); });
+    }
+    await assert.rejects(
+      nativeEvidenceModule.readProducedNativeEvidence(
+        latestEvidencePath,
+        { sessionId: "native-session", codeStateDigest: candidate.codeStateDigest },
+      ),
+      /ENOENT/,
+    );
+  } finally {
+    if (previousEndpoint === undefined) delete process.env.HERDR_WORKER_BRIDGE_ENDPOINT;
+    else process.env.HERDR_WORKER_BRIDGE_ENDPOINT = previousEndpoint;
+    if (previousNonce === undefined) delete process.env.HERDR_WORKER_BRIDGE_NONCE;
+    else process.env.HERDR_WORKER_BRIDGE_NONCE = previousNonce;
   }
 });
 
