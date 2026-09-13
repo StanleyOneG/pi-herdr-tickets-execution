@@ -13,13 +13,19 @@
     "node": ">=22.19.0"
   },
   "os": ["linux", "darwin"],
-  "files": ["src", "README.md", "LICENSE"],
+  "files": ["bin", "src", "README.md", "LICENSE"],
+  "bin": {
+    "pi-herdr-controller": "./bin/herdr-controller.mjs"
+  },
   "pi": {
     "extensions": ["./src/extension.ts"]
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test test/**/*.test.ts"
+  },
+  "dependencies": {
+    "tsx": "^4.19.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -30,7 +36,6 @@
     "@earendil-works/pi-ai": "0.85.1",
     "@earendil-works/pi-coding-agent": "0.85.1",
     "@types/node": "^22.0.0",
-    "tsx": "^4.19.0",
     "typebox": "^1.0.0",
     "typescript": "^5.7.0"
   }

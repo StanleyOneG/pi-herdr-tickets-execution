@@ -1,19 +1,39 @@
+import { isAbsolute } from "node:path";
+
 import type {
   AdmissionSnapshot,
+  AnswerDecisionRequest,
   ApprovalRequest,
+  AttemptRequest,
   BatchProposal,
+  CapturedModel,
   ControllerDependencies,
   ControllerErrorCode,
   ControllerResult,
   ControllerState,
   ControllerStateStore,
   ControllerStatus,
+  ExecutionAttempt,
   LocalActorCapability,
   PaginationRequest,
   PreparationRecord,
   PrepareRequest,
+  RecordWorkerObservationRequest,
+  SetupOperation,
+  SetupOperationRecord,
+  StartTicketRequest,
+  TicketWorktreePlan,
+  WorkerAllocation,
+  WorkerIdentity,
+  WorkerObservation,
 } from "./contracts.js";
-import { MAX_PREPARATIONS, MAX_STATUS_PAGE_SIZE } from "./contracts.js";
+import {
+  MAX_ATTEMPT_DECISIONS,
+  MAX_ATTEMPT_REFERENCES,
+  MAX_EXECUTION_ATTEMPTS,
+  MAX_PREPARATIONS,
+  MAX_STATUS_PAGE_SIZE,
+} from "./contracts.js";
 import {
   approvalFailures,
   calculateContextLimit,
@@ -24,7 +44,9 @@ import {
 } from "./policy.js";
 export type {
   AdmissionSnapshot,
+  AnswerDecisionRequest,
   ApprovalRequest,
+  AttemptRequest,
   BatchProposal,
   CapturedModel,
   ControllerError,
@@ -32,23 +54,73 @@ export type {
   ControllerState,
   ControllerStateStore,
   ControllerStatus,
+  DecisionRecord,
+  ExecutionAttempt,
+  ExecutionControllerDependencies,
+  ExecutionLifecycle,
+  GitWorktreePort,
   LocalActorCapability,
+  OriginalCheckoutSnapshot,
   PaginationRequest,
   PreparationRecord,
+  RecordWorkerObservationRequest,
   SetupOperation,
+  SetupOperationRecord,
+  SetupRuntimePort,
   SourceEvidence,
+  StartTicketRequest,
   ThinkingLevel,
+  TicketWorktreePlan,
+  WorkerAllocation,
+  WorkerIdentity,
+  WorkerObservation,
+  WorkerRuntimePort,
+  WorkerStatus,
+  WorktreeIdentity,
 } from "./contracts.js";
 
 const AUTHORIZATION_DIAGNOSTIC = "The caller does not hold the local controller capability";
+const REQUIRED_WORKER_SKILLS = ["skill:implement", "skill:tdd", "skill:code-review", "skill:handoff"];
 
 export class PreparationController {
+  private mutationQueue: Promise<void> = Promise.resolve();
+
   constructor(
     private readonly store: ControllerStateStore,
     private readonly dependencies: ControllerDependencies,
   ) {}
 
   async prepare(
+    actor: LocalActorCapability,
+    request: PrepareRequest,
+    snapshot: AdmissionSnapshot,
+  ): Promise<ControllerResult<PreparationRecord>> {
+    return this.serializeMutation((): Promise<ControllerResult<PreparationRecord>> =>
+      this.prepareOperation(actor, request, snapshot)
+    );
+  }
+
+  async submitProposal(
+    actor: LocalActorCapability,
+    preparationId: string,
+    proposal: BatchProposal,
+  ): Promise<ControllerResult<PreparationRecord>> {
+    return this.serializeMutation((): Promise<ControllerResult<PreparationRecord>> =>
+      this.submitProposalOperation(actor, preparationId, proposal)
+    );
+  }
+
+  async approve(
+    actor: LocalActorCapability,
+    preparationId: string,
+    request: ApprovalRequest,
+  ): Promise<ControllerResult<PreparationRecord>> {
+    return this.serializeMutation((): Promise<ControllerResult<PreparationRecord>> =>
+      this.approveOperation(actor, preparationId, request)
+    );
+  }
+
+  private async prepareOperation(
     actor: LocalActorCapability,
     request: PrepareRequest,
     snapshot: AdmissionSnapshot,
@@ -91,7 +163,7 @@ export class PreparationController {
     return saved.ok ? success(structuredClone(record)) : saved;
   }
 
-  async submitProposal(
+  private async submitProposalOperation(
     actor: LocalActorCapability,
     preparationId: string,
     proposal: BatchProposal,
@@ -163,7 +235,7 @@ export class PreparationController {
     return this.checkApproval(loaded.value, preparationId, request);
   }
 
-  async approve(
+  private async approveOperation(
     actor: LocalActorCapability,
     preparationId: string,
     request: ApprovalRequest,
@@ -188,6 +260,432 @@ export class PreparationController {
     return saved.ok ? success(structuredClone(record)) : saved;
   }
 
+  async startTicket(actor: LocalActorCapability, request: StartTicketRequest): Promise<ControllerResult<ExecutionAttempt>> {
+    return this.serializeMutation((): Promise<ControllerResult<ExecutionAttempt>> =>
+      this.startTicketOperation(actor, request)
+    );
+  }
+
+  async attachAttempt(actor: LocalActorCapability, request: AttemptRequest): Promise<ControllerResult<ExecutionAttempt>> {
+    return this.serializeMutation((): Promise<ControllerResult<ExecutionAttempt>> =>
+      this.attachAttemptOperation(actor, request)
+    );
+  }
+
+  async pauseAttempt(actor: LocalActorCapability, request: AttemptRequest): Promise<ControllerResult<ExecutionAttempt>> {
+    return this.serializeMutation((): Promise<ControllerResult<ExecutionAttempt>> =>
+      this.pauseAttemptOperation(actor, request)
+    );
+  }
+
+  async resumeAttempt(actor: LocalActorCapability, request: AttemptRequest): Promise<ControllerResult<ExecutionAttempt>> {
+    return this.serializeMutation((): Promise<ControllerResult<ExecutionAttempt>> =>
+      this.resumeAttemptOperation(actor, request)
+    );
+  }
+
+  async takeOverAttempt(actor: LocalActorCapability, request: AttemptRequest): Promise<ControllerResult<ExecutionAttempt>> {
+    return this.serializeMutation((): Promise<ControllerResult<ExecutionAttempt>> =>
+      this.takeOverAttemptOperation(actor, request)
+    );
+  }
+
+  async returnAttempt(actor: LocalActorCapability, request: AttemptRequest): Promise<ControllerResult<ExecutionAttempt>> {
+    return this.serializeMutation((): Promise<ControllerResult<ExecutionAttempt>> =>
+      this.returnAttemptOperation(actor, request)
+    );
+  }
+
+  async answerDecision(actor: LocalActorCapability, request: AnswerDecisionRequest): Promise<ControllerResult<ExecutionAttempt>> {
+    return this.serializeMutation((): Promise<ControllerResult<ExecutionAttempt>> =>
+      this.answerDecisionOperation(actor, request)
+    );
+  }
+
+  async recordWorkerObservation(
+    actor: LocalActorCapability,
+    request: RecordWorkerObservationRequest,
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    return this.serializeMutation((): Promise<ControllerResult<ExecutionAttempt>> =>
+      this.recordWorkerObservationOperation(actor, request)
+    );
+  }
+
+  async controllerRestarted(actor: LocalActorCapability): Promise<ControllerResult<ExecutionAttempt[]>> {
+    return this.serializeMutation((): Promise<ControllerResult<ExecutionAttempt[]>> =>
+      this.controllerRestartedOperation(actor)
+    );
+  }
+
+  private async startTicketOperation(
+    actor: LocalActorCapability,
+    request: StartTicketRequest,
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    const denied = this.authorizationFailure<ExecutionAttempt>(actor);
+    if (denied) return denied;
+    const execution = this.dependencies.execution;
+    if (!execution) return failure("infrastructure", ["Execution adapters are not configured"]);
+    if (
+      !validBoundedText(request.preparationId, 4_096) || !validBoundedText(request.ticketIdentity, 4_096) ||
+      !validBoundedText(request.workspaceId, 4_096)
+    ) {
+      return failure("execution-validation", ["Bounded preparation, ticket, and Herdr workspace identities are required"]);
+    }
+
+    const loaded = await this.loadState();
+    if (!loaded.ok) return loaded;
+    const duplicate = loaded.value.executionAttempts.find((attempt): boolean =>
+      attempt.preparationId === request.preparationId && attempt.ticketIdentity === request.ticketIdentity
+    );
+    if (duplicate) return success(structuredClone(duplicate));
+    const preparation = loaded.value.preparations.find((record): boolean => record.id === request.preparationId);
+    if (!preparation || preparation.stage !== "approved" || !preparation.proposal || !preparation.proposalDigest) {
+      return failure("execution-validation", ["Ticket execution requires an approved preparation"]);
+    }
+    const ticket = preparation.proposal.tickets.find((item): boolean => item.identity === request.ticketIdentity);
+    if (!ticket) return failure("execution-validation", ["Ticket is outside the approved preparation"]);
+    if (ticket.claimedBy !== null) {
+      return failure("execution-conflict", [`Ticket has a foreign tracker claim: ${request.ticketIdentity}`]);
+    }
+    const blockedBy = preparation.proposal.dependencies
+      .filter((dependency): boolean =>
+        dependency.ticketIdentity === ticket.identity && dependency.kind === "ticket" && dependency.status === "in-batch"
+      )
+      .map((dependency): string => dependency.prerequisiteIdentity)
+      .sort();
+    if (blockedBy.length > 0) {
+      return failure("execution-conflict", [`Ticket is blocked by in-batch prerequisites: ${blockedBy.join(", ")}`]);
+    }
+    if (loaded.value.executionAttempts.some((attempt): boolean =>
+      attempt.preparationId === request.preparationId && isExecuting(attempt.lifecycle)
+    )) {
+      return failure("execution-conflict", ["This preparation already owns an active ticket worker"]);
+    }
+    if (loaded.value.executionAttempts.length >= MAX_EXECUTION_ATTEMPTS) {
+      return failure("execution-validation", [`Execution attempt capacity of ${MAX_EXECUTION_ATTEMPTS} was reached`]);
+    }
+
+    const now = this.dependencies.now().toISOString();
+    let plan: TicketWorktreePlan;
+    try {
+      plan = execution.git.planTicketWorktree({
+        originalRoot: preparation.project.root,
+        preparationId: preparation.id,
+        ticketIdentity: ticket.identity,
+      });
+    } catch {
+      return failure("infrastructure", ["Ticket worktree planning failed"]);
+    }
+    if (!validBoundedText(plan.path, 4_096) || !isAbsolute(plan.path) || !validBoundedText(plan.branch, 500)) {
+      return failure("infrastructure", ["Ticket worktree plan is incomplete or unsafe"]);
+    }
+    const attempt: ExecutionAttempt = {
+      id: this.dependencies.generateId(),
+      preparationId: preparation.id,
+      proposalDigest: preparation.proposalDigest,
+      ticketIdentity: ticket.identity,
+      workspaceId: request.workspaceId,
+      lifecycle: "claimed",
+      owner: structuredClone(execution.owner),
+      createdAt: now,
+      updatedAt: now,
+      worktreePlan: structuredClone(plan),
+      setupOperations: [],
+      decisions: [],
+      artifactReferences: [],
+      diagnostics: [],
+    };
+    loaded.value.executionAttempts.push(attempt);
+    const claimed = await this.saveState(loaded.value);
+    if (!claimed.ok) return claimed;
+
+    try {
+      const original = await execution.git.inspectOriginal(preparation.project.root);
+      if (
+        original.root !== preparation.project.root ||
+        original.head !== preparation.proposal.target.baseCommit ||
+        original.branch !== preparation.proposal.target.branch
+      ) {
+        return this.attention(loaded.value, attempt, "Original checkout no longer matches the approved Git base");
+      }
+      attempt.originalCheckout = structuredClone(original);
+      attempt.lifecycle = "preparing-worktree";
+      const baselineSaved = await this.persistAttempt(loaded.value, attempt);
+      if (!baselineSaved.ok) return baselineSaved;
+
+      const worktree = await execution.git.createTicketWorktree({
+        originalRoot: original.root,
+        baseCommit: preparation.proposal.target.baseCommit,
+        plan,
+      });
+      if (
+        worktree.path !== plan.path || worktree.branch !== plan.branch ||
+        worktree.head !== preparation.proposal.target.baseCommit || worktree.commonDir !== original.commonDir
+      ) {
+        return this.attention(loaded.value, attempt, "Created ticket worktree identity does not match its durable plan");
+      }
+      attempt.worktree = structuredClone(worktree);
+      attempt.lifecycle = "starting";
+      const worktreeSaved = await this.persistAttempt(loaded.value, attempt);
+      if (!worktreeSaved.ok) return worktreeSaved;
+
+      const setup = await this.executeApprovedSetup(loaded.value, attempt, preparation.proposal.policy.setupOperations);
+      if (!setup.ok || setup.value.lifecycle === "needs-attention") return setup;
+      const guarded = await this.verifyGitGuard(loaded.value, attempt);
+      if (!guarded.ok || guarded.value.lifecycle === "needs-attention") return guarded;
+      const allocation = await execution.worker.allocate({
+        workspaceId: request.workspaceId,
+        agentName: workerAgentName(attempt.id),
+        cwd: worktree.path,
+      });
+      if (
+        !validWorkerAllocation(allocation) || allocation.workspaceId !== request.workspaceId ||
+        allocation.agentName !== workerAgentName(attempt.id)
+      ) {
+        return this.attention(loaded.value, attempt, "Worker allocation identity is incomplete or mismatched");
+      }
+      attempt.workerAllocation = structuredClone(allocation);
+      const allocationSaved = await this.persistAttempt(loaded.value, attempt);
+      if (!allocationSaved.ok) return allocationSaved;
+
+      const guardedBeforeStart = await this.verifyGitGuard(loaded.value, attempt);
+      if (!guardedBeforeStart.ok || guardedBeforeStart.value.lifecycle === "needs-attention") return guardedBeforeStart;
+      const worker = await execution.worker.start({ allocation, cwd: worktree.path, model: preparation.proposal.model });
+      const readinessFailure = workerReadinessFailure(worker, allocation, worktree.path, preparation.proposal.model);
+      if (readinessFailure) return this.attention(loaded.value, attempt, readinessFailure);
+      attempt.worker = structuredClone(worker);
+      const workerSaved = await this.persistAttempt(loaded.value, attempt);
+      if (!workerSaved.ok) return workerSaved;
+
+      const guardedBeforeDispatch = await this.verifyGitGuard(loaded.value, attempt);
+      if (!guardedBeforeDispatch.ok || guardedBeforeDispatch.value.lifecycle === "needs-attention") return guardedBeforeDispatch;
+      const ownership = await this.verifyWorkerOwnership(loaded.value, attempt);
+      if (!ownership.ok || ownership.value.lifecycle === "needs-attention") return ownership;
+      const observation = await execution.worker.dispatchImplementation(worker, ticket.identity);
+      return this.applyWorkerObservation(loaded.value, attempt, observation);
+    } catch {
+      return this.attention(loaded.value, attempt, "Execution infrastructure returned an error or ambiguous timeout");
+    }
+  }
+
+  private async executeApprovedSetup(
+    state: ControllerState,
+    attempt: ExecutionAttempt,
+    operations: SetupOperation[],
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    if (operations.length === 0) return success(structuredClone(attempt));
+    const runtime = this.dependencies.execution!.setup;
+    if (!runtime) return this.attention(state, attempt, "Approved setup operations require a configured setup adapter");
+    attempt.setupOperations ??= [];
+    for (let index = attempt.setupOperations.length; index < operations.length; index += 1) {
+      const operation = operations[index]!;
+      const record: SetupOperationRecord = {
+        index,
+        operationDigest: digest(operation),
+        state: "started",
+        startedAt: this.dependencies.now().toISOString(),
+      };
+      attempt.setupOperations.push(record);
+      const claimed = await this.persistAttempt(state, attempt);
+      if (!claimed.ok) return claimed;
+      try {
+        const result = await runtime.execute({ cwd: attempt.worktree!.path, operation: structuredClone(operation) });
+        if (!/^[a-f0-9]{64}$/i.test(result.outcomeDigest)) {
+          return this.attention(state, attempt, "Approved setup returned malformed bounded evidence");
+        }
+        record.state = "completed";
+        record.completedAt = this.dependencies.now().toISOString();
+        record.outcomeDigest = result.outcomeDigest;
+        const completed = await this.persistAttempt(state, attempt);
+        if (!completed.ok) return completed;
+      } catch {
+        return this.attention(state, attempt, "Approved setup failed or had an ambiguous result");
+      }
+    }
+    return success(structuredClone(attempt));
+  }
+
+  private async attachAttemptOperation(
+    actor: LocalActorCapability,
+    request: AttemptRequest,
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    const context = await this.mutableAttempt(actor, request.attemptId);
+    if (!context.ok) return context;
+    const { state, attempt, execution } = context.value;
+    const guarded = await this.verifyOwnedWorkerAndGit(state, attempt);
+    if (!guarded.ok || guarded.value.lifecycle === "needs-attention") return guarded;
+    try {
+      await execution.worker.focus(attempt.worker!);
+      return success(structuredClone(attempt));
+    } catch {
+      return this.attention(state, attempt, "Worker focus failed or had an ambiguous result");
+    }
+  }
+
+  private async pauseAttemptOperation(
+    actor: LocalActorCapability,
+    request: AttemptRequest,
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    const context = await this.mutableAttempt(actor, request.attemptId);
+    if (!context.ok) return context;
+    const { state, attempt } = context.value;
+    if (attempt.lifecycle !== "running" && attempt.lifecycle !== "pending-decision") {
+      return failure("execution-conflict", [`Attempt cannot be paused from ${attempt.lifecycle}`]);
+    }
+    attempt.suspendedFrom = attempt.lifecycle;
+    attempt.lifecycle = "paused";
+    return this.persistAttempt(state, attempt);
+  }
+
+  private async resumeAttemptOperation(
+    actor: LocalActorCapability,
+    request: AttemptRequest,
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    const context = await this.mutableAttempt(actor, request.attemptId);
+    if (!context.ok) return context;
+    const { state, attempt } = context.value;
+    if (attempt.lifecycle !== "paused" && attempt.lifecycle !== "restart-required") {
+      return failure("execution-conflict", [`Attempt cannot be resumed from ${attempt.lifecycle}`]);
+    }
+    if (!attempt.worker) return this.attention(state, attempt, "Restarted attempt requires later recovery because no worker identity was durably established");
+    if (attempt.lifecycle === "restart-required" && attempt.suspendedFrom === undefined) {
+      return this.attention(state, attempt, "Implementation dispatch state is ambiguous after controller restart; later recovery is required");
+    }
+    const guarded = await this.verifyOwnedWorkerAndGit(state, attempt);
+    if (!guarded.ok || guarded.value.lifecycle === "needs-attention") return guarded;
+    attempt.lifecycle = hasPendingDecision(attempt) ? "pending-decision" : "running";
+    delete attempt.suspendedFrom;
+    const resumed = await this.persistAttempt(state, attempt);
+    if (!resumed.ok) return resumed;
+    return this.deliverAnsweredDecisions(state, attempt);
+  }
+
+  private async takeOverAttemptOperation(
+    actor: LocalActorCapability,
+    request: AttemptRequest,
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    const context = await this.mutableAttempt(actor, request.attemptId);
+    if (!context.ok) return context;
+    const { state, attempt, execution } = context.value;
+    if (attempt.lifecycle !== "running" && attempt.lifecycle !== "pending-decision" && attempt.lifecycle !== "paused") {
+      return failure("execution-conflict", [`Attempt cannot enter takeover from ${attempt.lifecycle}`]);
+    }
+    if (!attempt.suspendedFrom) {
+      attempt.suspendedFrom = attempt.lifecycle === "pending-decision" ? "pending-decision" : "running";
+    }
+    attempt.lifecycle = "takeover";
+    const stopped = await this.persistAttempt(state, attempt);
+    if (!stopped.ok) return stopped;
+    const guarded = await this.verifyOwnedWorkerAndGit(state, attempt);
+    if (!guarded.ok || guarded.value.lifecycle === "needs-attention") return guarded;
+    try {
+      await execution.worker.focus(attempt.worker!);
+      return success(structuredClone(attempt));
+    } catch {
+      return this.attention(state, attempt, "Worker focus failed or had an ambiguous result");
+    }
+  }
+
+  private async returnAttemptOperation(
+    actor: LocalActorCapability,
+    request: AttemptRequest,
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    const context = await this.mutableAttempt(actor, request.attemptId);
+    if (!context.ok) return context;
+    const { state, attempt, execution } = context.value;
+    if (attempt.lifecycle !== "takeover") {
+      return failure("execution-conflict", [`Attempt cannot return to automation from ${attempt.lifecycle}`]);
+    }
+    const guarded = await this.verifyOwnedWorkerAndGit(state, attempt);
+    if (!guarded.ok || guarded.value.lifecycle === "needs-attention") return guarded;
+    attempt.lifecycle = hasPendingDecision(attempt) ? "pending-decision" : "running";
+    delete attempt.suspendedFrom;
+    const returned = await this.persistAttempt(state, attempt);
+    if (!returned.ok) return returned;
+    return this.deliverAnsweredDecisions(state, attempt, execution.worker);
+  }
+
+  private async answerDecisionOperation(
+    actor: LocalActorCapability,
+    request: AnswerDecisionRequest,
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    const context = await this.mutableAttempt(actor, request.attemptId);
+    if (!context.ok) return context;
+    const { state, attempt, execution } = context.value;
+    if (
+      !validBoundedText(request.answer, 4_000) || !validBoundedText(request.answeredBy, 500) ||
+      containsCredential(request.answer)
+    ) {
+      return failure("execution-validation", ["A bounded credential-free decision answer and author are required"]);
+    }
+    const decision = attempt.decisions.find((item): boolean => item.id === request.decisionId);
+    if (!decision) return failure("execution-validation", [`Unknown pending decision: ${request.decisionId}`]);
+    if (decision.state !== "pending") {
+      if (decision.answer === request.answer && decision.answeredBy === request.answeredBy) return success(structuredClone(attempt));
+      return failure("execution-conflict", ["A durable explicit answer already owns this decision"]);
+    }
+    decision.state = "answered";
+    decision.answer = request.answer;
+    decision.answeredBy = request.answeredBy;
+    decision.answeredAt = this.dependencies.now().toISOString();
+    const answered = await this.persistAttempt(state, attempt);
+    if (!answered.ok) return answered;
+    if (attempt.lifecycle === "takeover" || attempt.lifecycle === "paused" || attempt.lifecycle === "restart-required") {
+      return success(structuredClone(attempt));
+    }
+    const guarded = await this.verifyOwnedWorkerAndGit(state, attempt);
+    if (!guarded.ok || guarded.value.lifecycle === "needs-attention") return guarded;
+    try {
+      const observation = await execution.worker.deliverDecision(attempt.worker!, decision.id, request.answer);
+      if (!sameWorker(observation.identity, attempt.worker!)) {
+        return this.attention(state, attempt, "Worker occupant or saved Pi session changed before decision delivery");
+      }
+      decision.state = "delivered";
+      decision.deliveredAt = this.dependencies.now().toISOString();
+      const observed = await this.applyWorkerObservation(state, attempt, observation, false);
+      if (!observed.ok) return observed;
+      return this.persistAttempt(state, attempt);
+    } catch {
+      return this.attention(state, attempt, "Decision delivery failed or had an ambiguous result");
+    }
+  }
+
+  private async recordWorkerObservationOperation(
+    actor: LocalActorCapability,
+    request: RecordWorkerObservationRequest,
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    const context = await this.mutableAttempt(actor, request.attemptId);
+    if (!context.ok) return context;
+    return this.applyWorkerObservation(context.value.state, context.value.attempt, request.observation);
+  }
+
+  private async controllerRestartedOperation(
+    actor: LocalActorCapability,
+  ): Promise<ControllerResult<ExecutionAttempt[]>> {
+    const denied = this.authorizationFailure<ExecutionAttempt[]>(actor);
+    if (denied) return denied;
+    const execution = this.dependencies.execution;
+    if (!execution) return failure("infrastructure", ["Execution adapters are not configured"]);
+    const loaded = await this.loadState();
+    if (!loaded.ok) return loaded;
+    const changed: ExecutionAttempt[] = [];
+    for (const attempt of loaded.value.executionAttempts) {
+      if (!isExecuting(attempt.lifecycle)) continue;
+      attempt.owner = structuredClone(execution.owner);
+      if (attempt.lifecycle !== "paused" && attempt.lifecycle !== "takeover") {
+        if (attempt.lifecycle === "running" || attempt.lifecycle === "pending-decision") {
+          attempt.suspendedFrom = attempt.lifecycle;
+        }
+        attempt.lifecycle = "restart-required";
+      }
+      attempt.updatedAt = this.dependencies.now().toISOString();
+      changed.push(structuredClone(attempt));
+    }
+    if (changed.length === 0) return success([]);
+    const saved = await this.saveState(loaded.value);
+    return saved.ok ? success(changed) : saved;
+  }
+
   async status(
     actor: LocalActorCapability,
     pagination: PaginationRequest,
@@ -202,15 +700,209 @@ export class PreparationController {
 
     const loaded = await this.loadState();
     if (!loaded.ok) return loaded;
-    if (offset > loaded.value.preparations.length) return failure("query-validation", ["Status cursor is out of range"]);
-    const end = Math.min(offset + pagination.limit, loaded.value.preparations.length);
-    const hasMore = end < loaded.value.preparations.length;
+    const collectionLength = Math.max(loaded.value.preparations.length, loaded.value.executionAttempts.length);
+    if (offset > collectionLength) return failure("query-validation", ["Status cursor is out of range"]);
+    const nextOffset = Math.min(offset + pagination.limit, collectionLength);
+    const hasMore = nextOffset < collectionLength;
     return success({
-      preparations: structuredClone(loaded.value.preparations.slice(offset, end)),
-      nextCursor: hasMore ? encodeCursor(end) : null,
+      preparations: structuredClone(loaded.value.preparations.slice(offset, offset + pagination.limit)),
+      nextCursor: hasMore ? encodeCursor(nextOffset) : null,
       hasMore,
-      executionAttempts: [],
+      executionAttempts: structuredClone(loaded.value.executionAttempts.slice(offset, offset + pagination.limit)),
     });
+  }
+
+  private serializeMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.mutationQueue.then(operation, operation);
+    this.mutationQueue = result.then((): void => {}, (): void => {});
+    return result;
+  }
+
+  private async mutableAttempt(
+    actor: LocalActorCapability,
+    attemptId: string,
+  ): Promise<ControllerResult<{
+    state: ControllerState;
+    attempt: ExecutionAttempt;
+    execution: NonNullable<ControllerDependencies["execution"]>;
+  }>> {
+    const denied = this.authorizationFailure<{
+      state: ControllerState;
+      attempt: ExecutionAttempt;
+      execution: NonNullable<ControllerDependencies["execution"]>;
+    }>(actor);
+    if (denied) return denied;
+    const execution = this.dependencies.execution;
+    if (!execution) return failure("infrastructure", ["Execution adapters are not configured"]);
+    if (!attemptId.trim()) return failure("execution-validation", ["Attempt identity is required"]);
+    const loaded = await this.loadState();
+    if (!loaded.ok) return loaded;
+    const attempt = loaded.value.executionAttempts.find((item): boolean => item.id === attemptId);
+    if (!attempt) return failure("execution-validation", [`Unknown execution attempt: ${attemptId}`]);
+    if (attempt.owner.instanceId !== execution.owner.instanceId || attempt.owner.pid !== execution.owner.pid) {
+      return failure("execution-conflict", ["Attempt belongs to another controller process; reconcile restart before control"]);
+    }
+    return success({ state: loaded.value, attempt, execution });
+  }
+
+  private async persistAttempt(
+    state: ControllerState,
+    attempt: ExecutionAttempt,
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    attempt.updatedAt = this.dependencies.now().toISOString();
+    const saved = await this.saveState(state);
+    return saved.ok ? success(structuredClone(attempt)) : saved;
+  }
+
+  private async attention(
+    state: ControllerState,
+    attempt: ExecutionAttempt,
+    diagnostic: string,
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    attempt.lifecycle = "needs-attention";
+    delete attempt.suspendedFrom;
+    attempt.diagnostics = [diagnostic];
+    return this.persistAttempt(state, attempt);
+  }
+
+  private async verifyGitGuard(
+    state: ControllerState,
+    attempt: ExecutionAttempt,
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    const execution = this.dependencies.execution!;
+    if (!attempt.originalCheckout || !attempt.worktree) {
+      return this.attention(state, attempt, "Execution Git identity is incomplete");
+    }
+    try {
+      const currentOriginal = await execution.git.inspectOriginal(attempt.originalCheckout.root);
+      if (digest(currentOriginal) !== digest(attempt.originalCheckout)) {
+        return this.attention(state, attempt, "Original checkout changed after its execution baseline");
+      }
+      const currentWorktree = await execution.git.inspectWorktree(attempt.worktree.path);
+      if (digest(currentWorktree) !== digest(attempt.worktree)) {
+        return this.attention(state, attempt, "Ticket worktree path, branch, base, or common directory changed");
+      }
+      return success(structuredClone(attempt));
+    } catch {
+      return this.attention(state, attempt, "Git ownership inspection failed or returned an ambiguous result");
+    }
+  }
+
+  private async verifyWorkerOwnership(
+    state: ControllerState,
+    attempt: ExecutionAttempt,
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    const execution = this.dependencies.execution!;
+    if (!attempt.worker) return this.attention(state, attempt, "Worker identity is incomplete");
+    try {
+      const observation = await execution.worker.inspect(attempt.worker);
+      if (!sameWorker(observation.identity, attempt.worker)) {
+        return this.attention(state, attempt, "Worker occupant or saved Pi session changed");
+      }
+      if (!isWorkerStatus(observation.status)) {
+        return this.attention(state, attempt, "Worker ownership inspection returned an invalid lifecycle state");
+      }
+      if (observation.status === "missing" || observation.status === "unknown") {
+        return this.attention(state, attempt, "Owned worker is missing or in an unknown state");
+      }
+      return success(structuredClone(attempt));
+    } catch {
+      return this.attention(state, attempt, "Worker ownership inspection failed or returned an ambiguous result");
+    }
+  }
+
+  private async verifyOwnedWorkerAndGit(
+    state: ControllerState,
+    attempt: ExecutionAttempt,
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    const git = await this.verifyGitGuard(state, attempt);
+    if (!git.ok || git.value.lifecycle === "needs-attention") return git;
+    return this.verifyWorkerOwnership(state, attempt);
+  }
+
+  private async deliverAnsweredDecisions(
+    state: ControllerState,
+    attempt: ExecutionAttempt,
+    workerRuntime = this.dependencies.execution!.worker,
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    try {
+      for (const decision of attempt.decisions.filter((item): boolean => item.state === "answered")) {
+        const ownership = await this.verifyWorkerOwnership(state, attempt);
+        if (!ownership.ok || ownership.value.lifecycle === "needs-attention") return ownership;
+        const observation = await workerRuntime.deliverDecision(attempt.worker!, decision.id, decision.answer!);
+        if (!sameWorker(observation.identity, attempt.worker!)) {
+          return this.attention(state, attempt, "Worker occupant or saved Pi session changed before decision delivery");
+        }
+        decision.state = "delivered";
+        decision.deliveredAt = this.dependencies.now().toISOString();
+        const observed = await this.applyWorkerObservation(state, attempt, observation, false);
+        if (!observed.ok) return observed;
+      }
+      return this.persistAttempt(state, attempt);
+    } catch {
+      return this.attention(state, attempt, "Decision delivery failed or had an ambiguous result");
+    }
+  }
+
+  private async applyWorkerObservation(
+    state: ControllerState,
+    attempt: ExecutionAttempt,
+    observation: WorkerObservation,
+    persist = true,
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    if (!attempt.worker || !sameWorker(observation.identity, attempt.worker)) {
+      return this.attention(state, attempt, "Worker occupant or saved Pi session changed");
+    }
+    if (!isWorkerStatus(observation.status)) {
+      return this.attention(state, attempt, "Worker returned an invalid lifecycle state");
+    }
+    if (!validReferences(observation.artifactReferences)) {
+      return this.attention(state, attempt, "Worker returned invalid or excessive artifact references");
+    }
+    const references = uniqueReferences([...attempt.artifactReferences, ...observation.artifactReferences]);
+    if (references.length > MAX_ATTEMPT_REFERENCES) {
+      return this.attention(state, attempt, "Attempt artifact reference capacity was reached");
+    }
+    attempt.artifactReferences = references;
+    if (observation.status === "missing" || observation.status === "unknown") {
+      return this.attention(state, attempt, "Owned worker is missing or in an unknown state");
+    }
+    if (observation.status === "blocked") {
+      if (!observation.decision || !validDecisionInput(observation.decision)) {
+        return this.attention(state, attempt, "Worker is blocked without a bounded structured local decision");
+      }
+      const existing = attempt.decisions.find((decision): boolean =>
+        (observation.decision!.transportId !== undefined && decision.id === observation.decision!.transportId) ||
+        (decision.state === "pending" && decision.question === observation.decision!.question)
+      );
+      if (existing && (
+        existing.question !== observation.decision.question || existing.context !== observation.decision.context ||
+        digest(existing.options) !== digest(observation.decision.options) || existing.recommendation !== observation.decision.recommendation
+      )) return this.attention(state, attempt, "Worker reused a local decision identity with different content");
+      if (!existing) {
+        if (attempt.decisions.length >= MAX_ATTEMPT_DECISIONS) {
+          return this.attention(state, attempt, "Attempt decision capacity was reached");
+        }
+        attempt.decisions.push({
+          id: observation.decision.transportId ?? this.dependencies.generateId(),
+          state: "pending",
+          requestedAt: this.dependencies.now().toISOString(),
+          ...structuredClone(observation.decision),
+        });
+      }
+      if (attempt.lifecycle !== "paused" && attempt.lifecycle !== "takeover" && attempt.lifecycle !== "restart-required") {
+        attempt.lifecycle = "pending-decision";
+      }
+    } else if (
+      (observation.status === "idle" || observation.status === "done") &&
+      attempt.lifecycle !== "paused" && attempt.lifecycle !== "takeover" && attempt.lifecycle !== "restart-required"
+    ) {
+      attempt.lifecycle = hasPendingDecision(attempt) ? "pending-decision" : "completed-unaccepted";
+      if (attempt.lifecycle === "completed-unaccepted") delete attempt.suspendedFrom;
+    } else if (attempt.lifecycle !== "paused" && attempt.lifecycle !== "takeover" && attempt.lifecycle !== "restart-required") {
+      attempt.lifecycle = hasPendingDecision(attempt) ? "pending-decision" : "running";
+    }
+    return persist ? this.persistAttempt(state, attempt) : success(structuredClone(attempt));
   }
 
   private authorizationFailure<T>(actor: LocalActorCapability): ControllerResult<T> | undefined {
@@ -245,6 +937,115 @@ export class PreparationController {
       return failure("storage", ["Controller state could not be written durably"]);
     }
   }
+}
+
+function isExecuting(lifecycle: ExecutionAttempt["lifecycle"]): boolean {
+  return lifecycle !== "completed-unaccepted" && lifecycle !== "needs-attention";
+}
+
+function hasPendingDecision(attempt: ExecutionAttempt): boolean {
+  return attempt.decisions.some((decision): boolean => decision.state !== "delivered");
+}
+
+function workerAgentName(attemptId: string): string {
+  return `herdr-${digest({ attemptId }).slice(0, 16)}`;
+}
+
+function validWorkerAllocation(allocation: WorkerAllocation): boolean {
+  return hasOnlyKeys(allocation, ["workspaceId", "tabId", "paneId", "agentName"]) &&
+    [allocation.workspaceId, allocation.tabId, allocation.paneId, allocation.agentName]
+      .every((value): boolean => validBoundedText(value, 4_096));
+}
+
+function workerReadinessFailure(
+  worker: WorkerIdentity,
+  allocation: WorkerAllocation,
+  cwd: string,
+  model: CapturedModel,
+): string | undefined {
+  const raw = worker as unknown as Record<string, unknown>;
+  if (!hasOnlyKeys(raw, [
+    "workspaceId", "tabId", "paneId", "agentName", "piPid", "sessionId", "sessionFile", "cwd", "model",
+    "mode", "initialHistoryEntries", "skillCommands", "toolNames", "contextFiles",
+  ])) return "Started worker identity contains unsupported runtime data";
+  if (!sameAllocation(worker, allocation)) return "Started worker does not occupy its durable Herdr allocation";
+  if (
+    !Number.isSafeInteger(worker.piPid) || worker.piPid <= 0 || !validBoundedText(worker.sessionId, 4_096) ||
+    !validBoundedText(worker.sessionFile, 4_096) || !isAbsolute(worker.sessionFile) ||
+    !validBoundedText(worker.cwd, 4_096) || !isAbsolute(worker.cwd) || worker.cwd !== cwd
+  ) return "Started worker has incomplete or mismatched Pi process, session, or cwd identity";
+  if (raw.mode !== "tui" || raw.initialHistoryEntries !== 0) {
+    return "Started worker is not a fresh normal interactive Pi TUI session";
+  }
+  if (digest(worker.model) !== digest(model)) return "Started worker model or thinking selection differs from approval";
+  if (
+    !validStringCollection(worker.skillCommands, 100) ||
+    new Set(worker.skillCommands).size !== worker.skillCommands.length ||
+    !REQUIRED_WORKER_SKILLS.every((skill): boolean => worker.skillCommands.includes(skill))
+  ) return "Started worker is missing required native skills";
+  if (
+    !validStringCollection(worker.toolNames, 100) || new Set(worker.toolNames).size !== worker.toolNames.length ||
+    !["read", "bash", "edit", "write"].every((tool): boolean => worker.toolNames.includes(tool)) ||
+    !validStringCollection(worker.contextFiles, 100) || worker.contextFiles.length === 0 ||
+    new Set(worker.contextFiles).size !== worker.contextFiles.length || !worker.contextFiles.every(isAbsolute)
+  ) return "Started worker is missing normal tools or project instruction resources";
+  return undefined;
+}
+
+function sameAllocation(
+  worker: WorkerIdentity,
+  allocation: WorkerAllocation,
+): boolean {
+  return worker.workspaceId === allocation.workspaceId && worker.tabId === allocation.tabId &&
+    worker.paneId === allocation.paneId && worker.agentName === allocation.agentName;
+}
+
+function sameWorker(left: WorkerIdentity, right: WorkerIdentity): boolean {
+  return digest(left) === digest(right);
+}
+
+function isWorkerStatus(value: unknown): value is WorkerObservation["status"] {
+  return value === "ready" || value === "working" || value === "idle" || value === "done" ||
+    value === "blocked" || value === "missing" || value === "unknown";
+}
+
+function hasOnlyKeys(value: unknown, allowed: string[]): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const keys = new Set(allowed);
+  return Object.keys(value).every((key): boolean => keys.has(key));
+}
+
+function validReferences(references: string[]): boolean {
+  return validStringCollection(references, MAX_ATTEMPT_REFERENCES) &&
+    references.every((reference): boolean => reference.length <= 4_096 && !containsCredential(reference));
+}
+
+function uniqueReferences(references: string[]): string[] {
+  return [...new Set(references)];
+}
+
+function validDecisionInput(input: NonNullable<WorkerObservation["decision"]>): boolean {
+  const text = [input.question, input.context, input.recommendation, ...input.options];
+  return (input.transportId === undefined || /^[A-Za-z0-9_-]{1,200}$/.test(input.transportId)) &&
+    validBoundedText(input.question, 4_000) && validBoundedText(input.context, 4_000) &&
+    validBoundedText(input.recommendation, 4_000) && input.options.length >= 1 && input.options.length <= 20 &&
+    input.options.every((option): boolean => validBoundedText(option, 1_000)) &&
+    text.every((item): boolean => !containsCredential(item));
+}
+
+function containsCredential(value: string): boolean {
+  return /\b(?:sk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]+\b/i.test(value) ||
+    /(?:token|secret|password|api[_ -]?key)\s*[=:]\s*\S+/i.test(value) ||
+    /[?&](?:access_?token|api_?key|token|secret|password)=/i.test(value);
+}
+
+function validStringCollection(values: unknown, maximum: number): values is string[] {
+  return Array.isArray(values) && values.length <= maximum &&
+    values.every((value): boolean => typeof value === "string" && value.trim().length > 0 && value.length <= 4_096);
+}
+
+function validBoundedText(value: unknown, maximum: number): value is string {
+  return typeof value === "string" && value.trim().length > 0 && value.length <= maximum;
 }
 
 function encodeCursor(offset: number): string {

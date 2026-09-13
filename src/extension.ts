@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { basename, isAbsolute, join, resolve } from "node:path";
 
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -12,18 +11,16 @@ import type {
 import { Type, type Static } from "typebox";
 
 import {
-  PreparationController,
   type AdmissionSnapshot,
   type ApprovalRequest,
   type BatchProposal,
   type CapturedModel,
   type ControllerResult,
-  type PreparationRecord,
+  type ControllerStatus,
+  type ExecutionAttempt,
 } from "./controller.js";
+import { connectOrStartLocalController, type ControllerClient } from "./local-daemon.js";
 import { formatPreparationPreview } from "./presentation.js";
-import { JsonControllerStateStore } from "./state-store.js";
-
-const LOCAL_ACTOR_CAPABILITY = Symbol("Pi extension local actor");
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 const SOURCE_EVIDENCE_SCHEMA = Type.Object({
   identity: Type.String({ minLength: 1 }),
@@ -187,7 +184,8 @@ function capturedModel(pi: ExtensionAPI, ctx: ExtensionContext): CapturedModel {
 async function inspectAdmission(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
-): Promise<{ controller: PreparationController; snapshot: AdmissionSnapshot }> {
+  dependencies: HerdrExtensionDependencies,
+): Promise<{ controller: ControllerClient; snapshot: AdmissionSnapshot }> {
   const git = await gitContext(pi, ctx.cwd);
   const model = capturedModel(pi, ctx);
   const [piVersion, herdrVersion, auth] = await Promise.all([
@@ -221,21 +219,137 @@ async function inspectAdmission(
       available,
     },
   };
-  return { controller: createController(git.statePath), snapshot };
+  return { controller: await dependencies.connectController(git.statePath), snapshot };
 }
 
-function createController(statePath: string): PreparationController {
-  return new PreparationController(new JsonControllerStateStore(statePath), {
-    actorCapability: LOCAL_ACTOR_CAPABILITY,
-    now: (): Date => new Date(),
-    generateId: (): string => randomUUID(),
-    formatPreview: (record: PreparationRecord): string => formatPreparationPreview(record),
-  });
+export interface HerdrExtensionDependencies {
+  connectController: (statePath: string) => Promise<ControllerClient>;
+  workspaceId: () => string | undefined;
 }
 
-async function controllerFor(pi: ExtensionAPI, ctx: ExtensionContext): Promise<PreparationController> {
+const DEFAULT_EXTENSION_DEPENDENCIES: HerdrExtensionDependencies = {
+  connectController: connectOrStartLocalController,
+  workspaceId: (): string | undefined => process.env.HERDR_WORKSPACE_ID,
+};
+
+async function controllerFor(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  dependencies: HerdrExtensionDependencies,
+): Promise<ControllerClient> {
   const git = await gitContext(pi, ctx.cwd);
-  return createController(git.statePath);
+  return dependencies.connectController(git.statePath);
+}
+
+function attemptSummary(attempt: ExecutionAttempt, status: ControllerStatus): string[] {
+  const preparation = status.preparations.find((record): boolean => record.id === attempt.preparationId);
+  const ticket = preparation?.proposal?.tickets.find((item): boolean => item.identity === attempt.ticketIdentity);
+  const batch = preparation?.controllerName ?? attempt.preparationId;
+  const ticketLabel = ticket ? `${ticket.title} (${ticket.identity})` : attempt.ticketIdentity;
+  const lines = [`${attempt.id} ${attempt.lifecycle} ${ticketLabel} · batch ${batch}`];
+  if (attempt.worktree) lines.push(`  worktree ${attempt.worktree.path} (${attempt.worktree.branch} @ ${attempt.worktree.head.slice(0, 12)})`);
+  if (attempt.worker) {
+    lines.push(`  worker ${attempt.worker.agentName} workspace=${attempt.worker.workspaceId} tab=${attempt.worker.tabId} pane=${attempt.worker.paneId} pid=${attempt.worker.piPid}`);
+    lines.push(`  session ${attempt.worker.sessionId} ${attempt.worker.sessionFile}`);
+  } else if (attempt.workerAllocation) {
+    lines.push(`  allocation ${attempt.workerAllocation.agentName} workspace=${attempt.workerAllocation.workspaceId} tab=${attempt.workerAllocation.tabId} pane=${attempt.workerAllocation.paneId}`);
+  }
+  for (const decision of attempt.decisions.filter((item): boolean => item.state !== "delivered")) {
+    lines.push(`  decision ${decision.id} ${decision.state}: ${decision.question}`);
+    lines.push(`    context: ${decision.context}`);
+    if (decision.options.length > 0) lines.push(`    options: ${decision.options.join(" | ")}`);
+    lines.push(`    recommendation: ${decision.recommendation}`);
+  }
+  for (const reference of attempt.artifactReferences) lines.push(`  artifact ${reference}`);
+  for (const diagnostic of attempt.diagnostics) lines.push(`  attention ${diagnostic}`);
+  return lines;
+}
+
+function renderControllerStatus(ctx: ExtensionContext, status: ControllerStatus): void {
+  const preparationLines = status.preparations.map(
+    (record): string => `${record.id} ${record.stage} ${record.controllerName}${record.proposalDigest ? ` ${record.proposalDigest.slice(0, 12)}` : ""}`,
+  );
+  const attemptLines = status.executionAttempts.flatMap((attempt): string[] => attemptSummary(attempt, status));
+  const lines = [
+    ...(preparationLines.length > 0 ? ["Preparations", ...preparationLines] : []),
+    ...(attemptLines.length > 0 ? ["Attempts", ...attemptLines] : []),
+    ...(status.hasMore ? ["More records are available through the paginated controller client."] : []),
+  ];
+  if (lines.length === 0) lines.push("No Herdr preparations or attempts in this repository");
+  const activeCount = status.executionAttempts.filter(
+    (attempt): boolean => !["completed-unaccepted", "needs-attention"].includes(attempt.lifecycle),
+  ).length;
+  const decisionCount = status.executionAttempts.reduce(
+    (count, attempt): number => count + attempt.decisions.filter((decision): boolean => decision.state !== "delivered").length,
+    0,
+  );
+  ctx.ui.setStatus("herdr-controller", `${activeCount} active · ${decisionCount} pending decision${decisionCount === 1 ? "" : "s"}`);
+  ctx.ui.setWidget("herdr-controller", lines);
+  ctx.ui.notify(lines.join("\n"), "info");
+}
+
+async function refreshControllerStatus(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  dependencies: HerdrExtensionDependencies,
+): Promise<void> {
+  const status = unwrapResult(await (await controllerFor(pi, ctx, dependencies)).status({ limit: 50 }));
+  renderControllerStatus(ctx, status);
+}
+
+async function allControllerStatus(controller: ControllerClient): Promise<ControllerStatus> {
+  const preparations: ControllerStatus["preparations"] = [];
+  const executionAttempts: ControllerStatus["executionAttempts"] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < 2; page += 1) {
+    const status = unwrapResult(await controller.status({ limit: 50, ...(cursor ? { cursor } : {}) }));
+    preparations.push(...status.preparations);
+    executionAttempts.push(...status.executionAttempts);
+    if (!status.hasMore) return { preparations, executionAttempts, nextCursor: null, hasMore: false };
+    if (!status.nextCursor || status.nextCursor === cursor) throw new Error("Controller status pagination did not advance");
+    cursor = status.nextCursor;
+  }
+  throw new Error("Controller status exceeds its documented bounded capacity");
+}
+
+function commandArguments(args: string, count: number): string[] | undefined {
+  const values = args.trim().split(/\s+/, count + 1);
+  return values.length === count && values.every((value): boolean => value.length > 0) ? values : undefined;
+}
+
+function answerArguments(args: string): [string, string, string] | undefined {
+  const match = args.trim().match(/^(\S+)\s+(\S+)\s+([\s\S]+)$/);
+  return match ? [match[1]!, match[2]!, match[3]!.trim()] : undefined;
+}
+
+function registerAttemptControl(
+  pi: ExtensionAPI,
+  dependencies: HerdrExtensionDependencies,
+  name: string,
+  description: string,
+  operation: (controller: ControllerClient, attemptId: string) => Promise<ControllerResult<ExecutionAttempt>>,
+  after?: (ctx: ExtensionContext, attempt: ExecutionAttempt) => void,
+): void {
+  pi.registerCommand(name, {
+    description,
+    handler: async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
+      try {
+        const values = commandArguments(args, 1);
+        if (!values) throw new Error(`Usage: /${name} <attempt-id>`);
+        const controller = await controllerFor(pi, ctx, dependencies);
+        const changed = unwrapResult(await operation(controller, values[0]!));
+        renderControllerStatus(ctx, {
+          preparations: [],
+          executionAttempts: [changed],
+          nextCursor: null,
+          hasMore: false,
+        });
+        after?.(ctx, changed);
+      } catch (error) {
+        reportError(ctx, error);
+      }
+    },
+  });
 }
 
 function preparationPrompt(preparationId: string, specReference: string, instructionFiles: string[]): string {
@@ -279,7 +393,10 @@ function reportError(ctx: ExtensionContext, error: unknown): void {
   ctx.ui.notify(diagnosticsFor(error).join("\n"), "error");
 }
 
-export default function herdrPreparationExtension(pi: ExtensionAPI): void {
+export function registerHerdrExtension(
+  pi: ExtensionAPI,
+  dependencies: HerdrExtensionDependencies = DEFAULT_EXTENSION_DEPENDENCIES,
+): void {
   pi.registerCommand("herdr-prepare", {
     description: "Prepare a selected spec as a validated durable Herdr batch",
     handler: async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
@@ -287,13 +404,12 @@ export default function herdrPreparationExtension(pi: ExtensionAPI): void {
         if (!ctx.hasUI) throw new Error("Preparation requires an interactive Pi or RPC UI");
         const specReference = args.trim();
         if (!specReference) throw new Error("Usage: /herdr-prepare <configured-tracker-spec-reference>");
-        const inspected = await inspectAdmission(pi, ctx);
+        const inspected = await inspectAdmission(pi, ctx, dependencies);
         const suggestedName = `${inspected.snapshot.project.identity} / ${specReference}`;
         const controllerName = await ctx.ui.input("Controller name", suggestedName);
         if (!controllerName) return;
         const record = unwrapResult(
           await inspected.controller.prepare(
-            LOCAL_ACTOR_CAPABILITY,
             { specReference, controllerName },
             inspected.snapshot,
           ),
@@ -319,24 +435,134 @@ export default function herdrPreparationExtension(pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerCommand("herdr-status", {
-    description: "Show durable Herdr preparation status",
-    handler: async (_args: string, ctx: ExtensionCommandContext): Promise<void> => {
+  pi.registerCommand("herdr-start", {
+    description: "Start one ticket from an approved Herdr batch",
+    handler: async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
       try {
-        const status = unwrapResult(
-          await (await controllerFor(pi, ctx)).status(LOCAL_ACTOR_CAPABILITY, { limit: 50 }),
-        );
-        if (status.preparations.length === 0) {
-          ctx.ui.notify("No Herdr preparations in this repository", "info");
+        const values = commandArguments(args, 2);
+        if (!values) throw new Error("Usage: /herdr-start <preparation-id> <ticket-identity>");
+        const workspaceId = dependencies.workspaceId()?.trim();
+        if (!workspaceId) throw new Error("HERDR_WORKSPACE_ID is required to start a ticket from this Pi session");
+        const controller = await controllerFor(pi, ctx, dependencies);
+        const started = unwrapResult(await controller.startTicket({
+          preparationId: values[0]!,
+          ticketIdentity: values[1]!,
+          workspaceId,
+        }));
+        renderControllerStatus(ctx, {
+          preparations: [],
+          executionAttempts: [started],
+          nextCursor: null,
+          hasMore: false,
+        });
+      } catch (error) {
+        reportError(ctx, error);
+      }
+    },
+  });
+
+  registerAttemptControl(
+    pi,
+    dependencies,
+    "herdr-attach",
+    "Focus and show how to attach to the exact owned worker",
+    (controller, attemptId) => controller.attachAttempt({ attemptId }),
+    (ctx, changed): void => {
+      if (changed.worker) {
+        ctx.ui.notify(`Focused the owned worker. Attach from another terminal with: herdr agent attach ${changed.worker.agentName}`, "info");
+      }
+    },
+  );
+  registerAttemptControl(
+    pi,
+    dependencies,
+    "herdr-pause",
+    "Pause controller automation for one attempt",
+    (controller, attemptId) => controller.pauseAttempt({ attemptId }),
+  );
+  registerAttemptControl(
+    pi,
+    dependencies,
+    "herdr-resume",
+    "Explicitly resume a paused or restart-required attempt",
+    (controller, attemptId) => controller.resumeAttempt({ attemptId }),
+  );
+  registerAttemptControl(
+    pi,
+    dependencies,
+    "herdr-takeover",
+    "Pause automation and focus an owned worker for human takeover",
+    (controller, attemptId) => controller.takeOverAttempt({ attemptId }),
+    (ctx, changed): void => {
+      if (changed.worker) {
+        ctx.ui.notify(`Automation is paused. Attach interactively with: herdr agent attach ${changed.worker.agentName} --takeover`, "info");
+      }
+    },
+  );
+  registerAttemptControl(
+    pi,
+    dependencies,
+    "herdr-return",
+    "Return a takeover attempt to controller automation",
+    (controller, attemptId) => controller.returnAttempt({ attemptId }),
+  );
+
+  pi.registerCommand("herdr-questions", {
+    description: "Show pending local decisions, context, options, and recommendations",
+    handler: async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
+      try {
+        const attemptId = args.trim();
+        if (attemptId.includes(" ")) throw new Error("Usage: /herdr-questions [attempt-id]");
+        const status = await allControllerStatus(await controllerFor(pi, ctx, dependencies));
+        const attempts = attemptId
+          ? status.executionAttempts.filter((attempt): boolean => attempt.id === attemptId)
+          : status.executionAttempts;
+        if (attemptId && attempts.length === 0) throw new Error(`Unknown execution attempt: ${attemptId}`);
+        const pending = attempts.filter((attempt): boolean => attempt.decisions.some((decision): boolean => decision.state !== "delivered"));
+        if (pending.length === 0) {
+          ctx.ui.notify("No pending local decisions", "info");
           return;
         }
-        const records = status.preparations
-          .map((record): string => `${record.id} ${record.stage} ${record.controllerName}${record.proposalDigest ? ` ${record.proposalDigest.slice(0, 12)}` : ""}`)
-          .join("\n");
-        ctx.ui.notify(
-          status.hasMore ? `${records}\nMore preparations are available through the paginated controller status interface.` : records,
-          "info",
-        );
+        renderControllerStatus(ctx, { ...status, preparations: [], executionAttempts: pending, hasMore: false, nextCursor: null });
+      } catch (error) {
+        reportError(ctx, error);
+      }
+    },
+  });
+
+  pi.registerCommand("herdr-answer", {
+    description: "Durably answer one pending local decision",
+    handler: async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
+      try {
+        if (!ctx.hasUI) throw new Error("Answering a local decision requires an interactive Pi or RPC UI");
+        const values = answerArguments(args);
+        if (!values) throw new Error("Usage: /herdr-answer <attempt-id> <decision-id> <answer>");
+        const answeredBy = await ctx.ui.input("Record answer author", "local developer");
+        if (!answeredBy?.trim()) return;
+        const controller = await controllerFor(pi, ctx, dependencies);
+        const answered = unwrapResult(await controller.answerDecision({
+          attemptId: values[0],
+          decisionId: values[1],
+          answer: values[2],
+          answeredBy: answeredBy.trim(),
+        }));
+        renderControllerStatus(ctx, {
+          preparations: [],
+          executionAttempts: [answered],
+          nextCursor: null,
+          hasMore: false,
+        });
+      } catch (error) {
+        reportError(ctx, error);
+      }
+    },
+  });
+
+  pi.registerCommand("herdr-status", {
+    description: "Show durable Herdr preparation, attempt, session, and decision status",
+    handler: async (_args: string, ctx: ExtensionCommandContext): Promise<void> => {
+      try {
+        await refreshControllerStatus(pi, ctx, dependencies);
       } catch (error) {
         reportError(ctx, error);
       }
@@ -356,7 +582,7 @@ export default function herdrPreparationExtension(pi: ExtensionAPI): void {
       ctx: ExtensionContext,
     ): Promise<AgentToolResult<unknown>> {
       const record = unwrapResult(
-        await (await controllerFor(pi, ctx)).getPreparation(LOCAL_ACTOR_CAPABILITY, params.preparationId),
+        await (await controllerFor(pi, ctx, dependencies)).getPreparation(params.preparationId),
       );
       return {
         content: [{ type: "text", text: JSON.stringify(record, null, 2) }],
@@ -377,15 +603,14 @@ export default function herdrPreparationExtension(pi: ExtensionAPI): void {
       _onUpdate: AgentToolUpdateCallback<unknown> | undefined,
       ctx: ExtensionContext,
     ): Promise<AgentToolResult<unknown>> {
-      const controller = await controllerFor(pi, ctx);
+      const controller = await controllerFor(pi, ctx, dependencies);
       const record = unwrapResult(
         await controller.submitProposal(
-          LOCAL_ACTOR_CAPABILITY,
           params.preparationId,
           params.proposal as unknown as BatchProposal,
         ),
       );
-      const text = unwrapResult(await controller.preview(LOCAL_ACTOR_CAPABILITY, record.id));
+      const text = unwrapResult(await controller.preview(record.id));
       ctx.ui.notify(text, "info");
       return { content: [{ type: "text", text }], details: { preparationId: record.id, proposalDigest: record.proposalDigest } };
     },
@@ -404,9 +629,9 @@ export default function herdrPreparationExtension(pi: ExtensionAPI): void {
       ctx: ExtensionContext,
     ): Promise<AgentToolResult<unknown>> {
       if (!ctx.hasUI) throw new Error("Batch approval requires an interactive Pi or RPC UI");
-      const controller = await controllerFor(pi, ctx);
+      const controller = await controllerFor(pi, ctx, dependencies);
       const proposed = unwrapResult(
-        await controller.getPreparation(LOCAL_ACTOR_CAPABILITY, params.preparationId),
+        await controller.getPreparation(params.preparationId),
       );
       if (!proposed.proposal || !proposed.proposalDigest) throw new Error("Preparation has no proposal to approve");
       const proposalDigest = proposed.proposalDigest;
@@ -423,7 +648,7 @@ export default function herdrPreparationExtension(pi: ExtensionAPI): void {
         evidence: params.evidence,
       };
       const validated = unwrapResult(
-        await controller.validateApproval(LOCAL_ACTOR_CAPABILITY, params.preparationId, request),
+        await controller.validateApproval(params.preparationId, request),
       );
       const text = formatPreparationPreview(validated);
       const confirmed = await ctx.ui.confirm("Approve this exact Herdr batch?", text);
@@ -431,10 +656,14 @@ export default function herdrPreparationExtension(pi: ExtensionAPI): void {
         return { content: [{ type: "text", text: "Approval cancelled; the proposal remains unapproved." }], details: {} };
       }
       const approved = unwrapResult(
-        await controller.approve(LOCAL_ACTOR_CAPABILITY, params.preparationId, request),
+        await controller.approve(params.preparationId, request),
       );
       const result = `Approved ${approved.controllerName} at ${approved.approved?.approvedAt}; proposal ${approved.proposalDigest}. No worker was started.`;
       return { content: [{ type: "text", text: result }], details: { preparationId: approved.id, proposalDigest: approved.proposalDigest } };
     },
   });
+}
+
+export default function herdrPreparationExtension(pi: ExtensionAPI): void {
+  registerHerdrExtension(pi);
 }

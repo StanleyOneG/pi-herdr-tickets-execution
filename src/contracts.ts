@@ -129,12 +129,203 @@ export interface PreparationRecord {
 }
 
 export const MAX_PREPARATIONS = 100;
+export const MAX_EXECUTION_ATTEMPTS = 100;
 export const MAX_STATUS_PAGE_SIZE = 50;
+export const MAX_ATTEMPT_DECISIONS = 50;
+export const MAX_ATTEMPT_REFERENCES = 50;
+export const MAX_ATTEMPT_DIAGNOSTICS = 20;
+
+export type ExecutionLifecycle =
+  | "claimed"
+  | "preparing-worktree"
+  | "starting"
+  | "running"
+  | "paused"
+  | "pending-decision"
+  | "takeover"
+  | "completed-unaccepted"
+  | "needs-attention"
+  | "restart-required";
+
+export interface ControllerOwner {
+  instanceId: string;
+  pid: number;
+}
+
+export interface GitFileFingerprint {
+  path: string;
+  contentDigest: string;
+}
+
+export interface OriginalCheckoutSnapshot {
+  root: string;
+  commonDir: string;
+  head: string;
+  branch: string;
+  statusDigest: string;
+  indexDiffDigest: string;
+  worktreeDiffDigest: string;
+  changedFiles: GitFileFingerprint[];
+  untrackedFiles: GitFileFingerprint[];
+}
+
+export interface TicketWorktreePlan {
+  path: string;
+  branch: string;
+}
+
+export interface WorktreeIdentity extends TicketWorktreePlan {
+  commonDir: string;
+  head: string;
+}
+
+export interface WorkerAllocation {
+  workspaceId: string;
+  tabId: string;
+  paneId: string;
+  agentName: string;
+}
+
+export interface WorkerIdentity extends WorkerAllocation {
+  piPid: number;
+  sessionId: string;
+  sessionFile: string;
+  cwd: string;
+  model: CapturedModel;
+  mode: "tui";
+  initialHistoryEntries: 0;
+  skillCommands: string[];
+  toolNames: string[];
+  contextFiles: string[];
+}
+
+export type WorkerStatus = "ready" | "working" | "idle" | "done" | "blocked" | "missing" | "unknown";
+
+export interface PendingDecisionInput {
+  transportId?: string;
+  question: string;
+  context: string;
+  options: string[];
+  recommendation: string;
+}
+
+export interface WorkerObservation {
+  identity: WorkerIdentity;
+  status: WorkerStatus;
+  artifactReferences: string[];
+  decision?: PendingDecisionInput;
+  diagnostic?: string;
+  completionText?: string;
+}
+
+export interface DecisionRecord extends PendingDecisionInput {
+  id: string;
+  state: "pending" | "answered" | "delivered";
+  requestedAt: string;
+  answeredAt?: string;
+  answeredBy?: string;
+  answer?: string;
+  deliveredAt?: string;
+}
+
+export interface SetupOperationRecord {
+  index: number;
+  operationDigest: string;
+  state: "started" | "completed";
+  startedAt: string;
+  completedAt?: string;
+  outcomeDigest?: string;
+}
+
+export interface ExecutionAttempt {
+  id: string;
+  preparationId: string;
+  proposalDigest: string;
+  ticketIdentity: string;
+  workspaceId: string;
+  lifecycle: ExecutionLifecycle;
+  owner: ControllerOwner;
+  createdAt: string;
+  updatedAt: string;
+  originalCheckout?: OriginalCheckoutSnapshot;
+  worktreePlan?: TicketWorktreePlan;
+  worktree?: WorktreeIdentity;
+  workerAllocation?: WorkerAllocation;
+  worker?: WorkerIdentity;
+  setupOperations?: SetupOperationRecord[];
+  suspendedFrom?: "running" | "pending-decision";
+  decisions: DecisionRecord[];
+  artifactReferences: string[];
+  diagnostics: string[];
+}
+
+export interface StartTicketRequest {
+  preparationId: string;
+  ticketIdentity: string;
+  workspaceId: string;
+}
+
+export interface AttemptRequest {
+  attemptId: string;
+}
+
+export interface AnswerDecisionRequest extends AttemptRequest {
+  decisionId: string;
+  answer: string;
+  answeredBy: string;
+}
+
+export interface RecordWorkerObservationRequest extends AttemptRequest {
+  observation: WorkerObservation;
+}
+
+export interface GitWorktreePort {
+  planTicketWorktree(input: {
+    originalRoot: string;
+    preparationId: string;
+    ticketIdentity: string;
+  }): TicketWorktreePlan;
+  inspectOriginal(root: string): Promise<OriginalCheckoutSnapshot>;
+  createTicketWorktree(input: {
+    originalRoot: string;
+    baseCommit: string;
+    plan: TicketWorktreePlan;
+  }): Promise<WorktreeIdentity>;
+  inspectWorktree(path: string): Promise<WorktreeIdentity>;
+}
+
+export interface WorkerRuntimePort {
+  allocate(input: {
+    workspaceId: string;
+    agentName: string;
+    cwd: string;
+  }): Promise<WorkerAllocation>;
+  start(input: {
+    allocation: WorkerAllocation;
+    cwd: string;
+    model: CapturedModel;
+  }): Promise<WorkerIdentity>;
+  inspect(identity: WorkerIdentity): Promise<WorkerObservation>;
+  dispatchImplementation(identity: WorkerIdentity, ticketReference: string): Promise<WorkerObservation>;
+  deliverDecision(identity: WorkerIdentity, decisionId: string, answer: string): Promise<WorkerObservation>;
+  focus(identity: WorkerIdentity): Promise<void>;
+}
+
+export interface SetupRuntimePort {
+  execute(input: { cwd: string; operation: SetupOperation }): Promise<{ outcomeDigest: string }>;
+}
+
+export interface ExecutionControllerDependencies {
+  owner: ControllerOwner;
+  git: GitWorktreePort;
+  worker: WorkerRuntimePort;
+  setup?: SetupRuntimePort;
+}
 
 export interface ControllerState {
   schemaVersion: 1;
   preparations: PreparationRecord[];
-  executionAttempts: never[];
+  executionAttempts: ExecutionAttempt[];
 }
 
 export interface PaginationRequest {
@@ -146,7 +337,7 @@ export interface ControllerStatus {
   preparations: PreparationRecord[];
   nextCursor: string | null;
   hasMore: boolean;
-  executionAttempts: never[];
+  executionAttempts: ExecutionAttempt[];
 }
 
 export interface ControllerStateStore {
@@ -168,6 +359,9 @@ export type ControllerErrorCode =
   | "proposal-validation"
   | "query-validation"
   | "stale-approval"
+  | "execution-validation"
+  | "execution-conflict"
+  | "infrastructure"
   | "storage";
 
 export interface ControllerError {
@@ -186,4 +380,5 @@ export interface ControllerDependencies {
   now: () => Date;
   generateId: () => string;
   formatPreview: (record: PreparationRecord) => string;
+  execution?: ExecutionControllerDependencies;
 }
