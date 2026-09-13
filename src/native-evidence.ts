@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { open } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 
 import type { NativeEvidencePort, NativeEvidenceRecord } from "./contracts.js";
@@ -11,10 +12,7 @@ export class FileNativeEvidenceAdapter implements NativeEvidencePort {
   async verify(input: { record: NativeEvidenceRecord; candidate: { codeStateDigest: string } }): Promise<void> {
     const { record, candidate } = input;
     if (!isAbsolute(record.evidenceReference)) throw new Error("Native evidence reference must be an absolute local artifact");
-    const bytes = await readFile(record.evidenceReference);
-    if (bytes.byteLength === 0 || bytes.byteLength > MAX_NATIVE_EVIDENCE_BYTES) {
-      throw new Error("Native evidence artifact is empty or exceeds its bound");
-    }
+    const bytes = await readBoundedRegularFile(record.evidenceReference);
     if (hash(bytes) !== record.evidenceDigest) throw new Error("Native evidence artifact digest changed");
     const parsed: unknown = JSON.parse(bytes.toString("utf8"));
     if (!isReceipt(parsed) || parsed.kind !== record.kind || parsed.status !== record.status ||
@@ -25,9 +23,9 @@ export class FileNativeEvidenceAdapter implements NativeEvidencePort {
       if (!isAbsolute(artifact.reference) || artifact.reference === record.evidenceReference) {
         throw new Error("Native evidence source artifact reference is unsafe");
       }
-      const retained = await readFile(artifact.reference);
-      if (retained.byteLength === 0 || retained.byteLength > MAX_NATIVE_EVIDENCE_BYTES || hash(retained) !== artifact.digest) {
-        throw new Error("Native evidence source artifact is missing, changed, or exceeds its bound");
+      const retained = await readBoundedRegularFile(artifact.reference);
+      if (hash(retained) !== artifact.digest || !isProducerReceipt(JSON.parse(retained.toString("utf8")), parsed)) {
+        throw new Error("Native evidence source artifact is missing, changed, or candidate-mismatched");
       }
     }
   }
@@ -51,6 +49,38 @@ function isReceipt(value: unknown): value is {
     receipt.artifacts.every((artifact): boolean => typeof artifact === "object" && artifact !== null &&
       Object.keys(artifact).length === 2 && typeof artifact.reference === "string" && artifact.reference.length <= 4_096 &&
       typeof artifact.digest === "string" && /^[a-f0-9]{64}$/i.test(artifact.digest));
+}
+
+function isProducerReceipt(
+  value: unknown,
+  manifest: { kind: "tests" | "reviews"; status: "passed"; codeStateDigest: string; completedAt: string },
+): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const receipt = value as Record<string, unknown>;
+  return Object.keys(receipt).length === 7 && receipt.schemaVersion === 1 && receipt.producer === "pi-native-skill" &&
+    receipt.kind === manifest.kind && receipt.status === manifest.status && receipt.codeStateDigest === manifest.codeStateDigest &&
+    receipt.completedAt === manifest.completedAt && Array.isArray(receipt.executionReferences) &&
+    receipt.executionReferences.length > 0 && receipt.executionReferences.length <= 20 &&
+    receipt.executionReferences.every((reference): boolean => typeof reference === "string" &&
+      reference.trim().length > 0 && reference.length <= 4_096);
+}
+
+async function readBoundedRegularFile(path: string): Promise<Buffer> {
+  const file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+  try {
+    const metadata = await file.stat();
+    if (!metadata.isFile() || metadata.size <= 0 || metadata.size > MAX_NATIVE_EVIDENCE_BYTES) {
+      throw new Error("Native evidence artifact is not a bounded regular file");
+    }
+    const bytes = Buffer.alloc(MAX_NATIVE_EVIDENCE_BYTES + 1);
+    const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+    if (bytesRead === 0 || bytesRead > MAX_NATIVE_EVIDENCE_BYTES) {
+      throw new Error("Native evidence artifact is empty or exceeds its bound");
+    }
+    return bytes.subarray(0, bytesRead);
+  } finally {
+    await file.close();
+  }
 }
 
 function hash(value: Buffer): string {

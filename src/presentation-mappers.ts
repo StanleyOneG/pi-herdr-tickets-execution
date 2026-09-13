@@ -1,6 +1,15 @@
 import type { AcceptCandidateRequest, NativeEvidenceRecord } from "./contracts.js";
 
 /** Maps an untrusted acceptance DTO into a detached application command. */
+export function isAcceptCandidateCommand(value: unknown): value is AcceptCandidateRequest {
+  try {
+    mapAcceptCandidateCommand(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function mapAcceptCandidateCommand(value: unknown): AcceptCandidateRequest {
   if (!isObjectWithKeys(value, ["attemptId", "candidateDigest", "nativeEvidence"]) ||
     !boundedText(value.attemptId) || !digestText(value.candidateDigest) ||

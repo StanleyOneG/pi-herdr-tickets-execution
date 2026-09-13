@@ -13,15 +13,18 @@ export class JsonControllerStateStore implements ControllerStateStore {
   async load(): Promise<ControllerState> {
     try {
       const file = await open(this.statePath, "r");
+      let serialized: string;
       try {
         const metadata = await file.stat();
         if (metadata.size > MAX_STATE_BYTES) throw new Error("Controller state exceeds its storage bound");
-        const parsed: unknown = JSON.parse(await file.readFile("utf8"));
-        if (!isControllerState(parsed)) throw new Error("Controller state is malformed or unsupported");
-        return parsed;
+        serialized = await file.readFile("utf8");
       } finally {
         await file.close();
       }
+      const migrated = migrateLegacyApprovedIntegrations(JSON.parse(serialized) as unknown);
+      if (!isControllerState(migrated.value)) throw new Error("Controller state is malformed or unsupported");
+      if (migrated.changed) await this.save(migrated.value);
+      return migrated.value;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         return { schemaVersion: 1, preparations: [], executionAttempts: [] };
@@ -76,4 +79,25 @@ export class JsonControllerStateStore implements ControllerStateStore {
       if (process.platform !== "win32") throw error;
     }
   }
+}
+
+function migrateLegacyApprovedIntegrations(value: unknown): { value: unknown; changed: boolean } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { value, changed: false };
+  const state = value as Record<string, unknown>;
+  if (state.schemaVersion !== 1 || !Array.isArray(state.preparations)) return { value, changed: false };
+  let changed = false;
+  for (const item of state.preparations) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const preparation = item as Record<string, unknown>;
+    if (preparation.stage !== "approved" || preparation.batchIntegration !== undefined ||
+      !preparation.proposal || typeof preparation.proposal !== "object" || Array.isArray(preparation.proposal)
+    ) continue;
+    const target = (preparation.proposal as Record<string, unknown>).target;
+    if (!target || typeof target !== "object" || Array.isArray(target)) continue;
+    const baseCommit = (target as Record<string, unknown>).baseCommit;
+    if (typeof baseCommit !== "string" || baseCommit.length === 0 || baseCommit.length > 4_096) continue;
+    preparation.batchIntegration = { head: baseCommit, sequence: 0 };
+    changed = true;
+  }
+  return { value, changed };
 }

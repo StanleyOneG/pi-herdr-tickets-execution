@@ -114,6 +114,16 @@ export interface ApprovalRecord {
   evidence: SourceEvidence[];
 }
 
+export interface PendingIntegrationEffect {
+  attemptId: string;
+  receiptId: string;
+  worktreePath: string;
+  branch: string;
+  fromCommit: string;
+  toCommit: string;
+  sequence: number;
+}
+
 export interface PreparationRecord {
   id: string;
   stage: "reasoning" | "proposed" | "approved";
@@ -127,6 +137,7 @@ export interface PreparationRecord {
   effectiveContextLimit?: { handoffTokens: number; reserveTokens: number };
   approved?: ApprovalRecord;
   batchIntegration?: { head: string; sequence: number };
+  pendingIntegration?: PendingIntegrationEffect;
 }
 
 export const MAX_PREPARATIONS = 100;
@@ -268,6 +279,17 @@ export interface GateCheckRecord {
   completedAt: string;
 }
 
+export interface NativeVerificationRecord {
+  status: "passed" | "blocked";
+  candidateCommit: string;
+  codeStateDigest: string;
+  freshSessionId: string;
+  observedCommandDigests: string[];
+  findings: string[];
+  evidenceReference: string;
+  completedAt: string;
+}
+
 export interface AcceptanceReviewRecord {
   kind: "standards" | "spec";
   verdict: "passed" | "blocked";
@@ -312,6 +334,8 @@ export interface CandidateReceipt {
   integration?: {
     worktree: IntegrationWorktreeIdentity;
     staging: StagedIntegrationCandidate;
+    stagedCodeStateDigest: string;
+    nativeVerification?: NativeVerificationRecord;
     integratedCommit?: string;
     sequence?: number;
   };
@@ -357,12 +381,21 @@ export interface ExecutionAttempt {
   /** Omitted schema-1 attempts are generation zero until their next control mutation. */
   controlGeneration?: number;
   setupOperations?: SetupOperationRecord[];
-  suspendedFrom?: "running" | "pending-decision" | "accepting" | "integration-blocked";
+  suspendedFrom?: "running" | "pending-decision" | "completed-unaccepted" | "accepting" | "integration-blocked";
   decisions: DecisionRecord[];
   artifactReferences: string[];
   diagnostics: string[];
   candidateReceipts?: CandidateReceipt[];
   acceptedCommit?: string;
+}
+
+/** True only while an attempt owns one approved implementation-concurrency slot. */
+export function occupiesImplementationSlot(attempt: ExecutionAttempt): boolean {
+  if (["claimed", "preparing-worktree", "starting", "running", "pending-decision"].includes(attempt.lifecycle)) return true;
+  if (attempt.lifecycle === "paused" || attempt.lifecycle === "takeover" || attempt.lifecycle === "restart-required") {
+    return attempt.suspendedFrom === "running" || attempt.suspendedFrom === "pending-decision";
+  }
+  return false;
 }
 
 export interface StartTicketRequest {
@@ -448,6 +481,17 @@ export interface NativeEvidencePort {
   verify(input: { record: NativeEvidenceRecord; candidate: CandidateGitState }): Promise<void>;
 }
 
+export interface NativeVerificationPort {
+  verify(input: {
+    workspaceId: string;
+    cwd: string;
+    candidateCommit: string;
+    codeStateDigest: string;
+    model: CapturedModel;
+    evidenceReferences: string[];
+  }): Promise<NativeVerificationRecord>;
+}
+
 export interface WorkerRuntimePort {
   allocate(input: {
     workspaceId: string;
@@ -479,6 +523,7 @@ export interface ExecutionControllerDependencies {
     reviewer: AcceptanceReviewPort;
     checks: GateCheckPort;
     nativeEvidence: NativeEvidencePort;
+    nativeVerifier: NativeVerificationPort;
   };
 }
 

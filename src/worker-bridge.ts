@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, unlink } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 
@@ -20,6 +20,7 @@ import {
   WORKER_BRIDGE_NONCE_ENV,
   WORKER_DECISION_REQUEST_DIRECTORY_ENV,
   WORKER_DECISION_RESPONSE_DIRECTORY_ENV,
+  WORKER_NATIVE_VERIFICATION_ENDPOINT_ENV,
   WORKER_REVIEW_ENDPOINT_ENV,
   WORKER_REVIEW_NONCE_ENV,
   type WorkerDecisionAnswer,
@@ -36,6 +37,13 @@ const REVIEW_SCHEMA = Type.Object({
   findings: Type.Array(Type.String({ minLength: 1, maxLength: 4_000 }), { maxItems: 50 }),
 });
 type ReviewInput = Static<typeof REVIEW_SCHEMA>;
+const NATIVE_VERIFICATION_SCHEMA = Type.Object({
+  status: StringEnum(["passed", "blocked"] as const),
+  candidateCommit: Type.String({ minLength: 1, maxLength: 4_096 }),
+  codeStateDigest: Type.String({ pattern: "^[a-fA-F0-9]{64}$" }),
+  findings: Type.Array(Type.String({ minLength: 1, maxLength: 4_000 }), { maxItems: 50 }),
+});
+type NativeVerificationInput = Static<typeof NATIVE_VERIFICATION_SCHEMA>;
 const DECISION_SCHEMA = Type.Object({
   question: Type.String({ minLength: 1, maxLength: 4_000 }),
   context: Type.String({ minLength: 1, maxLength: 4_000 }),
@@ -48,6 +56,10 @@ let sessionStartReason: WorkerReadinessReceipt["sessionStartReason"] | undefined
 export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   sessionStartReason = undefined;
   const activeTools = new Set<string>();
+  const bashCommands = new Map<string, string>();
+  const observedCommandDigests: string[] = [];
+  let failedBashCommand = false;
+  let mutationToolUsed = false;
   let isAgentRunning = false;
   const outstandingJobs = (): string[] => [
     ...(isAgentRunning ? ["pi-agent-run"] : []),
@@ -56,6 +68,10 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   pi.on("session_start", (event, _ctx): void => {
     sessionStartReason = event.reason;
     activeTools.clear();
+    bashCommands.clear();
+    observedCommandDigests.length = 0;
+    failedBashCommand = false;
+    mutationToolUsed = false;
     isAgentRunning = false;
   });
   pi.on("agent_start", async (_event, ctx): Promise<void> => {
@@ -64,10 +80,20 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   });
   pi.on("tool_execution_start", async (event, ctx): Promise<void> => {
     activeTools.add(event.toolCallId);
+    if (event.toolName === "bash" && typeof event.args?.command === "string" && event.args.command.length <= 4_096) {
+      bashCommands.set(event.toolCallId, event.args.command);
+    }
+    if (event.toolName === "edit" || event.toolName === "write") mutationToolUsed = true;
     await writeLifecycle(ctx, "working", outstandingJobs());
   });
   pi.on("tool_execution_end", async (event, ctx): Promise<void> => {
     activeTools.delete(event.toolCallId);
+    const command = bashCommands.get(event.toolCallId);
+    if (command !== undefined) {
+      observedCommandDigests.push(createHash("sha256").update(command).digest("hex"));
+      failedBashCommand ||= event.isError;
+      bashCommands.delete(event.toolCallId);
+    }
     await writeLifecycle(ctx, "working", outstandingJobs());
   });
   pi.on("agent_settled", async (_event, ctx): Promise<void> => {
@@ -108,6 +134,40 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
         ...params,
       })}\n`);
       return { content: [{ type: "text", text: `Recorded ${params.kind} review as ${params.verdict}.` }], details: { kind: params.kind, verdict: params.verdict }, terminate: true };
+    },
+  });
+
+  pi.registerTool({
+    name: "herdr_submit_native_verification",
+    label: "Submit Native Verification",
+    description: "Submit the final staged native verification result. A pass is accepted only when this Pi session observed successful test commands and no edit/write tools.",
+    parameters: NATIVE_VERIFICATION_SCHEMA,
+    async execute(
+      _toolCallId: string,
+      params: NativeVerificationInput,
+      _signal: AbortSignal | undefined,
+      _onUpdate: AgentToolUpdateCallback<unknown> | undefined,
+      ctx: ExtensionContext,
+    ): Promise<AgentToolResult<unknown>> {
+      const endpoint = process.env[WORKER_NATIVE_VERIFICATION_ENDPOINT_ENV];
+      const nonce = process.env[WORKER_REVIEW_NONCE_ENV];
+      if (!endpoint || !isAbsolute(endpoint) || !nonce) throw new Error("Native verification channel is incomplete");
+      if (observedCommandDigests.length === 0 || (params.status === "blocked" && params.findings.length === 0) ||
+        (params.status === "passed" && (params.findings.length > 0 || failedBashCommand || mutationToolUsed))
+      ) throw new Error("Native verification result does not match observed test execution");
+      await atomicWritePrivateFile(endpoint, `${JSON.stringify({
+        schemaVersion: 1,
+        nonce,
+        sessionId: ctx.sessionManager.getSessionId(),
+        observedCommandDigests: [...new Set(observedCommandDigests)],
+        completedAt: new Date().toISOString(),
+        ...params,
+      })}\n`);
+      return {
+        content: [{ type: "text", text: `Recorded staged native verification as ${params.status}.` }],
+        details: { status: params.status, observedCommands: observedCommandDigests.length },
+        terminate: true,
+      };
     },
   });
 

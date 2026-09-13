@@ -17,6 +17,7 @@ import type {
   WorktreeIdentity,
   SetupOperation,
   SourceEvidence,
+  StagedIntegrationCandidate,
 } from "./contracts.js";
 import {
   MAX_ATTEMPT_DECISIONS,
@@ -25,7 +26,7 @@ import {
   MAX_CANDIDATE_RECEIPTS,
   MAX_EXECUTION_ATTEMPTS,
   MAX_PREPARATIONS,
-  isActiveExecutionLifecycle,
+  occupiesImplementationSlot,
 } from "./contracts.js";
 import {
   approvalEvidenceFailures,
@@ -112,7 +113,14 @@ export function isControllerState(value: unknown): value is ControllerState {
         review.kind === kind && review.verdict === "passed" && review.findings.length === 0 &&
         review.candidateCommit === acceptedReceipt.integration?.staging.candidateCommit &&
         review.reviewBase === acceptedReceipt.integration?.staging.baseCommit
-      ))
+      )) ||
+      (acceptedReceipt.integration?.stagedCodeStateDigest !== acceptedReceipt.candidate.codeStateDigest &&
+        (!isNativeVerification(
+          acceptedReceipt.integration?.nativeVerification,
+          acceptedReceipt.integration?.staging.candidateCommit,
+          acceptedReceipt.integration?.stagedCodeStateDigest,
+        ) || acceptedReceipt.integration?.nativeVerification?.status !== "passed" ||
+          acceptedReceipt.integration.nativeVerification.findings.length > 0))
     )) return false;
   }
   for (const preparation of preparations.filter((record): boolean => record.stage === "approved")) {
@@ -125,12 +133,30 @@ export function isControllerState(value: unknown): value is ControllerState {
     if (accepted.some((receipt, index): boolean => receipt.integration?.sequence !== index + 1)) return false;
     const expectedHead = accepted.at(-1)?.integration?.integratedCommit ?? preparation.proposal!.target.baseCommit;
     if (preparation.batchIntegration.head !== expectedHead) return false;
+    const pending = preparation.pendingIntegration;
+    if (pending) {
+      const attempt = attempts.find((item): boolean => item.id === pending.attemptId && item.preparationId === preparation.id);
+      const receipt = attempt?.candidateReceipts?.find((item): boolean => item.id === pending.receiptId);
+      if (!attempt || !receipt?.integration || pending.sequence !== preparation.batchIntegration.sequence + 1 ||
+        pending.fromCommit !== preparation.batchIntegration.head || pending.toCommit !== receipt.integration.staging.candidateCommit ||
+        pending.fromCommit !== receipt.integration.staging.baseCommit || pending.worktreePath !== receipt.integration.worktree.path ||
+        pending.branch !== receipt.integration.worktree.branch || receipt.state !== "captured" ||
+        (attempt.lifecycle !== "accepting" && attempt.lifecycle !== "needs-attention" &&
+          !(attempt.lifecycle === "restart-required" && attempt.suspendedFrom === "accepting"))
+      ) return false;
+    }
   }
-  const activeByPreparation = new Set<string>();
-  for (const attempt of attempts.filter((item): boolean => isActiveExecutionLifecycle(item.lifecycle))) {
-    if (activeByPreparation.has(attempt.preparationId)) return false;
-    activeByPreparation.add(attempt.preparationId);
+  for (const preparation of preparations.filter((record): boolean => record.stage === "approved")) {
+    const occupancy = attempts.filter((attempt): boolean =>
+      attempt.preparationId === preparation.id && occupiesImplementationSlot(attempt)
+    ).length;
+    if (occupancy > preparation.proposal!.policy.concurrency) return false;
   }
+  const retainedWorkers = attempts.filter((attempt): boolean => attempt.lifecycle !== "accepted" && attempt.worker !== undefined);
+  const workerLocations = retainedWorkers.map((attempt): string =>
+    `${attempt.worker!.workspaceId}\0${attempt.worker!.tabId}\0${attempt.worker!.paneId}\0${attempt.worker!.sessionId}`
+  );
+  if (new Set(workerLocations).size !== workerLocations.length) return false;
   return !preparations.some((record): boolean =>
     record.stage === "approved" &&
     hasApprovedControllerNameCollision(preparations, record.controllerName, record.id)
@@ -161,7 +187,9 @@ function isExecutionAttempt(value: unknown): value is ExecutionAttempt {
     typeof value.controlGeneration !== "number" || !Number.isSafeInteger(value.controlGeneration) || value.controlGeneration < 0
   )) return false;
   if (value.setupOperations !== undefined && (!Array.isArray(value.setupOperations) || !value.setupOperations.every(isSetupOperationRecord))) return false;
-  if (value.suspendedFrom !== undefined && !["running", "pending-decision", "accepting", "integration-blocked"].includes(value.suspendedFrom as string)) return false;
+  if (value.suspendedFrom !== undefined && ![
+    "running", "pending-decision", "completed-unaccepted", "accepting", "integration-blocked",
+  ].includes(value.suspendedFrom as string)) return false;
   if (!Array.isArray(value.decisions) || value.decisions.length > MAX_ATTEMPT_DECISIONS || !value.decisions.every(isDecision)) return false;
   const decisionIds = value.decisions.map((decision): string => decision.id);
   if (new Set(decisionIds).size !== decisionIds.length) return false;
@@ -233,8 +261,15 @@ function isCandidateReceipt(value: unknown): value is CandidateReceipt {
     !Array.isArray(value.reviews) || value.reviews.length > 10 || !value.reviews.every(isAcceptanceReview) ||
     !isSafeTextArray(value.findings, 100, false) || !isSafeTextArray(value.evidenceReferences, 200, false)
   ) return false;
-  if (value.integration !== undefined && (!isObject(value.integration) || !hasOnlyKeys(value.integration, ["worktree", "staging", "integratedCommit", "sequence"]) ||
-    !isIntegrationWorktree(value.integration.worktree) || !isStagedCandidate(value.integration.staging) ||
+  if (value.integration !== undefined && (!isObject(value.integration) || !hasOnlyKeys(value.integration, [
+    "worktree", "staging", "stagedCodeStateDigest", "nativeVerification", "integratedCommit", "sequence",
+  ]) || !isIntegrationWorktree(value.integration.worktree) || !isStagedCandidate(value.integration.staging) ||
+    !isDigest(value.integration.stagedCodeStateDigest) ||
+    (value.integration.nativeVerification !== undefined && !isNativeVerification(
+      value.integration.nativeVerification,
+      value.integration.staging.candidateCommit as string,
+      value.integration.stagedCodeStateDigest as string,
+    )) ||
     (value.integration.integratedCommit !== undefined && !isBoundedString(value.integration.integratedCommit)) ||
     (value.integration.sequence !== undefined && !isPositiveInteger(value.integration.sequence)))) return false;
   if (value.cleanup !== undefined && value.cleanup !== "closed" && value.cleanup !== "failed") return false;
@@ -259,6 +294,19 @@ function isNativeEvidence(value: unknown): boolean {
     isSafeText(value.evidenceReference, 4_096) && isDigest(value.evidenceDigest) && isTimestamp(value.completedAt);
 }
 
+function isNativeVerification(value: unknown, candidateCommit: unknown, codeStateDigest: unknown): boolean {
+  return isObject(value) && hasOnlyKeys(value, [
+    "status", "candidateCommit", "codeStateDigest", "freshSessionId", "observedCommandDigests", "findings",
+    "evidenceReference", "completedAt",
+  ]) && (value.status === "passed" || value.status === "blocked") &&
+    value.candidateCommit === candidateCommit && value.codeStateDigest === codeStateDigest &&
+    isBoundedString(value.freshSessionId) && isSafeTextArray(value.observedCommandDigests, 100, false) &&
+    value.observedCommandDigests.length > 0 && value.observedCommandDigests.every(isDigest) &&
+    isSafeTextArray(value.findings, 50, false) &&
+    (value.status === "passed" ? value.findings.length === 0 : value.findings.length > 0) &&
+    isSafeText(value.evidenceReference, 4_096) && isTimestamp(value.completedAt);
+}
+
 function isGateCheck(value: unknown): boolean {
   return isObject(value) && hasOnlyKeys(value, ["command", "exitCode", "outputDigest", "logReference", "candidateCommit", "completedAt"]) &&
     typeof value.command === "string" && value.command.length <= 4_096 && isNonnegativeInteger(value.exitCode) &&
@@ -279,7 +327,7 @@ function isIntegrationWorktree(value: unknown): boolean {
     isBoundedString(value.commonDir) && isAbsolute(value.commonDir) && isBoundedString(value.head) && isBoundedString(value.preparationId);
 }
 
-function isStagedCandidate(value: unknown): boolean {
+function isStagedCandidate(value: unknown): value is StagedIntegrationCandidate {
   return isObject(value) && hasOnlyKeys(value, ["path", "branch", "baseCommit", "candidateCommit"]) &&
     isBoundedString(value.path) && isAbsolute(value.path) && isBoundedString(value.branch) &&
     isBoundedString(value.baseCommit) && isBoundedString(value.candidateCommit);
@@ -399,7 +447,8 @@ function isPreparationRecord(value: unknown): value is PreparationRecord {
 
   if (value.stage === "reasoning") {
     return value.proposal === undefined && value.proposalDigest === undefined &&
-      value.effectiveContextLimit === undefined && value.approved === undefined && value.batchIntegration === undefined;
+      value.effectiveContextLimit === undefined && value.approved === undefined && value.batchIntegration === undefined &&
+      value.pendingIntegration === undefined;
   }
   if (!isBatchProposal(value.proposal) || !isDigest(value.proposalDigest)) return false;
   if (value.proposalDigest !== digest(value.proposal)) return false;
@@ -414,10 +463,21 @@ function isPreparationRecord(value: unknown): value is PreparationRecord {
   if (digest(value.model) !== digest(value.proposal.model)) return false;
   if (value.project.head !== value.proposal.target.baseCommit || value.project.branch !== value.proposal.target.branch) return false;
   if (validateProposal(value as unknown as PreparationRecord, value.proposal).length > 0) return false;
-  if (value.stage === "proposed") return value.approved === undefined && value.batchIntegration === undefined;
+  if (value.stage === "proposed") {
+    return value.approved === undefined && value.batchIntegration === undefined && value.pendingIntegration === undefined;
+  }
   return isApprovalRecord(value.approved, value.proposalDigest, value.proposal.sourceEvidence) &&
     isObject(value.batchIntegration) && isBoundedString(value.batchIntegration.head) &&
-    isNonnegativeInteger(value.batchIntegration.sequence);
+    isNonnegativeInteger(value.batchIntegration.sequence) &&
+    (value.pendingIntegration === undefined || isPendingIntegration(value.pendingIntegration));
+}
+
+function isPendingIntegration(value: unknown): boolean {
+  return isObject(value) && hasOnlyKeys(value, [
+    "attemptId", "receiptId", "worktreePath", "branch", "fromCommit", "toCommit", "sequence",
+  ]) && isBoundedString(value.attemptId) && isBoundedString(value.receiptId) &&
+    isBoundedString(value.worktreePath) && isAbsolute(value.worktreePath) && isBoundedString(value.branch) &&
+    isBoundedString(value.fromCommit) && isBoundedString(value.toCommit) && isPositiveInteger(value.sequence);
 }
 
 function isProject(value: unknown): value is PreparationRecord["project"] {

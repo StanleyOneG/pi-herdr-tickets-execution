@@ -9,6 +9,7 @@ import type {
   WorkerDecisionAnswer,
   WorkerDecisionRequest,
   WorkerLifecycleReceipt,
+  WorkerNativeVerificationReceipt,
   WorkerReadinessReceipt,
   WorkerReviewReceipt,
 } from "./worker-bridge-protocol.js";
@@ -62,6 +63,7 @@ export class FileWorkerBridgeTransport implements WorkerBridgeTransport {
       responseDirectory,
       lifecycleEndpoint: join(channelDirectory, "lifecycle.json"),
       reviewEndpoint: join(channelDirectory, "review.json"),
+      nativeVerificationEndpoint: join(channelDirectory, "native-verification.json"),
     };
     await atomicWritePrivateFile(join(this.directory, `${agentName}.channel.json`), `${JSON.stringify(channel)}\n`);
     return channel;
@@ -127,6 +129,27 @@ export class FileWorkerBridgeTransport implements WorkerBridgeTransport {
     }
   }
 
+  async waitForNativeVerification(
+    channel: WorkerBridgeChannel,
+    timeoutMs: number,
+  ): Promise<WorkerNativeVerificationReceipt> {
+    this.assertOwnedChannel(channel);
+    const deadline = this.now() + timeoutMs;
+    for (;;) {
+      try {
+        const parsed: unknown = JSON.parse(await readBounded(channel.nativeVerificationEndpoint!));
+        if (!isNativeVerificationReceipt(parsed) || parsed.nonce !== channel.nonce) {
+          throw new Error("Worker native verification receipt is malformed or stale");
+        }
+        return parsed;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      if (this.now() >= deadline) throw new Error("Worker native verification receipt timed out");
+      await this.sleep(this.pollIntervalMs);
+    }
+  }
+
   async waitForReview(channel: WorkerBridgeChannel, timeoutMs: number): Promise<WorkerReviewReceipt> {
     this.assertOwnedChannel(channel);
     const deadline = this.now() + timeoutMs;
@@ -161,7 +184,8 @@ export class FileWorkerBridgeTransport implements WorkerBridgeTransport {
       channel.requestDirectory === join(channelDirectory, "requests") &&
       channel.responseDirectory === join(channelDirectory, "responses") &&
       channel.lifecycleEndpoint === join(channelDirectory, "lifecycle.json") &&
-      channel.reviewEndpoint === join(channelDirectory, "review.json");
+      channel.reviewEndpoint === join(channelDirectory, "review.json") &&
+      channel.nativeVerificationEndpoint === join(channelDirectory, "native-verification.json");
   }
 }
 
@@ -174,7 +198,10 @@ async function readBounded(path: string): Promise<string> {
 function isChannel(value: unknown): value is Required<WorkerBridgeChannel> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const channel = value as WorkerBridgeChannel;
-  return [channel.endpoint, channel.requestDirectory, channel.responseDirectory, channel.lifecycleEndpoint, channel.reviewEndpoint]
+  return [
+    channel.endpoint, channel.requestDirectory, channel.responseDirectory, channel.lifecycleEndpoint,
+    channel.reviewEndpoint, channel.nativeVerificationEndpoint,
+  ]
     .every((path): boolean => typeof path === "string" && isAbsolute(path)) &&
     typeof channel.nonce === "string" && SAFE_ID.test(channel.nonce);
 }
@@ -195,6 +222,19 @@ function isLifecycleReceipt(value: unknown): value is WorkerLifecycleReceipt {
     (receipt.state === "working" || receipt.state === "settled") && Number.isFinite(Date.parse(receipt.observedAt)) &&
     Array.isArray(receipt.outstandingJobs) && receipt.outstandingJobs.length <= 50 &&
     receipt.outstandingJobs.every((job): boolean => safeText(job, 4_096));
+}
+
+function isNativeVerificationReceipt(value: unknown): value is WorkerNativeVerificationReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const receipt = value as WorkerNativeVerificationReceipt;
+  return receipt.schemaVersion === 1 && SAFE_ID.test(receipt.nonce) && safeText(receipt.sessionId, 4_096) &&
+    (receipt.status === "passed" || receipt.status === "blocked") && safeText(receipt.candidateCommit, 4_096) &&
+    /^[a-f0-9]{64}$/i.test(receipt.codeStateDigest) && Array.isArray(receipt.observedCommandDigests) &&
+    receipt.observedCommandDigests.length > 0 && receipt.observedCommandDigests.length <= 100 &&
+    receipt.observedCommandDigests.every((item): boolean => /^[a-f0-9]{64}$/i.test(item)) &&
+    Array.isArray(receipt.findings) && receipt.findings.length <= 50 &&
+    receipt.findings.every((finding): boolean => safeText(finding, 4_000)) &&
+    Number.isFinite(Date.parse(receipt.completedAt));
 }
 
 function isReviewReceipt(value: unknown): value is WorkerReviewReceipt {

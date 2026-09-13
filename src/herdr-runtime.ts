@@ -8,6 +8,8 @@ import type {
   AcceptanceReviewPort,
   AcceptanceReviewRecord,
   CapturedModel,
+  NativeVerificationPort,
+  NativeVerificationRecord,
   WorkerAllocation,
   WorkerDispatchAcknowledgement,
   WorkerIdentity,
@@ -21,6 +23,7 @@ import {
   WORKER_BRIDGE_NONCE_ENV,
   WORKER_DECISION_REQUEST_DIRECTORY_ENV,
   WORKER_DECISION_RESPONSE_DIRECTORY_ENV,
+  WORKER_NATIVE_VERIFICATION_ENDPOINT_ENV,
   WORKER_READINESS_COMMAND,
   WORKER_REVIEW_ENDPOINT_ENV,
   WORKER_REVIEW_NONCE_ENV,
@@ -81,7 +84,7 @@ export interface HerdrWorkerRuntimeOptions {
 }
 
 /** Production WorkerRuntimePort adapter for an owned ordinary interactive Pi TUI in Herdr. */
-export class HerdrWorkerRuntime implements WorkerRuntimePort, AcceptanceReviewPort {
+export class HerdrWorkerRuntime implements WorkerRuntimePort, AcceptanceReviewPort, NativeVerificationPort {
   private readonly channels = new Map<string, WorkerBridgeChannel>();
   private readonly shellReadyTimeoutMs: number;
   private readonly agentStartTimeoutMs: number;
@@ -126,6 +129,9 @@ export class HerdrWorkerRuntime implements WorkerRuntimePort, AcceptanceReviewPo
       "--env", `${WORKER_DECISION_REQUEST_DIRECTORY_ENV}=${channel.requestDirectory}`,
       "--env", `${WORKER_DECISION_RESPONSE_DIRECTORY_ENV}=${channel.responseDirectory}`,
       ...(channel.reviewEndpoint ? ["--env", `${WORKER_REVIEW_ENDPOINT_ENV}=${channel.reviewEndpoint}`] : []),
+      ...(channel.nativeVerificationEndpoint ? [
+        "--env", `${WORKER_NATIVE_VERIFICATION_ENDPOINT_ENV}=${channel.nativeVerificationEndpoint}`,
+      ] : []),
       "--env", `${WORKER_REVIEW_NONCE_ENV}=${channel.nonce}`,
       "--no-focus",
     ], 15_000);
@@ -247,6 +253,65 @@ export class HerdrWorkerRuntime implements WorkerRuntimePort, AcceptanceReviewPo
       !Array.isArray(observation.outstandingJobs) || observation.outstandingJobs.length > 0
     ) throw new Error("Owned worker is not settled with no outstanding Pi work for cleanup");
     await this.command(["tab", "close", identity.tabId], 10_000);
+  }
+
+  async verify(input: Parameters<NativeVerificationPort["verify"]>[0]): Promise<NativeVerificationRecord> {
+    if (!this.options.bridge.waitForNativeVerification) {
+      throw new Error("Structured native verification transport is unavailable");
+    }
+    const verificationIdentity = createHash("sha256")
+      .update(`${input.candidateCommit}\0${input.codeStateDigest}`)
+      .digest("hex").slice(0, 20);
+    const allocation = await this.allocate({
+      workspaceId: input.workspaceId,
+      agentName: `verify-${verificationIdentity}`,
+      cwd: input.cwd,
+    });
+    let identity: WorkerIdentity | undefined;
+    let shouldClose = false;
+    try {
+      identity = await this.start({ allocation, cwd: input.cwd, model: input.model });
+      const channel = this.channels.get(allocationKey(allocation));
+      if (!channel) throw new Error("Native verification bridge channel is unavailable");
+      const prompt = [
+        "/skill:implement Verification-only acceptance gate for an already staged candidate.",
+        `Candidate commit: ${input.candidateCommit}`,
+        `Controller-observed Git code-state digest: ${input.codeStateDigest}`,
+        "Read and follow the installed implementation skill and project instructions for their existing testing and code-review obligations.",
+        "Re-run every required native test against this exact staged code state. Use bash only for those test commands; use read/grep/find/ls for inspection.",
+        "Do not edit or write files, commit, repair findings, invent fallback commands, waive missing tests, or perform delivery/tracker operations.",
+        `Retained source evidence references: ${input.evidenceReferences.join(", ")}`,
+        "If required tests cannot be identified or executed, submit blocked with findings.",
+        "Finish by calling herdr_submit_native_verification exactly once with the supplied candidate commit and code-state digest, pass only after all required tests and native review obligations succeed, and include every blocking finding.",
+      ].join("\n\n");
+      await this.command([
+        "agent", "prompt", identity.agentName, prompt,
+        "--wait", "--until", "idle", "--until", "done", "--until", "blocked", "--timeout", "300000",
+      ], 305_000);
+      const receipt = await this.options.bridge.waitForNativeVerification(channel, 10_000);
+      if (receipt.nonce !== channel.nonce || receipt.sessionId !== identity.sessionId ||
+        receipt.candidateCommit !== input.candidateCommit || receipt.codeStateDigest !== input.codeStateDigest
+      ) throw new Error("Native verification receipt is stale or mismatched");
+      const settled = await this.inspect(identity);
+      if (!settled.settled || !["idle", "done"].includes(settled.status) ||
+        !Array.isArray(settled.outstandingJobs) || settled.outstandingJobs.length > 0
+      ) throw new Error("Native verification Pi session has not settled or still has outstanding work");
+      shouldClose = receipt.status === "passed" && receipt.findings.length === 0;
+      return {
+        status: receipt.status,
+        candidateCommit: receipt.candidateCommit,
+        codeStateDigest: receipt.codeStateDigest,
+        freshSessionId: receipt.sessionId,
+        observedCommandDigests: [...receipt.observedCommandDigests],
+        findings: [...receipt.findings],
+        evidenceReference: channel.nativeVerificationEndpoint!,
+        completedAt: receipt.completedAt,
+      };
+    } finally {
+      if (identity && shouldClose) {
+        try { await this.close(identity); } catch { /* Preserve saved verification session when cleanup fails. */ }
+      }
+    }
   }
 
   async review(input: Parameters<AcceptanceReviewPort["review"]>[0]): Promise<AcceptanceReviewRecord> {

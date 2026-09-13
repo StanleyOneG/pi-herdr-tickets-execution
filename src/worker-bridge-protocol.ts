@@ -8,6 +8,7 @@ export const WORKER_DECISION_RESPONSE_DIRECTORY_ENV = "HERDR_WORKER_DECISION_RES
 export const WORKER_READINESS_COMMAND = "/herdr-worker-ready";
 export const WORKER_REVIEW_ENDPOINT_ENV = "HERDR_WORKER_REVIEW_ENDPOINT";
 export const WORKER_REVIEW_NONCE_ENV = "HERDR_WORKER_REVIEW_NONCE";
+export const WORKER_NATIVE_VERIFICATION_ENDPOINT_ENV = "HERDR_WORKER_NATIVE_VERIFICATION_ENDPOINT";
 
 export interface WorkerBridgeChannel {
   endpoint: string;
@@ -16,6 +17,7 @@ export interface WorkerBridgeChannel {
   responseDirectory?: string;
   lifecycleEndpoint?: string;
   reviewEndpoint?: string;
+  nativeVerificationEndpoint?: string;
 }
 
 export interface WorkerLifecycleReceipt {
@@ -25,6 +27,18 @@ export interface WorkerLifecycleReceipt {
   state: "working" | "settled";
   observedAt: string;
   outstandingJobs: string[];
+}
+
+export interface WorkerNativeVerificationReceipt {
+  schemaVersion: 1;
+  nonce: string;
+  sessionId: string;
+  status: "passed" | "blocked";
+  candidateCommit: string;
+  codeStateDigest: string;
+  observedCommandDigests: string[];
+  findings: string[];
+  completedAt: string;
 }
 
 export interface WorkerReviewReceipt {
@@ -101,4 +115,5 @@ export interface WorkerBridgeTransport {
   deliverDecision?(channel: WorkerBridgeChannel, answer: WorkerDecisionAnswer): Promise<void>;
   readLifecycle?(channel: WorkerBridgeChannel): Promise<WorkerLifecycleReceipt | undefined>;
   waitForReview?(channel: WorkerBridgeChannel, timeoutMs: number): Promise<WorkerReviewReceipt>;
+  waitForNativeVerification?(channel: WorkerBridgeChannel, timeoutMs: number): Promise<WorkerNativeVerificationReceipt>;
 }

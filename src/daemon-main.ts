@@ -33,6 +33,7 @@ export async function runDaemon(argv: string[]): Promise<void> {
         reviewer: worker,
         checks: new LocalGateCheckAdapter(paths.evidenceDirectory),
         nativeEvidence: new FileNativeEvidenceAdapter(),
+        nativeVerifier: worker,
       },
     },
   });

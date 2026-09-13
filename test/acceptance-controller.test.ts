@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -14,10 +14,14 @@ import {
   type BatchProposal,
   type CandidateReceipt,
   type ControllerResult,
+  type ControllerState,
+  type ControllerStateStore,
   type ExecutionAttempt,
   type GateCheckPort,
   type GateCheckRecord,
   type NativeEvidenceRecord,
+  type NativeVerificationPort,
+  type NativeVerificationRecord,
   type PreparationRecord,
   type SourceEvidence,
   type WorkerAllocation,
@@ -35,6 +39,7 @@ import { JsonControllerStateStore } from "../src/state-store.js";
 
 interface Repository { root: string; statePath: string; head: string }
 const roots = new Set<string>();
+const evidenceRoots = new Set<string>();
 const actor = Symbol("acceptance actor");
 
 afterEach(async (): Promise<void> => {
@@ -42,6 +47,10 @@ afterEach(async (): Promise<void> => {
     await rm(root, { recursive: true, force: true });
     await rm(join(dirname(root), `.${basename(root)}-herdr-worktrees`), { recursive: true, force: true });
     roots.delete(root);
+  }
+  for (const root of evidenceRoots) {
+    await rm(root, { recursive: true, force: true });
+    evidenceRoots.delete(root);
   }
 });
 
@@ -101,9 +110,11 @@ class SettledWorker implements WorkerRuntimePort {
   inspections = 0;
   settled = true;
   outstandingJobs: string[] = [];
-  async allocate(input: { workspaceId: string; agentName: string }): Promise<WorkerAllocation> { return { workspaceId: input.workspaceId, agentName: input.agentName, tabId: "tab", paneId: "pane" }; }
+  async allocate(input: { workspaceId: string; agentName: string }): Promise<WorkerAllocation> {
+    return { workspaceId: input.workspaceId, agentName: input.agentName, tabId: `tab-${input.agentName}`, paneId: `pane-${input.agentName}` };
+  }
   async start(input: Parameters<WorkerRuntimePort["start"]>[0]): Promise<WorkerIdentity> {
-    return { ...input.allocation, piPid: 42, sessionId: "worker-session", sessionFile: "/sessions/worker.jsonl", cwd: input.cwd, model: input.model, mode: "tui", initialHistoryEntries: 0, skillCommands: ["skill:implement", "skill:tdd", "skill:code-review", "skill:handoff"], toolNames: ["read", "bash", "edit", "write"], contextFiles: [join(input.cwd, "AGENTS.md")] };
+    return { ...input.allocation, piPid: 42, sessionId: `session-${input.allocation.agentName}`, sessionFile: `/sessions/${input.allocation.agentName}.jsonl`, cwd: input.cwd, model: input.model, mode: "tui", initialHistoryEntries: 0, skillCommands: ["skill:implement", "skill:tdd", "skill:code-review", "skill:handoff"], toolNames: ["read", "bash", "edit", "write"], contextFiles: [join(input.cwd, "AGENTS.md")] };
   }
   async inspect(identity: WorkerIdentity): Promise<WorkerObservation> {
     this.inspections += 1;
@@ -115,12 +126,14 @@ class SettledWorker implements WorkerRuntimePort {
   async close(): Promise<void> { this.closed += 1; }
 }
 
-class PassingAcceptance implements AcceptanceReviewPort, GateCheckPort {
+class PassingAcceptance implements AcceptanceReviewPort, GateCheckPort, NativeVerificationPort {
   reviewSessions: string[] = [];
+  nativeVerificationCalls: Array<Parameters<NativeVerificationPort["verify"]>[0]> = [];
   failCheck = false;
   blockReview: "standards" | "spec" | undefined;
   reviewHook: ((input: Parameters<AcceptanceReviewPort["review"]>[0]) => Promise<void>) | undefined;
   checkHook: ((input: Parameters<GateCheckPort["execute"]>[0]) => Promise<void>) | undefined;
+  verificationHook: ((input: Parameters<NativeVerificationPort["verify"]>[0]) => Promise<void>) | undefined;
   reuseReviewSession = false;
   async review(input: Parameters<AcceptanceReviewPort["review"]>[0]): Promise<Awaited<ReturnType<AcceptanceReviewPort["review"]>>> {
     await this.reviewHook?.(input);
@@ -132,6 +145,20 @@ class PassingAcceptance implements AcceptanceReviewPort, GateCheckPort {
   async execute(input: Parameters<GateCheckPort["execute"]>[0]): Promise<GateCheckRecord> {
     await this.checkHook?.(input);
     return { command: input.command, exitCode: this.failCheck ? 1 : 0, outputDigest: "a".repeat(64), logReference: "/evidence/check.log", candidateCommit: input.candidateCommit, completedAt: "2026-10-01T15:00:00.000Z" };
+  }
+  async verify(input: Parameters<NativeVerificationPort["verify"]>[0]): Promise<NativeVerificationRecord> {
+    this.nativeVerificationCalls.push(structuredClone(input));
+    await this.verificationHook?.(input);
+    return {
+      status: "passed",
+      candidateCommit: input.candidateCommit,
+      codeStateDigest: input.codeStateDigest,
+      freshSessionId: `native-verification-${this.nativeVerificationCalls.length}`,
+      observedCommandDigests: ["b".repeat(64)],
+      findings: [],
+      evidenceReference: "/evidence/native-staging-verification.json",
+      completedAt: "2026-10-01T15:00:00.000Z",
+    };
   }
 }
 
@@ -146,9 +173,10 @@ async function running(
   acceptance: PassingAcceptance,
   batch = proposal(repo),
   checks: GateCheckPort = acceptance,
+  store: ControllerStateStore = new JsonControllerStateStore(repo.statePath),
 ): Promise<{ controller: PreparationController; attempt: ExecutionAttempt }> {
   const ids = ["preparation", "attempt", "receipt", "attempt-b", "receipt-b"];
-  const controller = new PreparationController(new JsonControllerStateStore(repo.statePath), {
+  const controller = new PreparationController(store, {
     actorCapability: actor,
     now: (): Date => new Date("2026-10-01T14:00:00.000Z"),
     generateId: (): string => ids.shift() ?? "fallback",
@@ -157,7 +185,7 @@ async function running(
       owner: { instanceId: "controller", pid: 101 },
       git: new RealGitWorktreeAdapter(),
       worker,
-      acceptance: { reviewer: acceptance, checks, nativeEvidence: new FileNativeEvidenceAdapter() },
+      acceptance: { reviewer: acceptance, checks, nativeEvidence: new FileNativeEvidenceAdapter(), nativeVerifier: acceptance },
     },
   });
   const prepared = value(await controller.prepare(actor, { specReference: "spec-2", controllerName: "example / issue 5" }, admission(repo)));
@@ -168,12 +196,20 @@ async function running(
 }
 
 function nativeEvidence(receipt: CandidateReceipt): NativeEvidenceRecord[] {
-  const directory = join(tmpdir(), "herdr-native-evidence", receipt.candidate.codeStateDigest);
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const directory = mkdtempSync(join(tmpdir(), "herdr-native-evidence-"));
+  evidenceRoots.add(directory);
   return (["tests", "reviews"] as const).map((kind, index): NativeEvidenceRecord => {
     const completedAt = `2026-10-01T14:3${index}:00.000Z`;
-    const retainedReference = join(directory, `${kind}.md`);
-    const retainedArtifact = `${kind} evidence for Git code state ${receipt.candidate.codeStateDigest}\n`;
+    const retainedReference = join(directory, `${kind}.json`);
+    const retainedArtifact = `${JSON.stringify({
+      schemaVersion: 1,
+      producer: "pi-native-skill",
+      kind,
+      status: "passed",
+      codeStateDigest: receipt.candidate.codeStateDigest,
+      completedAt,
+      executionReferences: [receipt.sessionFile],
+    })}\n`;
     writeFileSync(retainedReference, retainedArtifact, { mode: 0o600 });
     const artifact = `${JSON.stringify({
       schemaVersion: 1,
@@ -186,7 +222,7 @@ function nativeEvidence(receipt: CandidateReceipt): NativeEvidenceRecord[] {
         digest: createHash("sha256").update(retainedArtifact).digest("hex"),
       }],
     })}\n`;
-    const evidenceReference = join(directory, `${kind}.json`);
+    const evidenceReference = join(directory, `${kind}-manifest.json`);
     writeFileSync(evidenceReference, artifact, { mode: 0o600 });
     return {
       kind,
@@ -310,6 +346,94 @@ test("missing and stale native implementation evidence cannot start integration"
   assert.equal(rejected.ok, false);
   assert.equal(acceptance.reviewSessions.length, 0);
   assert.equal(value(await active.controller.status(actor, { limit: 10 })).executionAttempts[0]?.lifecycle, "completed-unaccepted");
+});
+
+test("rewrapping stale native artifacts with the current code identity cannot authorize acceptance", async (): Promise<void> => {
+  const repo = await repository();
+  const worker = new SettledWorker();
+  const acceptance = new PassingAcceptance();
+  const active = await running(repo, worker, acceptance);
+  await writeFile(join(active.attempt.worktree!.path, "candidate.js"), "export const version = 1;\n");
+  value(await active.controller.recordWorkerObservation(actor, {
+    attemptId: active.attempt.id,
+    controlGeneration: active.attempt.controlGeneration ?? 0,
+    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+  }));
+  const obsolete = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
+  const relabelled = nativeEvidence(obsolete);
+  await writeFile(join(active.attempt.worktree!.path, "candidate.js"), "export const version = 2;\n");
+  const current = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
+  for (const record of relabelled) {
+    const manifest = JSON.parse(await readFile(record.evidenceReference, "utf8")) as Record<string, unknown>;
+    manifest.codeStateDigest = current.candidate.codeStateDigest;
+    const serialized = `${JSON.stringify(manifest)}\n`;
+    await writeFile(record.evidenceReference, serialized);
+    record.codeStateDigest = current.candidate.codeStateDigest;
+    record.evidenceDigest = createHash("sha256").update(serialized).digest("hex");
+  }
+
+  const rejected = await active.controller.acceptCandidate(actor, {
+    attemptId: active.attempt.id,
+    candidateDigest: current.candidate.candidateDigest,
+    nativeEvidence: relabelled,
+  });
+
+  assert.equal(rejected.ok, false);
+  assert.equal(acceptance.reviewSessions.length, 0);
+});
+
+test("oversized native evidence artifacts are rejected at the acceptance boundary", async (): Promise<void> => {
+  const repo = await repository();
+  const worker = new SettledWorker();
+  const acceptance = new PassingAcceptance();
+  const active = await running(repo, worker, acceptance);
+  await writeFile(join(active.attempt.worktree!.path, "candidate.js"), "export const candidate = true;\n");
+  value(await active.controller.recordWorkerObservation(actor, {
+    attemptId: active.attempt.id,
+    controlGeneration: active.attempt.controlGeneration ?? 0,
+    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+  }));
+  const captured = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
+  const evidence = nativeEvidence(captured);
+  const oversized = Buffer.alloc(1024 * 1024 + 1, "x");
+  await writeFile(evidence[0]!.evidenceReference, oversized);
+  evidence[0]!.evidenceDigest = createHash("sha256").update(oversized).digest("hex");
+
+  const rejected = await active.controller.acceptCandidate(actor, {
+    attemptId: active.attempt.id,
+    candidateDigest: captured.candidate.candidateDigest,
+    nativeEvidence: evidence,
+  });
+
+  assert.equal(rejected.ok, false);
+  assert.equal(acceptance.reviewSessions.length, 0);
+});
+
+test("nonregular native evidence artifacts are rejected at the acceptance boundary", async (): Promise<void> => {
+  const repo = await repository();
+  const worker = new SettledWorker();
+  const acceptance = new PassingAcceptance();
+  const active = await running(repo, worker, acceptance);
+  await writeFile(join(active.attempt.worktree!.path, "candidate.js"), "export const candidate = true;\n");
+  value(await active.controller.recordWorkerObservation(actor, {
+    attemptId: active.attempt.id,
+    controlGeneration: active.attempt.controlGeneration ?? 0,
+    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+  }));
+  const captured = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
+  const evidence = nativeEvidence(captured);
+  const fifo = join(dirname(evidence[0]!.evidenceReference), "native-evidence.fifo");
+  execFileSync("mkfifo", [fifo]);
+  evidence[0]!.evidenceReference = fifo;
+
+  const rejected = await active.controller.acceptCandidate(actor, {
+    attemptId: active.attempt.id,
+    candidateDigest: captured.candidate.candidateDigest,
+    nativeEvidence: evidence,
+  });
+
+  assert.equal(rejected.ok, false);
+  assert.equal(acceptance.reviewSessions.length, 0);
 });
 
 test("content-equivalent staging and later commits retain native evidence through Git code-state identity", async (): Promise<void> => {
@@ -550,6 +674,15 @@ test("acceptance serializes against the persisted integration head rather than a
     candidateDigest: firstCapture.candidate.candidateDigest,
     nativeEvidence: nativeEvidence(firstCapture),
   }));
+  assert.equal(acceptance.nativeVerificationCalls.length, 1);
+  assert.equal(
+    acceptance.nativeVerificationCalls[0]?.codeStateDigest,
+    acceptedFirst.candidateReceipts![0]!.integration!.stagedCodeStateDigest,
+  );
+  assert.equal(
+    acceptedFirst.candidateReceipts![0]!.integration!.nativeVerification?.candidateCommit,
+    acceptedFirst.acceptedCommit,
+  );
   const third = value(await active.controller.startTicket(actor, {
     preparationId: active.attempt.preparationId,
     ticketIdentity: "ticket-c",
@@ -620,6 +753,54 @@ test("a real integration conflict preserves the last accepted branch and both ti
   assert.equal(await readFile(join(integrationPath, "README.md"), "utf8"), "first accepted change\n");
   assert.equal(await readFile(join(active.attempt.worktree!.path, "README.md"), "utf8"), "first accepted change\n");
   assert.equal(await readFile(join(second.worktree!.path, "README.md"), "utf8"), "second conflicting change\n");
+});
+
+test("staged changes during required native re-verification block batch advancement", async (): Promise<void> => {
+  const repo = await repository();
+  const batch = proposal(repo);
+  batch.sourceEvidence.push(evidence("ticket-b"));
+  batch.tickets.push({ identity: "ticket-b", title: "Second", evidenceIdentity: "ticket-b", claimedBy: null });
+  const worker = new SettledWorker();
+  const acceptance = new PassingAcceptance();
+  const active = await running(repo, worker, acceptance, batch);
+  await writeFile(join(active.attempt.worktree!.path, "a.js"), "export const a = true;\n");
+  value(await active.controller.recordWorkerObservation(actor, {
+    attemptId: active.attempt.id,
+    controlGeneration: active.attempt.controlGeneration ?? 0,
+    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+  }));
+  const second = value(await active.controller.startTicket(actor, {
+    preparationId: active.attempt.preparationId,
+    ticketIdentity: "ticket-b",
+    workspaceId: "workspace",
+  }));
+  await writeFile(join(second.worktree!.path, "b.js"), "export const b = true;\n");
+  value(await active.controller.recordWorkerObservation(actor, {
+    attemptId: second.id,
+    controlGeneration: second.controlGeneration ?? 0,
+    observation: { identity: second.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+  }));
+  const firstCapture = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
+  const first = value(await active.controller.acceptCandidate(actor, {
+    attemptId: active.attempt.id,
+    candidateDigest: firstCapture.candidate.candidateDigest,
+    nativeEvidence: nativeEvidence(firstCapture),
+  }));
+  const secondCapture = value(await active.controller.captureCandidate(actor, { attemptId: second.id }));
+  acceptance.verificationHook = async (input): Promise<void> => {
+    await writeFile(join(input.cwd, "verification-mutation.js"), "unexpected\n");
+  };
+
+  const blocked = value(await active.controller.acceptCandidate(actor, {
+    attemptId: second.id,
+    candidateDigest: secondCapture.candidate.candidateDigest,
+    nativeEvidence: nativeEvidence(secondCapture),
+  }));
+
+  assert.equal(blocked.lifecycle, "integration-blocked");
+  assert.match(blocked.candidateReceipts![0]!.findings.join("\n"), /changed during native verification/);
+  const integrationPath = first.candidateReceipts![0]!.integration!.worktree.path;
+  assert.equal(git(integrationPath, "rev-parse", "HEAD"), first.acceptedCommit);
 });
 
 test("untracked add/add collisions block integration without overwriting accepted work", async (): Promise<void> => {
@@ -747,6 +928,8 @@ test("approved gate commands execute independently in staging and retain their r
     "console.log('Authorization: Bearer temporary-test-value');",
     "console.log('postgres://user:password@database.invalid/app');",
     "console.log('Error: private stack detail\\n    at secret (/private/source.js:1:1)');",
+    "console.log('src/file.ts(1,1): error TS2345: private compiler detail');",
+    "console.log(\"# tests 3\\n# pass 2\\n# fail 1\\nfailureType: 'testCodeFailure'\\nfailureType: 'passwordSecret'\");",
     "",
   ].join("\n"));
   value(await active.controller.recordWorkerObservation(actor, {
@@ -771,9 +954,15 @@ test("approved gate commands execute independently in staging and retain their r
   assert.equal(metadata.candidateCommit, accepted.acceptedCommit);
   assert.equal(typeof metadata.commandDigest, "string");
   assert.equal(typeof metadata.outputDigest, "string");
+  assert.deepEqual(metadata.diagnostics, {
+    compilerErrorCodes: ["TS2345"],
+    testFailureTypes: ["testCodeFailure"],
+    testSummary: { tests: 3, pass: 2, fail: 1 },
+  });
   assert.equal(log.includes("temporary-test-value"), false);
   assert.equal(log.includes("postgres://"), false);
   assert.equal(log.includes("private stack detail"), false);
+  assert.equal(log.includes("passwordSecret"), false);
   assert.equal(log.includes("node candidate.js"), false);
   assert.equal(check.candidateCommit, accepted.acceptedCommit);
 });
@@ -882,6 +1071,62 @@ test("takeover remains prompt during a delayed acceptance gate and prevents adva
   assert.equal(git(integrationPath, "rev-parse", "HEAD"), repo.head);
 });
 
+test("explicit restart resume reconciles a durably journaled batch advancement", async (): Promise<void> => {
+  const repo = await repository();
+  const durable = new JsonControllerStateStore(repo.statePath);
+  let failedAcceptedSave = false;
+  const failAfterAdvance: ControllerStateStore = {
+    load: (): Promise<ControllerState> => durable.load(),
+    save: async (state: ControllerState): Promise<void> => {
+      if (!failedAcceptedSave && state.executionAttempts.some((attempt): boolean => attempt.lifecycle === "accepted")) {
+        failedAcceptedSave = true;
+        throw new Error("simulated storage interruption after Git advancement");
+      }
+      await durable.save(state);
+    },
+  };
+  const worker = new SettledWorker();
+  const acceptance = new PassingAcceptance();
+  const active = await running(repo, worker, acceptance, proposal(repo), acceptance, failAfterAdvance);
+  await writeFile(join(active.attempt.worktree!.path, "candidate.js"), "export const journalled = true;\n");
+  value(await active.controller.recordWorkerObservation(actor, {
+    attemptId: active.attempt.id,
+    controlGeneration: active.attempt.controlGeneration ?? 0,
+    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+  }));
+  const captured = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
+
+  const interrupted = await active.controller.acceptCandidate(actor, {
+    attemptId: active.attempt.id,
+    candidateDigest: captured.candidate.candidateDigest,
+    nativeEvidence: nativeEvidence(captured),
+  });
+  assert.equal(interrupted.ok, false);
+  const pending = await durable.load();
+  assert.equal(pending.executionAttempts[0]?.lifecycle, "accepting");
+  assert.equal(pending.preparations[0]?.pendingIntegration?.attemptId, active.attempt.id);
+
+  const replacement = new PreparationController(durable, {
+    actorCapability: actor,
+    now: (): Date => new Date("2026-10-01T16:00:00.000Z"),
+    generateId: (): string => "replacement-receipt",
+    formatPreview: formatPreparationPreview,
+    execution: {
+      owner: { instanceId: "replacement-controller", pid: 202 },
+      git: new RealGitWorktreeAdapter(),
+      worker,
+      acceptance: { reviewer: acceptance, checks: acceptance, nativeEvidence: new FileNativeEvidenceAdapter(), nativeVerifier: acceptance },
+    },
+  });
+  value(await replacement.controllerRestarted(actor));
+
+  const reconciled = value(await replacement.resumeAttempt(actor, { attemptId: active.attempt.id }));
+
+  assert.equal(reconciled.lifecycle, "accepted");
+  assert.equal(reconciled.acceptedCommit, pending.preparations[0]!.pendingIntegration!.toCommit);
+  assert.equal(value(await replacement.status(actor, { limit: 10 })).preparations[0]?.pendingIntegration, undefined);
+});
+
 test("final batch advancement disables project Git hooks", async (): Promise<void> => {
   const repo = await repository();
   const hook = join(repo.root, ".git", "hooks", "post-merge");
@@ -933,12 +1178,99 @@ test("gate timeouts kill commands that ignore graceful termination", async (): P
   assert.equal(metadata.outputOmitted, true);
 });
 
-test("integration-blocked attempts regain ownership only through restart reconciliation and explicit resume", async (): Promise<void> => {
+test("acceptance integration does not consume implementation concurrency while another ticket runs", async (): Promise<void> => {
+  const repo = await repository();
+  const batch = proposal(repo);
+  batch.policy.concurrency = 2;
+  batch.sourceEvidence.push(evidence("ticket-b"));
+  batch.tickets.push({ identity: "ticket-b", title: "Concurrent implementation", evidenceIdentity: "ticket-b", claimedBy: null });
+  const worker = new SettledWorker();
+  const acceptance = new PassingAcceptance();
+  const active = await running(repo, worker, acceptance, batch);
+  await writeFile(join(active.attempt.worktree!.path, "candidate.js"), "export const acceptedWhileRunning = true;\n");
+  value(await active.controller.recordWorkerObservation(actor, {
+    attemptId: active.attempt.id,
+    controlGeneration: active.attempt.controlGeneration ?? 0,
+    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+  }));
+  const captured = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
+  const second = value(await active.controller.startTicket(actor, {
+    preparationId: active.attempt.preparationId,
+    ticketIdentity: "ticket-b",
+    workspaceId: "workspace",
+  }));
+  assert.equal(second.lifecycle, "running");
+
+  const accepted = value(await active.controller.acceptCandidate(actor, {
+    attemptId: active.attempt.id,
+    candidateDigest: captured.candidate.candidateDigest,
+    nativeEvidence: nativeEvidence(captured),
+  }));
+
+  assert.equal(accepted.lifecycle, "accepted");
+  const attempts = value(await active.controller.status(actor, { limit: 10 })).executionAttempts;
+  assert.equal(attempts.find((attempt): boolean => attempt.id === second.id)?.lifecycle, "running");
+});
+
+test("legacy approved state without integration metadata migrates to its approved base", async (): Promise<void> => {
   const repo = await repository();
   const worker = new SettledWorker();
   const acceptance = new PassingAcceptance();
-  acceptance.failCheck = true;
   const active = await running(repo, worker, acceptance);
+  const legacy = JSON.parse(await readFile(repo.statePath, "utf8")) as {
+    preparations: Array<{ batchIntegration?: unknown }>;
+  };
+  delete legacy.preparations[0]!.batchIntegration;
+  await writeFile(repo.statePath, `${JSON.stringify(legacy, null, 2)}\n`);
+
+  const status = value(await active.controller.status(actor, { limit: 10 }));
+
+  assert.deepEqual(status.preparations[0]?.batchIntegration, { head: repo.head, sequence: 0 });
+});
+
+test("completed candidates require explicit resume after controller restart", async (): Promise<void> => {
+  const repo = await repository();
+  const worker = new SettledWorker();
+  const acceptance = new PassingAcceptance();
+  const active = await running(repo, worker, acceptance);
+  await writeFile(join(active.attempt.worktree!.path, "candidate.js"), "export const restart = true;\n");
+  value(await active.controller.recordWorkerObservation(actor, {
+    attemptId: active.attempt.id,
+    controlGeneration: active.attempt.controlGeneration ?? 0,
+    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+  }));
+  const replacement = new PreparationController(new JsonControllerStateStore(repo.statePath), {
+    actorCapability: actor,
+    now: (): Date => new Date("2026-10-01T16:00:00.000Z"),
+    generateId: (): string => "replacement-receipt",
+    formatPreview: formatPreparationPreview,
+    execution: {
+      owner: { instanceId: "replacement-controller", pid: 202 },
+      git: new RealGitWorktreeAdapter(),
+      worker,
+      acceptance: { reviewer: acceptance, checks: acceptance, nativeEvidence: new FileNativeEvidenceAdapter(), nativeVerifier: acceptance },
+    },
+  });
+
+  const reconciled = value(await replacement.controllerRestarted(actor));
+  assert.equal(reconciled[0]?.lifecycle, "restart-required");
+  const beforeResume = await replacement.captureCandidate(actor, { attemptId: active.attempt.id });
+  assert.equal(beforeResume.ok, false);
+  const resumed = value(await replacement.resumeAttempt(actor, { attemptId: active.attempt.id }));
+  assert.equal(resumed.lifecycle, "completed-unaccepted");
+  assert.equal(value(await replacement.captureCandidate(actor, { attemptId: active.attempt.id })).state, "captured");
+});
+
+test("integration-blocked attempts regain ownership only through restart reconciliation and explicit resume", async (): Promise<void> => {
+  const repo = await repository();
+  const batch = proposal(repo);
+  batch.policy.concurrency = 2;
+  batch.sourceEvidence.push(evidence("ticket-b"));
+  batch.tickets.push({ identity: "ticket-b", title: "Still running", evidenceIdentity: "ticket-b", claimedBy: null });
+  const worker = new SettledWorker();
+  const acceptance = new PassingAcceptance();
+  acceptance.failCheck = true;
+  const active = await running(repo, worker, acceptance, batch);
   await writeFile(join(active.attempt.worktree!.path, "candidate.js"), "export const retry = true;\n");
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
@@ -952,6 +1284,12 @@ test("integration-blocked attempts regain ownership only through restart reconci
     nativeEvidence: nativeEvidence(captured),
   }));
   assert.equal(blocked.lifecycle, "integration-blocked");
+  const concurrent = value(await active.controller.startTicket(actor, {
+    preparationId: active.attempt.preparationId,
+    ticketIdentity: "ticket-b",
+    workspaceId: "workspace",
+  }));
+  assert.equal(concurrent.lifecycle, "running");
   const replacement = new PreparationController(new JsonControllerStateStore(repo.statePath), {
     actorCapability: actor,
     now: (): Date => new Date("2026-10-01T16:00:00.000Z"),
@@ -965,12 +1303,14 @@ test("integration-blocked attempts regain ownership only through restart reconci
         reviewer: acceptance,
         checks: acceptance,
         nativeEvidence: new FileNativeEvidenceAdapter(),
+        nativeVerifier: acceptance,
       },
     },
   });
 
   const reconciled = value(await replacement.controllerRestarted(actor));
-  assert.equal(reconciled[0]?.lifecycle, "restart-required");
+  assert.equal(reconciled.length, 2);
+  assert.equal(reconciled.find((attempt): boolean => attempt.id === active.attempt.id)?.lifecycle, "restart-required");
   const beforeResume = await replacement.captureCandidate(actor, { attemptId: active.attempt.id });
   assert.equal(beforeResume.ok, false);
   const resumed = value(await replacement.resumeAttempt(actor, { attemptId: active.attempt.id }));

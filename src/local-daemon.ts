@@ -27,7 +27,7 @@ import type {
   RecordWorkerObservationRequest,
 } from "./contracts.js";
 import { PreparationController } from "./controller.js";
-import { mapAcceptCandidateCommand } from "./presentation-mappers.js";
+import { isAcceptCandidateCommand, mapAcceptCandidateCommand } from "./presentation-mappers.js";
 import { isBatchProposal, isCapturedModel, isSourceEvidence, isWorkerIdentity } from "./state-validation.js";
 import type { WorkerDecisionRequest } from "./worker-bridge-protocol.js";
 
@@ -461,7 +461,7 @@ function validateMethodParams(method: RequestMethod, params: unknown[]): void {
     case "getPreparation": valid = params.length === 1 && boundedText(params[0]); break;
     case "startTicket": valid = params.length === 1 && isStartTicketRequest(params[0]); break;
     case "captureCandidate": valid = params.length === 1 && isAttemptRequest(params[0]); break;
-    case "acceptCandidate": valid = params.length === 1 && isAcceptCandidateRequest(params[0]); break;
+    case "acceptCandidate": valid = params.length === 1 && isAcceptCandidateCommand(params[0]); break;
     case "attachAttempt":
     case "pauseAttempt":
     case "resumeAttempt":
@@ -518,17 +518,6 @@ function isAnswerDecisionRequest(value: unknown): value is AnswerDecisionRequest
   return isObjectWithKeys(value, ["attemptId", "decisionId", "answer", "answeredBy"]) &&
     boundedText(value.attemptId) && boundedText(value.decisionId) && boundedText(value.answer, 4_000) &&
     boundedText(value.answeredBy, 500);
-}
-
-function isAcceptCandidateRequest(value: unknown): value is AcceptCandidateRequest {
-  if (!isObjectWithKeys(value, ["attemptId", "candidateDigest", "nativeEvidence"]) || !boundedText(value.attemptId) ||
-    !digestText(value.candidateDigest) || !Array.isArray(value.nativeEvidence) || value.nativeEvidence.length > 20
-  ) return false;
-  return value.nativeEvidence.every((item): boolean => isObjectWithKeys(item, [
-    "kind", "status", "codeStateDigest", "evidenceReference", "evidenceDigest", "completedAt",
-  ]) && (item.kind === "tests" || item.kind === "reviews") && item.status === "passed" &&
-    digestText(item.codeStateDigest) && boundedText(item.evidenceReference) && digestText(item.evidenceDigest) &&
-    typeof item.completedAt === "string" && Number.isFinite(Date.parse(item.completedAt)));
 }
 
 function isRecordWorkerObservationRequest(value: unknown): value is RecordWorkerObservationRequest {

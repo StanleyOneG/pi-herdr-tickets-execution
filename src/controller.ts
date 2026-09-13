@@ -21,6 +21,8 @@ import type {
   GateCheckRecord,
   LocalActorCapability,
   NativeEvidenceRecord,
+  NativeVerificationRecord,
+  PendingIntegrationEffect,
   PaginationRequest,
   PreparationRecord,
   PrepareRequest,
@@ -42,6 +44,7 @@ import {
   MAX_PREPARATIONS,
   MAX_STATUS_PAGE_SIZE,
   isActiveExecutionLifecycle,
+  occupiesImplementationSlot,
 } from "./contracts.js";
 import {
   approvalFailures,
@@ -79,7 +82,10 @@ export type {
   LocalActorCapability,
   NativeEvidencePort,
   NativeEvidenceRecord,
+  NativeVerificationPort,
+  NativeVerificationRecord,
   OriginalCheckoutSnapshot,
+  PendingIntegrationEffect,
   PaginationRequest,
   PreparationRecord,
   RecordWorkerObservationRequest,
@@ -436,10 +442,11 @@ export class PreparationController {
     if (blockedBy.length > 0) {
       return failure("execution-conflict", [`Ticket is blocked by in-batch prerequisites: ${blockedBy.sort().join(", ")}`]);
     }
-    if (loaded.value.executionAttempts.some((attempt): boolean =>
-      attempt.preparationId === request.preparationId && isActiveExecutionLifecycle(attempt.lifecycle)
-    )) {
-      return failure("execution-conflict", ["This preparation already owns an active ticket worker"]);
+    const implementationOccupancy = loaded.value.executionAttempts.filter((attempt): boolean =>
+      attempt.preparationId === request.preparationId && occupiesImplementationSlot(attempt)
+    ).length;
+    if (implementationOccupancy >= preparation.proposal.policy.concurrency) {
+      return failure("execution-conflict", ["This preparation has reached its implementation concurrency limit"]);
     }
     if (loaded.value.executionAttempts.length >= MAX_EXECUTION_ATTEMPTS) {
       return failure("execution-validation", [`Execution attempt capacity of ${MAX_EXECUTION_ATTEMPTS} was reached`]);
@@ -609,10 +616,9 @@ export class PreparationController {
         return failure("execution-conflict", guarded.ok ? guarded.value.diagnostics : guarded.error.diagnostics);
       }
       const observation = await execution.worker.inspect(attempt.worker);
-      if (!sameWorker(observation.identity, attempt.worker) || !observation.settled ||
-        (observation.status !== "idle" && observation.status !== "done") ||
-        !Array.isArray(observation.outstandingJobs) || observation.outstandingJobs.length > 0
-      ) return failure("execution-conflict", ["Candidate requires a settled Pi lifecycle with no outstanding jobs"]);
+      if (!isSettledOwnedWorker(observation, attempt.worker)) {
+        return failure("execution-conflict", ["Candidate requires a settled Pi lifecycle with no outstanding jobs"]);
+      }
       const candidate = await execution.git.captureCandidate({ path: attempt.worktree.path, sourceBase: attempt.worktree.head });
       const specEvidence = preparation.proposal!.sourceEvidence.find(
         (evidence): boolean => evidence.identity === preparation.proposal!.spec.evidenceIdentity,
@@ -732,9 +738,46 @@ export class PreparationController {
         return this.blockAcceptanceLease(lease, "Staged candidate HEAD does not match its integration plan");
       }
       const staged = await this.updateAcceptance(lease, (context): void => {
-        context.receipt.integration = { worktree: structuredClone(integration), staging: structuredClone(staging) };
+        context.receipt.integration = {
+          worktree: structuredClone(integration),
+          staging: structuredClone(staging),
+          stagedCodeStateDigest: stagedCandidate.codeStateDigest,
+        };
       });
       if (!staged.ok) return staged;
+
+      if (stagedCandidate.codeStateDigest !== receipt.candidate.codeStateDigest) {
+        const verification = await acceptance.nativeVerifier.verify({
+          workspaceId: attempt.workspaceId,
+          cwd: staging.path,
+          candidateCommit: staging.candidateCommit,
+          codeStateDigest: stagedCandidate.codeStateDigest,
+          model: proposal.model,
+          evidenceReferences: receipt.evidenceReferences,
+        });
+        if (!isValidNativeVerification(verification, staging.candidateCommit, stagedCandidate.codeStateDigest) ||
+          verification.freshSessionId === attempt.worker?.sessionId
+        ) return this.blockAcceptanceLease(lease, "Staged native verification returned malformed, stale, or non-fresh evidence");
+        const afterNativeVerification = await execution.git.captureCandidate({
+          path: staging.path,
+          sourceBase: staging.baseCommit,
+        });
+        if (afterNativeVerification.candidateDigest !== stagedCandidate.candidateDigest) {
+          return this.blockAcceptanceLease(lease, "Staged candidate changed during native verification");
+        }
+        const verified = await this.updateAcceptance(lease, (context): void => {
+          context.receipt.integration!.nativeVerification = structuredClone(verification);
+          context.receipt.evidenceReferences = uniqueReferences([
+            ...context.receipt.evidenceReferences,
+            verification.evidenceReference,
+          ]);
+          context.receipt.findings.push(...verification.findings);
+        });
+        if (!verified.ok) return verified;
+        if (verification.status !== "passed" || verification.findings.length > 0) {
+          return this.blockAcceptanceLease(lease, "Native implementation verification failed on the staged candidate");
+        }
+      }
 
       for (const check of proposal.policy.checks) {
         const result = await acceptance.checks.execute({
@@ -806,6 +849,13 @@ export class PreparationController {
     if (!preparation.proposal!.policy.requiredReviews.every((kind): boolean => receipt.reviews.some(
       (review): boolean => review.kind === kind && review.verdict === "passed" && review.findings.length === 0,
     ))) return this.blockAcceptance(state, attempt, receipt, "Required reviews are incomplete");
+    if (integration.stagedCodeStateDigest !== receipt.candidate.codeStateDigest && (
+      !isValidNativeVerification(
+        integration.nativeVerification,
+        integration.staging.candidateCommit,
+        integration.stagedCodeStateDigest,
+      ) || integration.nativeVerification?.status !== "passed" || integration.nativeVerification.findings.length > 0
+    )) return this.blockAcceptance(state, attempt, receipt, "Staged native implementation verification is incomplete");
     const guarded = await this.verifyOwnedWorkerAndGit(state, attempt);
     if (!guarded.ok || guarded.value.lifecycle === "needs-attention") return guarded;
     const observation = await execution.worker.inspect(attempt.worker!);
@@ -826,16 +876,46 @@ export class PreparationController {
     if (currentIntegration.head !== preparation.batchIntegration?.head) {
       return this.blockAcceptance(state, attempt, receipt, "Batch integration worktree moved outside recorded acceptance");
     }
-    const integratedCommit = await execution.git.advanceIntegration({
-      integration: integration.worktree,
-      staging: integration.staging,
-    });
+    const pendingIntegration: PendingIntegrationEffect = {
+      attemptId: attempt.id,
+      receiptId: receipt.id,
+      worktreePath: integration.worktree.path,
+      branch: integration.worktree.branch,
+      fromCommit: integration.staging.baseCommit,
+      toCommit: integration.staging.candidateCommit,
+      sequence: (preparation.batchIntegration?.sequence ?? 0) + 1,
+    };
+    preparation.pendingIntegration = pendingIntegration;
+    const journalled = await this.saveState(state);
+    if (!journalled.ok) return journalled;
+    let integratedCommit: string;
+    try {
+      integratedCommit = await execution.git.advanceIntegration({
+        integration: integration.worktree,
+        staging: integration.staging,
+      });
+    } catch {
+      try {
+        const afterFailure = await execution.git.inspectWorktree(integration.worktree.path);
+        if (afterFailure.head === pendingIntegration.toCommit && afterFailure.branch === pendingIntegration.branch) {
+          integratedCommit = pendingIntegration.toCommit;
+        } else if (afterFailure.head === pendingIntegration.fromCommit && afterFailure.branch === pendingIntegration.branch) {
+          delete preparation.pendingIntegration;
+          return this.blockAcceptance(state, attempt, receipt, "Integration advancement failed before changing the accepted branch");
+        } else {
+          return failure("infrastructure", ["Integration advancement has an ambiguous result and requires restart reconciliation"]);
+        }
+      } catch {
+        return failure("infrastructure", ["Integration advancement has an ambiguous result and requires restart reconciliation"]);
+      }
+    }
     if (integratedCommit !== integration.staging.candidateCommit) {
-      return this.blockAcceptance(state, attempt, receipt, "Integration returned a mismatched accepted commit");
+      return failure("infrastructure", ["Integration returned a mismatched commit and requires restart reconciliation"]);
     }
     receipt.integration!.integratedCommit = integratedCommit;
     receipt.integration!.sequence = (preparation.batchIntegration?.sequence ?? 0) + 1;
     preparation.batchIntegration = { head: integratedCommit, sequence: receipt.integration!.sequence };
+    delete preparation.pendingIntegration;
     receipt.state = "accepted";
     receipt.acceptedAt = this.dependencies.now().toISOString();
     attempt.acceptedCommit = integratedCommit;
@@ -962,7 +1042,12 @@ export class PreparationController {
     }
     const guarded = await this.verifyOwnedWorkerAndGit(state, attempt);
     if (!guarded.ok || guarded.value.lifecycle === "needs-attention") return guarded;
-    attempt.lifecycle = attempt.suspendedFrom === "accepting" || attempt.suspendedFrom === "integration-blocked"
+    const preparation = state.preparations.find((record): boolean => record.id === attempt.preparationId)!;
+    if (attempt.lifecycle === "restart-required" && attempt.suspendedFrom === "accepting" &&
+      preparation.pendingIntegration?.attemptId === attempt.id
+    ) return this.reconcilePendingIntegration(state, attempt, preparation);
+    attempt.lifecycle = attempt.suspendedFrom === "completed-unaccepted" || attempt.suspendedFrom === "accepting" ||
+      attempt.suspendedFrom === "integration-blocked"
       ? "completed-unaccepted"
       : hasPendingDecision(attempt) ? "pending-decision" : "running";
     delete attempt.suspendedFrom;
@@ -970,6 +1055,50 @@ export class PreparationController {
     const resumed = await this.persistAttempt(state, attempt);
     if (!resumed.ok) return resumed;
     return this.deliverAnsweredDecisions(state, attempt);
+  }
+
+  private async reconcilePendingIntegration(
+    state: ControllerState,
+    attempt: ExecutionAttempt,
+    preparation: PreparationRecord,
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    const effect = preparation.pendingIntegration!;
+    const receipt = attempt.candidateReceipts?.find((item): boolean => item.id === effect.receiptId);
+    if (!receipt?.integration || receipt.integration.staging.candidateCommit !== effect.toCommit ||
+      receipt.integration.staging.baseCommit !== effect.fromCommit ||
+      receipt.integration.worktree.path !== effect.worktreePath || receipt.integration.worktree.branch !== effect.branch
+    ) return this.attention(state, attempt, "Pending integration advancement no longer matches its retained candidate evidence");
+    try {
+      const worktree = await this.dependencies.execution!.git.inspectWorktree(effect.worktreePath);
+      if (worktree.branch !== effect.branch) {
+        return this.attention(state, attempt, "Pending integration worktree branch changed before reconciliation");
+      }
+      if (worktree.head === effect.toCommit) {
+        receipt.integration.integratedCommit = effect.toCommit;
+        receipt.integration.sequence = effect.sequence;
+        receipt.state = "accepted";
+        receipt.acceptedAt = this.dependencies.now().toISOString();
+        preparation.batchIntegration = { head: effect.toCommit, sequence: effect.sequence };
+        delete preparation.pendingIntegration;
+        attempt.acceptedCommit = effect.toCommit;
+        attempt.lifecycle = "accepted";
+        delete attempt.suspendedFrom;
+        advanceControlGeneration(attempt);
+        return this.persistAttempt(state, attempt);
+      }
+      if (worktree.head === effect.fromCommit) {
+        delete preparation.pendingIntegration;
+        receipt.state = "blocked";
+        receipt.findings = uniqueReferences([...receipt.findings, "Journalled integration advancement did not occur before restart"]);
+        attempt.lifecycle = "completed-unaccepted";
+        delete attempt.suspendedFrom;
+        advanceControlGeneration(attempt);
+        return this.persistAttempt(state, attempt);
+      }
+      return this.attention(state, attempt, "Pending integration worktree moved to an unrelated commit");
+    } catch {
+      return this.attention(state, attempt, "Pending integration advancement could not be reconciled safely");
+    }
   }
 
   private async takeOverAttemptOperation(
@@ -1097,11 +1226,12 @@ export class PreparationController {
     if (!loaded.ok) return loaded;
     const changed: ExecutionAttempt[] = [];
     for (const attempt of loaded.value.executionAttempts) {
-      if (!isActiveExecutionLifecycle(attempt.lifecycle) && attempt.lifecycle !== "integration-blocked") continue;
+      if (!isActiveExecutionLifecycle(attempt.lifecycle) && attempt.lifecycle !== "completed-unaccepted" &&
+        attempt.lifecycle !== "integration-blocked") continue;
       attempt.owner = structuredClone(execution.owner);
       advanceControlGeneration(attempt);
-      if (attempt.lifecycle === "integration-blocked") {
-        attempt.suspendedFrom = "integration-blocked";
+      if (attempt.lifecycle === "completed-unaccepted" || attempt.lifecycle === "integration-blocked") {
+        attempt.suspendedFrom = attempt.lifecycle;
         attempt.lifecycle = "restart-required";
       } else if (attempt.lifecycle !== "paused" && attempt.lifecycle !== "takeover") {
         if (attempt.lifecycle === "running" || attempt.lifecycle === "pending-decision" || attempt.lifecycle === "accepting") {
@@ -1532,6 +1662,22 @@ function validateNativeEvidence(evidence: NativeEvidenceRecord[], receipt: Candi
     ) return "Native implementation evidence is malformed, failed, or stale";
   }
   return undefined;
+}
+
+function isValidNativeVerification(
+  record: NativeVerificationRecord | undefined,
+  candidateCommit: string,
+  codeStateDigest: string,
+): record is NativeVerificationRecord {
+  return !!record && (record.status === "passed" || record.status === "blocked") &&
+    record.candidateCommit === candidateCommit && record.codeStateDigest === codeStateDigest &&
+    validBoundedText(record.freshSessionId, 4_096) &&
+    validStringCollection(record.observedCommandDigests, 100) && record.observedCommandDigests.length > 0 &&
+    record.observedCommandDigests.every((value): boolean => /^[a-f0-9]{64}$/i.test(value)) &&
+    validStringCollection(record.findings, 50) &&
+    (record.status === "passed" ? record.findings.length === 0 : record.findings.length > 0) &&
+    validBoundedText(record.evidenceReference, 4_096) && !containsCredential(record.evidenceReference) &&
+    Number.isFinite(Date.parse(record.completedAt));
 }
 
 function isValidCheckResult(

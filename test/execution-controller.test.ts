@@ -37,6 +37,7 @@ import type {
   WorkerBridgeTransport,
   WorkerDecisionRequest,
   WorkerLifecycleReceipt,
+  WorkerNativeVerificationReceipt,
   WorkerReadinessReceipt,
   WorkerReviewReceipt,
 } from "../src/worker-bridge-protocol.js";
@@ -165,7 +166,7 @@ class ControlledWorker implements WorkerRuntimePort {
     this.allocations += 1;
     await this.beforeAllocate?.();
     if (this.failAt === "allocate") throw new Error("token=secret allocation failed");
-    return { workspaceId: input.workspaceId, tabId: "tab-1", paneId: "pane-1", agentName: input.agentName };
+    return { workspaceId: input.workspaceId, tabId: `tab-${this.allocations}`, paneId: `pane-${this.allocations}`, agentName: input.agentName };
   }
 
   async start(input: Parameters<WorkerRuntimePort["start"]>[0]): Promise<WorkerIdentity> {
@@ -175,8 +176,8 @@ class ControlledWorker implements WorkerRuntimePort {
     const identity: WorkerIdentity = {
       ...input.allocation,
       piPid: 4242,
-      sessionId: "session-1",
-      sessionFile: "/saved/session-1.jsonl",
+      sessionId: `session-${input.allocation.tabId.slice("tab-".length)}`,
+      sessionFile: `/saved/session-${input.allocation.tabId.slice("tab-".length)}.jsonl`,
       cwd: input.cwd,
       model: input.model,
       mode: "tui",
@@ -874,9 +875,11 @@ class ControlledBridge implements WorkerBridgeTransport {
     responseDirectory: "/tmp/herdr-worker-decisions/responses",
     lifecycleEndpoint: "/tmp/herdr-worker-lifecycle.json",
     reviewEndpoint: "/tmp/herdr-worker-review.json",
+    nativeVerificationEndpoint: "/tmp/herdr-worker-native-verification.json",
   };
   receiptFactory: (() => WorkerReadinessReceipt) | undefined;
   reviewReceiptFactory: (() => WorkerReviewReceipt) | undefined;
+  nativeVerificationReceiptFactory: (() => WorkerNativeVerificationReceipt) | undefined;
   lifecycleOutstandingJobs: string[] = [];
 
   async openChannel(): Promise<WorkerBridgeChannel> {
@@ -886,6 +889,11 @@ class ControlledBridge implements WorkerBridgeTransport {
   async waitForReadiness(): Promise<WorkerReadinessReceipt> {
     if (!this.receiptFactory) throw new Error("missing receipt");
     return this.receiptFactory();
+  }
+
+  async waitForNativeVerification(): Promise<WorkerNativeVerificationReceipt> {
+    if (!this.nativeVerificationReceiptFactory) throw new Error("missing native verification receipt");
+    return this.nativeVerificationReceiptFactory();
   }
 
   async waitForReview(): Promise<WorkerReviewReceipt> {
@@ -1573,6 +1581,43 @@ test("production Herdr runtime rejects stale startup, model, cwd, pane, session,
     assert.equal(attempt.lifecycle, "needs-attention");
     assert.equal(executor.calls.some((call): boolean => call.args[3]?.startsWith("/skill:implement") === true), false);
   }
+});
+
+test("production Herdr staged native verification uses a fresh normal Pi skill session and observed command receipt", async (): Promise<void> => {
+  const executor = new ControlledHerdr();
+  const bridge = new ControlledBridge();
+  const runtime = herdrRuntime(executor, bridge);
+  bridge.receiptFactory = (): WorkerReadinessReceipt => receiptFor(executor);
+  bridge.nativeVerificationReceiptFactory = (): WorkerNativeVerificationReceipt => ({
+    schemaVersion: 1,
+    nonce: bridge.channel.nonce,
+    sessionId: "session-1",
+    status: "passed",
+    candidateCommit: "b".repeat(40),
+    codeStateDigest: "c".repeat(64),
+    observedCommandDigests: ["d".repeat(64)],
+    findings: [],
+    completedAt: "2026-09-12T15:00:00.000Z",
+  });
+
+  const verification = await runtime.verify({
+    workspaceId: "workspace-1",
+    cwd: "/candidate/staging",
+    candidateCommit: "b".repeat(40),
+    codeStateDigest: "c".repeat(64),
+    model: { provider: "test", id: "reasoner", thinkingLevel: "high", contextWindow: 220_000 },
+    evidenceReferences: ["/evidence/native-tests.json"],
+  });
+
+  assert.equal(verification.status, "passed");
+  assert.deepEqual(verification.observedCommandDigests, ["d".repeat(64)]);
+  assert.equal(verification.evidenceReference, bridge.channel.nativeVerificationEndpoint);
+  const startCall = executor.calls.find((call): boolean => call.args[0] === "agent" && call.args[1] === "start")!;
+  assert.equal(startCall.args.some((arg): boolean => ["--continue", "--resume", "--fork", "--session", "--no-tools", "--no-skills"].includes(arg)), false);
+  const prompt = executor.calls.find((call): boolean => call.args[0] === "agent" && call.args[1] === "prompt" && call.args[3]?.startsWith("/skill:implement Verification-only") === true)!;
+  assert.ok(prompt.args.includes("--wait"));
+  assert.match(prompt.args[3]!, /Do not edit or write files, commit, repair findings/);
+  assert.equal(executor.calls.some((call): boolean => call.args[0] === "tab" && call.args[1] === "close"), true);
 });
 
 test("production Herdr acceptance review starts a fresh Pi session and retains structured candidate binding", async (): Promise<void> => {
