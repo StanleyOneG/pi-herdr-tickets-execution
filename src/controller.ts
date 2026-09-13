@@ -16,8 +16,11 @@ import type {
   ControllerState,
   ControllerStateStore,
   ControllerStatus,
+  AcceptanceReviewRecord,
   ExecutionAttempt,
+  GateCheckRecord,
   LocalActorCapability,
+  NativeEvidenceRecord,
   PaginationRequest,
   PreparationRecord,
   PrepareRequest,
@@ -674,6 +677,10 @@ export class PreparationController {
         sourcePath: attempt.worktree!.path,
         candidate: receipt.candidate,
       });
+      const stagedCandidate = await execution.git.captureCandidate({ path: staging.path, sourceBase: staging.baseCommit });
+      if (stagedCandidate.head !== staging.candidateCommit) {
+        return this.blockAcceptance(state, attempt, receipt, "Staged candidate HEAD does not match its integration plan");
+      }
       receipt.integration = { worktree: structuredClone(integration), staging: structuredClone(staging) };
       const staged = await this.persistAttempt(state, attempt);
       if (!staged.ok) return staged;
@@ -718,9 +725,15 @@ export class PreparationController {
       if (!proposal.policy.requiredReviews.every((kind): boolean => receipt.reviews.some((review): boolean => review.kind === kind && review.verdict === "passed"))) {
         return this.blockAcceptance(state, attempt, receipt, "Required reviews are incomplete");
       }
-      const afterReview = await execution.git.captureCandidate({ path: attempt.worktree!.path, sourceBase: receipt.candidate.sourceBase });
+      const [afterReview, stagedAfterReview] = await Promise.all([
+        execution.git.captureCandidate({ path: attempt.worktree!.path, sourceBase: receipt.candidate.sourceBase }),
+        execution.git.captureCandidate({ path: staging.path, sourceBase: staging.baseCommit }),
+      ]);
       if (afterReview.candidateDigest !== receipt.candidate.candidateDigest) {
         return this.blockAcceptance(state, attempt, receipt, "Candidate changed while acceptance evidence was collected");
+      }
+      if (stagedAfterReview.candidateDigest !== stagedCandidate.candidateDigest) {
+        return this.blockAcceptance(state, attempt, receipt, "Staged candidate changed while checks or reviews were running");
       }
       const integratedCommit = await execution.git.advanceIntegration({ integration, staging });
       if (integratedCommit !== staging.candidateCommit) {
@@ -1347,7 +1360,7 @@ function hasOnlyKeys(value: unknown, allowed: string[]): value is Record<string,
   return Object.keys(value).every((key): boolean => keys.has(key));
 }
 
-function validateNativeEvidence(evidence: import("./contracts.js").NativeEvidenceRecord[], receipt: CandidateReceipt): string | undefined {
+function validateNativeEvidence(evidence: NativeEvidenceRecord[], receipt: CandidateReceipt): string | undefined {
   if (!Array.isArray(evidence) || evidence.length < 2 || evidence.length > 20) return "Native implementation evidence is incomplete";
   if (!evidence.some((item): boolean => item.kind === "tests") || !evidence.some((item): boolean => item.kind === "reviews")) {
     return "Native implementation tests and reviews must both be preserved";
@@ -1362,7 +1375,7 @@ function validateNativeEvidence(evidence: import("./contracts.js").NativeEvidenc
 }
 
 function validCheckResult(
-  result: import("./contracts.js").GateCheckRecord,
+  result: GateCheckRecord,
   command: string,
   candidateCommit: string,
 ): boolean {
@@ -1372,7 +1385,7 @@ function validCheckResult(
 }
 
 function validReview(
-  review: import("./contracts.js").AcceptanceReviewRecord,
+  review: AcceptanceReviewRecord,
   kind: "standards" | "spec",
   reviewBase: string,
   candidateCommit: string,
