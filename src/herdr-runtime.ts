@@ -265,56 +265,43 @@ export class HerdrWorkerRuntime implements WorkerRuntimePort, AcceptanceReviewPo
     const verificationIdentity = createHash("sha256")
       .update(`${input.candidateCommit}\0${input.codeStateDigest}`)
       .digest("hex").slice(0, 20);
-    const allocation = await this.allocate({
+    const prompt = [
+      "/skill:implement Verification-only acceptance gate for an already staged candidate.",
+      `Candidate commit: ${input.candidateCommit}`,
+      `Controller-observed Git code-state digest: ${input.codeStateDigest}`,
+      "Read and follow the installed implementation skill and project instructions for their existing testing and code-review obligations.",
+      "Re-run every required native test against this exact staged code state. Use bash only for those test commands; use read/grep/find/ls for inspection.",
+      "Do not edit or write files, commit, repair findings, invent fallback commands, waive missing tests, or perform delivery/tracker operations.",
+      `Retained source evidence references: ${input.evidenceReferences.join(", ")}`,
+      "If required tests cannot be identified or executed, submit blocked with findings.",
+      "Finish by calling herdr_submit_native_verification exactly once with the supplied candidate commit and code-state digest, pass only after all required tests and native review obligations succeed, and include every blocking finding.",
+    ].join("\n\n");
+    return this.runIsolatedAcceptance({
       workspaceId: input.workspaceId,
       agentName: `verify-${verificationIdentity}`,
       cwd: input.cwd,
+      model: input.model,
+      prompt,
+      missingChannelMessage: "Native verification bridge channel is unavailable",
+      unsettledMessage: "Native verification Pi session has not settled or still has outstanding work",
+      waitForReceipt: (channel) => this.options.bridge.waitForNativeVerification!(channel, 10_000),
+      validateReceipt: (receipt, identity, channel): NativeVerificationRecord => {
+        if (receipt.nonce !== channel.nonce || receipt.sessionId !== identity.sessionId ||
+          receipt.candidateCommit !== input.candidateCommit || receipt.codeStateDigest !== input.codeStateDigest
+        ) throw new Error("Native verification receipt is stale or mismatched");
+        return {
+          status: receipt.status,
+          candidateCommit: receipt.candidateCommit,
+          codeStateDigest: receipt.codeStateDigest,
+          freshSessionId: receipt.sessionId,
+          observedCommandDigests: [...receipt.observedCommandDigests],
+          findings: [...receipt.findings],
+          evidenceReference: channel.nativeVerificationEndpoint!,
+          completedAt: receipt.completedAt,
+        };
+      },
+      passed: (record) => record.status === "passed" && record.findings.length === 0,
     });
-    let identity: WorkerIdentity | undefined;
-    let shouldClose = false;
-    try {
-      identity = await this.start({ allocation, cwd: input.cwd, model: input.model });
-      const channel = this.channels.get(allocationKey(allocation));
-      if (!channel) throw new Error("Native verification bridge channel is unavailable");
-      const prompt = [
-        "/skill:implement Verification-only acceptance gate for an already staged candidate.",
-        `Candidate commit: ${input.candidateCommit}`,
-        `Controller-observed Git code-state digest: ${input.codeStateDigest}`,
-        "Read and follow the installed implementation skill and project instructions for their existing testing and code-review obligations.",
-        "Re-run every required native test against this exact staged code state. Use bash only for those test commands; use read/grep/find/ls for inspection.",
-        "Do not edit or write files, commit, repair findings, invent fallback commands, waive missing tests, or perform delivery/tracker operations.",
-        `Retained source evidence references: ${input.evidenceReferences.join(", ")}`,
-        "If required tests cannot be identified or executed, submit blocked with findings.",
-        "Finish by calling herdr_submit_native_verification exactly once with the supplied candidate commit and code-state digest, pass only after all required tests and native review obligations succeed, and include every blocking finding.",
-      ].join("\n\n");
-      await this.command([
-        "agent", "prompt", identity.agentName, prompt,
-        "--wait", "--until", "idle", "--until", "done", "--until", "blocked", "--timeout", "300000",
-      ], 305_000);
-      const receipt = await this.options.bridge.waitForNativeVerification(channel, 10_000);
-      if (receipt.nonce !== channel.nonce || receipt.sessionId !== identity.sessionId ||
-        receipt.candidateCommit !== input.candidateCommit || receipt.codeStateDigest !== input.codeStateDigest
-      ) throw new Error("Native verification receipt is stale or mismatched");
-      const settled = await this.inspect(identity);
-      if (!settled.settled || !["idle", "done"].includes(settled.status) ||
-        !Array.isArray(settled.outstandingJobs) || settled.outstandingJobs.length > 0
-      ) throw new Error("Native verification Pi session has not settled or still has outstanding work");
-      shouldClose = receipt.status === "passed" && receipt.findings.length === 0;
-      return {
-        status: receipt.status,
-        candidateCommit: receipt.candidateCommit,
-        codeStateDigest: receipt.codeStateDigest,
-        freshSessionId: receipt.sessionId,
-        observedCommandDigests: [...receipt.observedCommandDigests],
-        findings: [...receipt.findings],
-        evidenceReference: channel.nativeVerificationEndpoint!,
-        completedAt: receipt.completedAt,
-      };
-    } finally {
-      if (identity && shouldClose) {
-        try { await this.close(identity); } catch { /* Preserve saved verification session when cleanup fails. */ }
-      }
-    }
   }
 
   async review(input: Parameters<AcceptanceReviewPort["review"]>[0]): Promise<AcceptanceReviewRecord> {
@@ -322,51 +309,83 @@ export class HerdrWorkerRuntime implements WorkerRuntimePort, AcceptanceReviewPo
     const digest = createHash("sha256")
       .update(`${input.kind}\0${input.candidateCommit}\0${input.reviewBase}`)
       .digest("hex").slice(0, 20);
-    const allocation = await this.allocate({ workspaceId: input.workspaceId, agentName: `review-${digest}`, cwd: input.cwd });
+    const prompt = [
+      `Perform a fresh-context ${input.kind} acceptance review of the staged candidate.`,
+      `Review base: ${input.reviewBase}`,
+      `Candidate commit: ${input.candidateCommit}`,
+      `Inspect the actual diff with git diff ${input.reviewBase}..${input.candidateCommit}.`,
+      input.kind === "standards"
+        ? "Read and apply the project's coding standards and normal review guidance."
+        : "Read the approved spec/ticket evidence and verify every applicable requirement without widening scope.",
+      `Approved evidence references: ${input.evidenceReferences.join(", ")}`,
+      "Do not edit files, repair findings, reuse another review, or claim a pass with unresolved blockers.",
+      "Finish by calling herdr_submit_acceptance_review exactly once with this kind, review base, candidate commit, verdict, and all blocking findings.",
+    ].join("\n\n");
+    return this.runIsolatedAcceptance({
+      workspaceId: input.workspaceId,
+      agentName: `review-${digest}`,
+      cwd: input.cwd,
+      model: input.model,
+      prompt,
+      missingChannelMessage: "Review bridge channel is unavailable",
+      unsettledMessage: "Fresh review Pi session has not settled or still has outstanding work",
+      waitForReceipt: (channel) => this.options.bridge.waitForReview!(channel, 10_000),
+      validateReceipt: (receipt, identity, channel): AcceptanceReviewRecord => {
+        if (receipt.nonce !== channel.nonce || receipt.sessionId !== identity.sessionId || receipt.kind !== input.kind ||
+          receipt.candidateCommit !== input.candidateCommit || receipt.reviewBase !== input.reviewBase
+        ) throw new Error("Fresh review receipt is stale or mismatched");
+        return {
+          kind: receipt.kind,
+          verdict: receipt.verdict,
+          candidateCommit: receipt.candidateCommit,
+          reviewBase: receipt.reviewBase,
+          freshSessionId: receipt.sessionId,
+          findings: receipt.findings,
+          evidenceReference: channel.reviewEndpoint!,
+          completedAt: receipt.completedAt,
+        };
+      },
+      passed: (record) => record.verdict === "passed" && record.findings.length === 0,
+    });
+  }
+
+  private async runIsolatedAcceptance<TReceipt, TRecord>(input: {
+    workspaceId: string;
+    agentName: string;
+    cwd: string;
+    model: CapturedModel;
+    prompt: string;
+    missingChannelMessage: string;
+    unsettledMessage: string;
+    waitForReceipt: (channel: WorkerBridgeChannel) => Promise<TReceipt>;
+    validateReceipt: (receipt: TReceipt, identity: WorkerIdentity, channel: WorkerBridgeChannel) => TRecord;
+    passed: (record: TRecord) => boolean;
+  }): Promise<TRecord> {
+    const allocation = await this.allocate({
+      workspaceId: input.workspaceId,
+      agentName: input.agentName,
+      cwd: input.cwd,
+    });
     let identity: WorkerIdentity | undefined;
     let shouldClose = false;
     try {
       identity = await this.start({ allocation, cwd: input.cwd, model: input.model });
       const channel = this.channels.get(allocationKey(allocation));
-      if (!channel) throw new Error("Review bridge channel is unavailable");
-      const prompt = [
-        `Perform a fresh-context ${input.kind} acceptance review of the staged candidate.`,
-        `Review base: ${input.reviewBase}`,
-        `Candidate commit: ${input.candidateCommit}`,
-        `Inspect the actual diff with git diff ${input.reviewBase}..${input.candidateCommit}.`,
-        input.kind === "standards"
-          ? "Read and apply the project's coding standards and normal review guidance."
-          : "Read the approved spec/ticket evidence and verify every applicable requirement without widening scope.",
-        `Approved evidence references: ${input.evidenceReferences.join(", ")}`,
-        "Do not edit files, repair findings, reuse another review, or claim a pass with unresolved blockers.",
-        "Finish by calling herdr_submit_acceptance_review exactly once with this kind, review base, candidate commit, verdict, and all blocking findings.",
-      ].join("\n\n");
+      if (!channel) throw new Error(input.missingChannelMessage);
       await this.command([
-        "agent", "prompt", identity.agentName, prompt,
+        "agent", "prompt", identity.agentName, input.prompt,
         "--wait", "--until", "idle", "--until", "done", "--until", "blocked", "--timeout", "300000",
       ], 305_000);
-      const receipt = await this.options.bridge.waitForReview(channel, 10_000);
-      if (receipt.nonce !== channel.nonce || receipt.sessionId !== identity.sessionId || receipt.kind !== input.kind ||
-        receipt.candidateCommit !== input.candidateCommit || receipt.reviewBase !== input.reviewBase
-      ) throw new Error("Fresh review receipt is stale or mismatched");
+      const record = input.validateReceipt(await input.waitForReceipt(channel), identity, channel);
       const settled = await this.inspect(identity);
       if (!settled.settled || !["idle", "done"].includes(settled.status) ||
         !Array.isArray(settled.outstandingJobs) || settled.outstandingJobs.length > 0
-      ) throw new Error("Fresh review Pi session has not settled or still has outstanding work");
-      shouldClose = receipt.verdict === "passed" && receipt.findings.length === 0;
-      return {
-        kind: receipt.kind,
-        verdict: receipt.verdict,
-        candidateCommit: receipt.candidateCommit,
-        reviewBase: receipt.reviewBase,
-        freshSessionId: receipt.sessionId,
-        findings: receipt.findings,
-        evidenceReference: channel.reviewEndpoint!,
-        completedAt: receipt.completedAt,
-      };
+      ) throw new Error(input.unsettledMessage);
+      shouldClose = input.passed(record);
+      return record;
     } finally {
       if (identity && shouldClose) {
-        try { await this.close(identity); } catch { /* Preserve the saved review session even if tab cleanup fails. */ }
+        try { await this.close(identity); } catch { /* Preserve the saved acceptance session when cleanup fails. */ }
       }
     }
   }

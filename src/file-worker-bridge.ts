@@ -82,18 +82,14 @@ export class FileWorkerBridgeTransport implements WorkerBridgeTransport {
 
   async waitForReadiness(channel: WorkerBridgeChannel, timeoutMs: number): Promise<WorkerReadinessReceipt> {
     this.assertOwnedChannel(channel);
-    const deadline = this.now() + timeoutMs;
-    for (;;) {
-      try {
-        const parsed: unknown = JSON.parse(await readBounded(channel.endpoint));
-        await removeIfPresent(channel.endpoint);
-        return parsed as WorkerReadinessReceipt;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      }
-      if (this.now() >= deadline) throw new Error("Worker readiness receipt timed out");
-      await this.sleep(this.pollIntervalMs);
-    }
+    const receipt = await this.waitForRecord(
+      channel.endpoint,
+      timeoutMs,
+      "Worker readiness receipt timed out",
+      (parsed): WorkerReadinessReceipt => parsed as WorkerReadinessReceipt,
+    );
+    await removeIfPresent(channel.endpoint);
+    return receipt;
   }
 
   async nextDecisionRequest(channel: WorkerBridgeChannel): Promise<WorkerDecisionRequest | undefined> {
@@ -145,22 +141,19 @@ export class FileWorkerBridgeTransport implements WorkerBridgeTransport {
       expectedPiPid,
       requestedAt: new Date(this.now()).toISOString(),
     })}\n`);
-    const deadline = this.now() + timeoutMs;
-    for (;;) {
-      try {
-        const parsed: unknown = JSON.parse(await readBounded(channel.lifecycleChallengeResponseEndpoint!));
+    await this.waitForRecord(
+      channel.lifecycleChallengeResponseEndpoint!,
+      timeoutMs,
+      "Worker lifecycle challenge timed out without a live bridge response",
+      (parsed): true => {
         if (!isLifecycleChallengeResponse(parsed) || parsed.nonce !== channel.nonce ||
           parsed.challenge !== challenge || parsed.piPid !== expectedPiPid
         ) throw new Error("Worker lifecycle challenge response is stale or belongs to another Pi process");
-        await removeIfPresent(channel.lifecycleChallengeEndpoint!);
-        await removeIfPresent(channel.lifecycleChallengeResponseEndpoint!);
-        return;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      }
-      if (this.now() >= deadline) throw new Error("Worker lifecycle challenge timed out without a live bridge response");
-      await this.sleep(this.pollIntervalMs);
-    }
+        return true;
+      },
+    );
+    await removeIfPresent(channel.lifecycleChallengeEndpoint!);
+    await removeIfPresent(channel.lifecycleChallengeResponseEndpoint!);
   }
 
   async waitForNativeVerification(
@@ -168,34 +161,46 @@ export class FileWorkerBridgeTransport implements WorkerBridgeTransport {
     timeoutMs: number,
   ): Promise<WorkerNativeVerificationReceipt> {
     this.assertOwnedChannel(channel);
-    const deadline = this.now() + timeoutMs;
-    for (;;) {
-      try {
-        const parsed: unknown = JSON.parse(await readBounded(channel.nativeVerificationEndpoint!));
+    return this.waitForRecord(
+      channel.nativeVerificationEndpoint!,
+      timeoutMs,
+      "Worker native verification receipt timed out",
+      (parsed): WorkerNativeVerificationReceipt => {
         if (!isNativeVerificationReceipt(parsed) || parsed.nonce !== channel.nonce) {
           throw new Error("Worker native verification receipt is malformed or stale");
         }
         return parsed;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      }
-      if (this.now() >= deadline) throw new Error("Worker native verification receipt timed out");
-      await this.sleep(this.pollIntervalMs);
-    }
+      },
+    );
   }
 
   async waitForReview(channel: WorkerBridgeChannel, timeoutMs: number): Promise<WorkerReviewReceipt> {
     this.assertOwnedChannel(channel);
+    return this.waitForRecord(
+      channel.reviewEndpoint!,
+      timeoutMs,
+      "Worker review receipt timed out",
+      (parsed): WorkerReviewReceipt => {
+        if (!isReviewReceipt(parsed) || parsed.nonce !== channel.nonce) throw new Error("Worker review receipt is malformed or stale");
+        return parsed;
+      },
+    );
+  }
+
+  private async waitForRecord<T>(
+    path: string,
+    timeoutMs: number,
+    timeoutMessage: string,
+    parse: (value: unknown) => T,
+  ): Promise<T> {
     const deadline = this.now() + timeoutMs;
     for (;;) {
       try {
-        const parsed: unknown = JSON.parse(await readBounded(channel.reviewEndpoint!));
-        if (!isReviewReceipt(parsed) || parsed.nonce !== channel.nonce) throw new Error("Worker review receipt is malformed or stale");
-        return parsed;
+        return parse(JSON.parse(await readBounded(path)));
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
-      if (this.now() >= deadline) throw new Error("Worker review receipt timed out");
+      if (this.now() >= deadline) throw new Error(timeoutMessage);
       await this.sleep(this.pollIntervalMs);
     }
   }

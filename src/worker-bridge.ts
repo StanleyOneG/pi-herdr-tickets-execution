@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { mkdir, open, readFile, unlink } from "node:fs/promises";
-import { dirname, isAbsolute, join } from "node:path";
+import { homedir, tmpdir, userInfo } from "node:os";
+import { mkdir, open, readFile, realpath, unlink } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 import { StringEnum } from "@earendil-works/pi-ai";
 import type {
@@ -65,23 +66,16 @@ interface PendingSubagentLaunch {
   toolCallId: string;
   cwd: string;
   sourceSessionId: string;
+  sourceSessionFile?: string;
   sourceSessionIdentities: Set<string>;
   codeStateDigest: string;
   args: unknown;
   launchedAt: number;
 }
-interface AsyncStartObservation {
-  runId: string;
-  sessionId: string;
-  completionOwnerId: string;
-  mode: "parallel" | "workflow";
-  agents: string[];
-  cwd: string;
-  asyncDir: string;
-}
 interface AsyncReviewLaunch extends PendingSubagentLaunch {
   runId: string;
-  start: AsyncStartObservation;
+  mode: "workflow";
+  asyncDir: string;
 }
 let sessionStartReason: WorkerReadinessReceipt["sessionStartReason"] | undefined;
 
@@ -92,12 +86,12 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   const nativeTestDiagnostics: string[] = [];
   const activeSubagentRuns = new Set<string>();
   const pendingSubagentLaunches = new Map<string, PendingSubagentLaunch>();
-  const asyncStartObservations = new Map<string, AsyncStartObservation>();
   const asyncReviewLaunches = new Map<string, AsyncReviewLaunch>();
   const pendingAsyncCompletions = new Map<string, unknown>();
   const terminalAsyncReviewRuns = new Set<string>();
   const consumedReviewerSessions = new Set<string>();
-  const activeAsyncReviewCaptures = new Set<string>();
+  const activeAsyncReviewCaptures = new Map<string, Promise<void>>();
+  const terminalNativeEvidenceFailures = new Map<string, string>();
   const nativeExecutions = new Map<string, NativeExecutionProof>();
   let failedBashCommand = false;
   let mutationToolUsed = false;
@@ -112,37 +106,51 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   const outstandingJobs = (): string[] => [
     ...(isAgentRunning ? ["pi-agent-run"] : []),
     ...[...activeTools].sort().map((id): string => `pi-tool:${id}`),
-    ...[...activeAsyncReviewCaptures].sort().map((id): string => `native-async-review-capture:${id}`),
+    ...[...activeAsyncReviewCaptures.keys()].sort().map((id): string => `native-async-review-capture:${id}`),
+    ...[...terminalNativeEvidenceFailures].sort().map(([id, reason]): string =>
+      `native-evidence-terminal-failure:${id}:${reason}`),
   ];
   const consumeAsyncReviewCompletion = (runId: string, payload: unknown): void => {
     const launch = asyncReviewLaunches.get(runId);
-    if (!launch || terminalAsyncReviewRuns.has(runId)) {
-      if (!launch && !terminalAsyncReviewRuns.has(runId) && asyncStartObservations.has(runId)) {
-        pendingAsyncCompletions.set(runId, payload);
-      }
-      return;
-    }
+    if (!launch || terminalAsyncReviewRuns.has(runId)) return;
     terminalAsyncReviewRuns.add(runId);
     asyncReviewLaunches.delete(runId);
     pendingAsyncCompletions.delete(runId);
-    activeAsyncReviewCaptures.add(runId);
-    void retainAsyncNativeReview(nativeExecutions, consumedReviewerSessions, launch, payload)
-      .catch(async (): Promise<void> => {
-        await invalidateNativeExecutions(nativeExecutions, "reviews", launch.cwd);
-      })
-      .finally((): void => { activeAsyncReviewCaptures.delete(runId); });
+    const capture = (async (): Promise<void> => {
+      try {
+        await retainAsyncNativeReview(nativeExecutions, consumedReviewerSessions, launch, payload);
+      } catch (error) {
+        nativeExecutions.delete(launch.toolCallId);
+        let reason = error instanceof Error ? error.message : String(error);
+        try {
+          await revokePublishedNativeEvidence();
+        } catch (revocationError) {
+          reason = `${reason}; revocation failed: ${revocationError instanceof Error ? revocationError.message : String(revocationError)}`;
+        }
+        terminalNativeEvidenceFailures.set(runId, boundedDiagnostic(reason));
+      }
+    })().catch((error: unknown): void => {
+      // This terminal guard must never reject: lifecycle remains fail-closed until the session is replaced.
+      nativeExecutions.delete(launch.toolCallId);
+      terminalNativeEvidenceFailures.set(runId, boundedDiagnostic(error instanceof Error ? error.message : String(error)));
+    });
+    activeAsyncReviewCaptures.set(runId, capture);
+    void capture.then((): void => { activeAsyncReviewCaptures.delete(runId); });
   };
   pi.events.on("subagent:async-started", (payload: unknown): void => {
     const id = eventIdentity(payload);
-    if (!id) return;
-    activeSubagentRuns.add(id);
-    const observation = parseAsyncReviewStart(payload);
-    if (observation) asyncStartObservations.set(id, observation);
+    if (id) activeSubagentRuns.add(id);
   });
   pi.events.on("subagent:async-complete", (payload: unknown): void => {
     const id = eventIdentity(payload);
     if (!id) return;
     activeSubagentRuns.delete(id);
+    const completion = objectRecord(payload);
+    const toolCallId = typeof completion?.toolCallId === "string" ? completion.toolCallId : undefined;
+    if (!asyncReviewLaunches.has(id) && toolCallId && pendingSubagentLaunches.has(toolCallId)) {
+      pendingAsyncCompletions.set(id, payload);
+      return;
+    }
     consumeAsyncReviewCompletion(id, payload);
   });
   pi.on("session_start", (event, _ctx): void => {
@@ -150,12 +158,12 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     activeTools.clear();
     activeSubagentRuns.clear();
     pendingSubagentLaunches.clear();
-    asyncStartObservations.clear();
     asyncReviewLaunches.clear();
     pendingAsyncCompletions.clear();
     terminalAsyncReviewRuns.clear();
     consumedReviewerSessions.clear();
     activeAsyncReviewCaptures.clear();
+    terminalNativeEvidenceFailures.clear();
     observedCommandDigests.length = 0;
     nativeTestDiagnostics.length = 0;
     failedBashCommand = false;
@@ -177,6 +185,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
           toolCallId: event.toolCallId,
           cwd: ctx.cwd,
           sourceSessionId,
+          ...(sessionFile ? { sourceSessionFile: sessionFile } : {}),
           sourceSessionIdentities: new Set([sourceSessionId, ...(sessionFile ? [sessionFile] : [])]),
           codeStateDigest: await captureCodeStateDigest(ctx.cwd),
           args: event.args,
@@ -211,18 +220,21 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   pi.on("tool_execution_end", async (event, ctx): Promise<void> => {
     activeTools.delete(event.toolCallId);
     const pendingLaunch = pendingSubagentLaunches.get(event.toolCallId);
-    pendingSubagentLaunches.delete(event.toolCallId);
     if (event.toolName === "subagent" && event.isError && pendingLaunch && looksLikeAnyReviewRequest(pendingLaunch.args)) {
       await invalidateNativeExecutions(nativeExecutions, "reviews", ctx.cwd);
     }
     if (event.toolName === "subagent" && !event.isError) {
       const asyncResult = parseAsyncLaunchResult(event.result);
-      const asyncStart = asyncResult ? asyncStartObservations.get(asyncResult.runId) : undefined;
       if (pendingLaunch && looksLikeReviewRequest(pendingLaunch.args) && (asyncResult || isAsyncLaunchLike(event.result))) {
         await invalidateNativeExecutions(nativeExecutions, "reviews", ctx.cwd);
-        if (asyncResult && asyncStart && isBoundAsyncReviewLaunch(pendingLaunch, asyncStart, asyncResult)) {
-          asyncReviewLaunches.set(asyncResult.runId, { ...pendingLaunch, runId: asyncResult.runId, start: asyncStart });
-          asyncStartObservations.delete(asyncResult.runId);
+        if (asyncResult && await isBoundAsyncReviewLaunch(pendingLaunch, asyncResult)) {
+          activeSubagentRuns.add(asyncResult.runId);
+          asyncReviewLaunches.set(asyncResult.runId, {
+            ...pendingLaunch,
+            runId: asyncResult.runId,
+            mode: asyncResult.mode,
+            asyncDir: asyncResult.asyncDir,
+          });
           const pendingCompletion = pendingAsyncCompletions.get(asyncResult.runId);
           if (pendingCompletion) consumeAsyncReviewCompletion(asyncResult.runId, pendingCompletion);
         }
@@ -236,10 +248,12 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
         }
       }
     }
+    pendingSubagentLaunches.delete(event.toolCallId);
     await writeLifecycle(ctx, "working", outstandingJobs());
   });
   pi.on("agent_settled", async (_event, ctx): Promise<void> => {
     isAgentRunning = false;
+    await Promise.all([...activeAsyncReviewCaptures.values()]);
     const jobs = outstandingJobs();
     if (ctx.hasPendingMessages()) jobs.push("pi-queued-message");
     jobs.push(...await reconcileSubagentWork(pi, activeSubagentRuns));
@@ -693,34 +707,8 @@ function looksLikeAnyReviewRequest(args: unknown): boolean {
 
 function looksLikeReviewRequest(args: unknown): boolean {
   const serialized = serializeBoundedToolArgs(args);
-  // Start events redact tasks, so intent is later joined to resolved reviewer identities and the host result.
-  return Boolean(serialized && /review/i.test(serialized) &&
-    ((/standards/i.test(serialized) && /\bspec\b/i.test(serialized)) ||
-      (serialized.match(/reviewer/gi)?.length ?? 0) >= 2));
-}
-
-function parseAsyncReviewStart(value: unknown): AsyncStartObservation | undefined {
-  const event = objectRecord(value);
-  if (!event || event.lifecycleArtifactVersion !== 3 || !["parallel", "workflow"].includes(String(event.mode)) ||
-    typeof event.sessionId !== "string" || !event.sessionId ||
-    typeof event.completionOwnerId !== "string" || !event.completionOwnerId ||
-    typeof event.cwd !== "string" || !isAbsolute(event.cwd) ||
-    typeof event.asyncDir !== "string" || !isAbsolute(event.asyncDir) || !Array.isArray(event.agents)
-  ) return undefined;
-  const agents = event.agents;
-  if (agents.length < 2 || agents.length > 8 || !agents.every((agent): agent is string =>
-    typeof agent === "string" && agent.toLowerCase() === "reviewer")) return undefined;
-  const runId = eventIdentity(event);
-  if (!runId) return undefined;
-  return {
-    runId,
-    sessionId: event.sessionId,
-    completionOwnerId: event.completionOwnerId,
-    mode: event.mode as "parallel" | "workflow",
-    agents,
-    cwd: event.cwd,
-    asyncDir: event.asyncDir,
-  };
+  return Boolean(serialized && /runs\.all/i.test(serialized) && /review/i.test(serialized) &&
+    /standards/i.test(serialized) && /(?:\bspec\b|requirements?)/i.test(serialized));
 }
 
 function isAsyncLaunchLike(value: unknown): boolean {
@@ -728,22 +716,29 @@ function isAsyncLaunchLike(value: unknown): boolean {
   return Boolean(details && typeof details.runId === "string" && Array.isArray(details.results) && details.results.length === 0);
 }
 
-function parseAsyncLaunchResult(value: unknown): { runId: string; mode: string; asyncDir: string } | undefined {
+function parseAsyncLaunchResult(value: unknown): { runId: string; toolCallId: string; mode: "workflow"; asyncDir: string } | undefined {
   const details = objectRecord(objectRecord(value)?.details);
-  if (!details || typeof details.runId !== "string" || eventIdentity({ id: details.runId }) !== details.runId ||
-    typeof details.mode !== "string" || typeof details.asyncDir !== "string" || !isAbsolute(details.asyncDir)
+  if (!details || details.mode !== "workflow" || typeof details.runId !== "string" ||
+    eventIdentity({ id: details.runId }) !== details.runId || details.asyncId !== details.runId ||
+    typeof details.toolCallId !== "string" || typeof details.asyncDir !== "string" ||
+    !isAbsolute(details.asyncDir) || !Array.isArray(details.results) || details.results.length !== 0
   ) return undefined;
-  return { runId: details.runId, mode: details.mode, asyncDir: details.asyncDir };
+  return { runId: details.runId, toolCallId: details.toolCallId, mode: "workflow", asyncDir: details.asyncDir };
 }
 
-function isBoundAsyncReviewLaunch(
+async function isBoundAsyncReviewLaunch(
   pending: PendingSubagentLaunch,
-  started: AsyncStartObservation,
-  result: { runId: string; mode: string; asyncDir: string },
-): boolean {
-  return looksLikeReviewRequest(pending.args) && result.runId === started.runId &&
-    result.mode === started.mode && result.asyncDir === started.asyncDir &&
-    pending.cwd === started.cwd && pending.sourceSessionIdentities.has(started.sessionId);
+  result: { runId: string; toolCallId: string; mode: "workflow"; asyncDir: string },
+): Promise<boolean> {
+  if (!looksLikeReviewRequest(pending.args) || result.toolCallId !== pending.toolCallId) return false;
+  const expected = join(piSubagentsTempRoot(), "async-subagent-runs", result.runId);
+  if (resolve(result.asyncDir) !== expected) return false;
+  try {
+    await assertCanonicalDirectory(result.asyncDir, join(piSubagentsTempRoot(), "async-subagent-runs"));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function retainAsyncNativeReview(
@@ -753,56 +748,129 @@ async function retainAsyncNativeReview(
   value: unknown,
 ): Promise<void> {
   const completion = objectRecord(value);
-  if (!completion || completion.lifecycleArtifactVersion !== 3 || completion.id !== launch.runId ||
-    completion.runId !== launch.runId || completion.mode !== launch.start.mode || completion.success !== true ||
-    completion.state !== "complete" || completion.exitCode !== 0 || completion.cwd !== launch.cwd ||
-    completion.asyncDir !== launch.start.asyncDir || completion.sessionId !== launch.start.sessionId ||
-    completion.completionOwnerId !== launch.start.completionOwnerId || !Number.isFinite(completion.timestamp) ||
-    Number(completion.timestamp) < launch.launchedAt || !Array.isArray(completion.results) ||
-    completion.results.length !== launch.start.agents.length
+  const timestamp = Number(completion?.timestamp);
+  if (!completion || completion.id !== launch.runId || completion.runId !== launch.runId ||
+    completion.toolCallId !== launch.toolCallId || completion.mode !== "workflow" || completion.success !== true ||
+    completion.state !== "complete" || completion.cwd !== launch.cwd || completion.asyncDir !== launch.asyncDir ||
+    !launch.sourceSessionIdentities.has(String(completion.sessionId)) ||
+    typeof completion.completionOwnerId !== "string" || !completion.completionOwnerId ||
+    !Number.isFinite(timestamp) || timestamp < launch.launchedAt || timestamp > Date.now() + 60_000 ||
+    !Array.isArray(completion.results) ||
+    completion.results.length !== 2
   ) throw new Error("Asynchronous native review completion was stale, unrelated, or incomplete");
   if (await captureCodeStateDigest(launch.cwd) !== launch.codeStateDigest) {
     throw new Error("Asynchronous native review did not complete on its launch code state");
   }
+
+  const statusPath = join(launch.asyncDir, "status.json");
+  const receiptPath = join(launch.asyncDir, "workflow-receipt.json");
+  const statusFile = await readCanonicalBoundedFile(statusPath, [launch.asyncDir], 2 * 1024 * 1024);
+  const receiptFile = await readCanonicalBoundedFile(receiptPath, [launch.asyncDir], 2 * 1024 * 1024);
+  const status = parseJsonRecord(statusFile);
+  const receipt = parseJsonRecord(receiptFile);
+  const completionReceipt = objectRecord(completion.workflowReceipt);
+  const workflowChildren = objectRecord(completion.workflowChildren);
+  if (!status || !receipt || status.runId !== launch.runId || status.toolCallId !== launch.toolCallId ||
+    status.mode !== "workflow" || status.state !== "complete" || status.cwd !== launch.cwd ||
+    status.sessionId !== completion.sessionId || status.completionOwnerId !== completion.completionOwnerId ||
+    status.workflowReceiptPath !== receiptPath || !Number.isFinite(status.endedAt) ||
+    Number(status.endedAt) < launch.launchedAt || Number(status.endedAt) > timestamp ||
+    receipt.version !== 1 || receipt.workflowRunId !== launch.runId || receipt.state !== "complete" ||
+    !Number.isFinite(receipt.createdAt) || Number(receipt.createdAt) < launch.launchedAt || Number(receipt.createdAt) > timestamp ||
+    completionReceipt?.path !== receiptPath || stableJson(completionReceipt.receipt) !== stableJson(receipt) ||
+    stableJson(status.workflowChildren) !== stableJson(workflowChildren) ||
+    stableJson(receipt.workflowChildren) !== stableJson(workflowChildren) ||
+    !isCompleteWorkflowChildren(workflowChildren, launch)
+  ) throw new Error("Asynchronous native review status or workflow receipt was stale or incomplete");
+
+  const entries = objectRecord(receipt.entries);
+  const steps = Array.isArray(status.steps) ? status.steps.map(objectRecord) : [];
+  if (!entries || Object.keys(entries).length !== 2 || steps.length !== 2 || steps.some((step) => !step)) {
+    throw new Error("Asynchronous native review child inventory was incomplete");
+  }
+  const results = new Map<string, Record<string, unknown>>();
+  for (const resultValue of completion.results) {
+    const result = objectRecord(resultValue);
+    if (!result || typeof result.workflowKey !== "string" || results.has(result.workflowKey)) {
+      throw new Error("Asynchronous native review result identities were incomplete");
+    }
+    results.set(result.workflowKey, result);
+  }
+
+  if (!launch.sourceSessionFile) throw new Error("Asynchronous native review source session root was unavailable");
+  const sessionRoot = join(dirname(launch.sourceSessionFile), basename(launch.sourceSessionFile, ".jsonl"));
+  const outputRoots = [
+    launch.asyncDir,
+    join(dirname(launch.sourceSessionFile), "subagent-artifacts"),
+    join(launch.cwd, ".pi", "subagents", "artifacts"),
+    join(piSubagentsTempRoot(), "artifacts"),
+  ];
   const reviewerSessions = new Set<string>();
+  const roles = new Set<"standards" | "spec">();
   const reviewArtifacts: Array<{
+    role: "standards" | "spec";
+    workflowKey: string;
     reviewerSession: string;
     reference: string;
     digest: string;
-    launchContractDigest: string;
     verdict: "OK" | "OK with notes";
     report: string;
   }> = [];
-  for (let index = 0; index < completion.results.length; index += 1) {
-    const result = objectRecord(completion.results[index]);
+  for (const stepValue of steps) {
+    const step = stepValue!;
+    const key = typeof step.workflowKey === "string" ? step.workflowKey : "";
+    const entry = objectRecord(entries[key]);
+    const result = results.get(key);
     const artifactPaths = objectRecord(result?.artifactPaths);
-    if (!result || result.agent !== launch.start.agents[index] || result.context !== "fresh" ||
-      result.success !== true || result.status !== "completed" || result.outputState !== "present" ||
-      result.index !== index || typeof result.sessionFile !== "string" || !isAbsolute(result.sessionFile) ||
-      reviewerSessions.has(result.sessionFile) || consumedReviewerSessions.has(result.sessionFile) ||
-      result.sessionFile === launch.start.sessionId ||
-      typeof result.launchContractDigest !== "string" || !/^[a-f0-9]{64}$/i.test(result.launchContractDigest) ||
-      typeof artifactPaths?.outputPath !== "string" || !isAbsolute(artifactPaths.outputPath)
-    ) throw new Error("Asynchronous native review child identity or artifact was incomplete");
-    await assertRegularFile(result.sessionFile);
-    const report = await readBoundedRegularFile(artifactPaths.outputPath);
+    const continuation = objectRecord(entry?.continuation);
+    const runIds = Array.isArray(continuation?.runIds) ? continuation.runIds : [];
+    const childRunId = runIds.at(-1);
+    const role = reviewRole(`${key} ${String(step.label ?? "")}`);
+    const workflowChild = (workflowChildren!.children as unknown[]).map(objectRecord)
+      .find((child): boolean => child?.childId === key);
+    if (!entry || !result || !workflowChild || !role || roles.has(role) || entry.key !== key || entry.agent !== "reviewer" ||
+      entry.requestedContext !== "fresh" || entry.resolvedContext !== "fresh" ||
+      step.agent !== "reviewer" || step.status !== "completed" || step.parentWorkflowRunId !== launch.runId ||
+      typeof childRunId !== "string" || !childRunId || step.runId !== childRunId || result.runId !== childRunId ||
+      workflowChild.runId !== childRunId || workflowChild.agent !== "reviewer" || workflowChild.state !== "completed" ||
+      (entry.latestRunId !== undefined && entry.latestRunId !== childRunId) ||
+      result.agent !== "reviewer" || result.success !== true || result.status !== "completed" ||
+      result.outputState !== "present" || typeof step.sessionFile !== "string" || result.sessionFile !== step.sessionFile ||
+      typeof entry.outputReference !== "string" || result.outputReference !== entry.outputReference ||
+      artifactPaths?.outputPath !== entry.outputReference
+    ) throw new Error("Asynchronous native review child identity, role, freshness, or artifact binding was incomplete");
+
+    const canonicalSession = await assertCanonicalRegularFile(step.sessionFile, [sessionRoot]);
+    if (reviewerSessions.has(canonicalSession) || consumedReviewerSessions.has(canonicalSession)) {
+      throw new Error("Asynchronous native review reused a reviewer session");
+    }
+    const { canonicalPath: reportPath, content: report } = await readCanonicalBoundedFile(
+      entry.outputReference,
+      outputRoots,
+      256 * 1024,
+    );
     const verdicts = [...report.matchAll(/^Merge verdict:\s*(BLOCK|OK with notes|OK)\s*\.?\s*$/gim)];
     if (verdicts.length !== 1 || verdicts[0]![1]!.toUpperCase() === "BLOCK") {
       throw new Error("Asynchronous native review reported a blocker or omitted its merge verdict");
     }
-    reviewerSessions.add(result.sessionFile);
-    consumedReviewerSessions.add(result.sessionFile);
-    const verdict = /^OK with notes$/i.test(verdicts[0]![1]!) ? "OK with notes" : "OK";
+    reviewerSessions.add(canonicalSession);
+    consumedReviewerSessions.add(canonicalSession);
+    roles.add(role);
     reviewArtifacts.push({
-      reviewerSession: result.sessionFile,
-      reference: artifactPaths.outputPath,
+      role,
+      workflowKey: key,
+      reviewerSession: canonicalSession,
+      reference: reportPath,
       digest: createHash("sha256").update(report).digest("hex"),
-      launchContractDigest: result.launchContractDigest,
-      verdict,
+      verdict: /^OK with notes$/i.test(verdicts[0]![1]!) ? "OK with notes" : "OK",
       report,
     });
   }
-  const completedAt = new Date(Number(completion.timestamp)).toISOString();
+  if (roles.size !== 2 || !roles.has("standards") || !roles.has("spec")) {
+    throw new Error("Asynchronous native review did not prove distinct Standards and Spec reviewers");
+  }
+
+  const completedAt = new Date(timestamp).toISOString();
   const endpoint = process.env[WORKER_BRIDGE_ENDPOINT_ENV];
   if (!endpoint || !isAbsolute(endpoint)) throw new Error("Attempt-bound worker bridge endpoint is unavailable");
   const evidenceDirectory = join(dirname(endpoint), "native-evidence");
@@ -817,6 +885,7 @@ async function retainAsyncNativeReview(
     codeStateDigest: launch.codeStateDigest,
     completedAt,
     executionReferences: [executionReference],
+    workflowReceipt: { reference: receiptPath, digest: createHash("sha256").update(receiptFile.content).digest("hex") },
     reviewArtifacts,
   })}\n`;
   await atomicWritePrivateFile(sourcePath, source);
@@ -829,14 +898,129 @@ async function retainAsyncNativeReview(
   });
 }
 
-async function assertRegularFile(path: string): Promise<void> {
-  const file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+function isCompleteWorkflowChildren(value: Record<string, unknown> | undefined, launch: AsyncReviewLaunch): boolean {
+  if (!value || value.version !== 1 || value.parentToolCallId !== launch.toolCallId ||
+    value.workflowRunId !== launch.runId || value.inventoryComplete !== true ||
+    value.workflowState !== "completed" || !Array.isArray(value.children) || value.children.length !== 2
+  ) return false;
+  const ids = new Set<string>();
+  return value.children.every((childValue): boolean => {
+    const child = objectRecord(childValue);
+    if (!child || typeof child.childId !== "string" || ids.has(child.childId) || child.state !== "completed") return false;
+    ids.add(child.childId);
+    return typeof child.runId === "string" && Boolean(child.runId) && child.agent === "reviewer";
+  });
+}
+
+function reviewRole(value: string): "standards" | "spec" | undefined {
+  const standards = /\bstandards?\b/i.test(value);
+  const spec = /\b(?:spec|specification|requirements?)\b/i.test(value);
+  return standards === spec ? undefined : standards ? "standards" : "spec";
+}
+
+function parseJsonRecord(input: { content: string }): Record<string, unknown> | undefined {
   try {
-    const metadata = await file.stat();
-    if (!metadata.isFile() || metadata.size <= 0) throw new Error("Reviewer session identity is not a regular file");
+    return objectRecord(JSON.parse(input.content));
+  } catch {
+    return undefined;
+  }
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key): string => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function piSubagentsTempRoot(): string {
+  const configured = process.env.PI_SUBAGENTS_TEMP_ROOT?.trim();
+  if (configured) return resolve(configured);
+  if (typeof process.getuid === "function") return join(tmpdir(), `pi-subagents-uid-${process.getuid()}`);
+  for (const key of ["USERNAME", "USER", "LOGNAME"] as const) {
+    if (process.env[key]) return join(tmpdir(), `pi-subagents-user-${sanitizeScope(process.env[key]!)}`);
+  }
+  try {
+    if (userInfo().username) return join(tmpdir(), `pi-subagents-user-${sanitizeScope(userInfo().username)}`);
+  } catch {
+    // Continue to the same home-directory fallbacks used by pi-subagents.
+  }
+  const home = process.env.USERPROFILE ?? process.env.HOME ?? homedir();
+  return join(tmpdir(), `pi-subagents-home-${sanitizeScope(home)}`);
+}
+
+function sanitizeScope(value: string): string {
+  return value.trim().replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "unknown";
+}
+
+function isContained(root: string, candidate: string): boolean {
+  const pathFromRoot = relative(root, candidate);
+  return pathFromRoot === "" || (!pathFromRoot.startsWith("..") && !isAbsolute(pathFromRoot));
+}
+
+async function assertCanonicalDirectory(path: string, trustedRoot: string): Promise<string> {
+  if (!isAbsolute(path)) throw new Error("Installed extension path was not absolute");
+  const [canonicalRoot, canonicalPath] = await Promise.all([realpath(trustedRoot), realpath(path)]);
+  if (canonicalPath !== resolve(path) || !isContained(canonicalRoot, canonicalPath)) {
+    throw new Error("Installed extension path escaped its canonical root");
+  }
+  const file = await open(canonicalPath, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+  try {
+    if (!(await file.stat()).isDirectory()) throw new Error("Installed extension path was not a directory");
   } finally {
     await file.close();
   }
+  return canonicalPath;
+}
+
+async function assertCanonicalRegularFile(path: string, trustedRoots: string[]): Promise<string> {
+  const result = await readCanonicalBoundedFile(path, trustedRoots, 16 * 1024 * 1024, false);
+  return result.canonicalPath;
+}
+
+async function readCanonicalBoundedFile(
+  path: string,
+  trustedRoots: string[],
+  maximumBytes: number,
+  readContent = true,
+): Promise<{ canonicalPath: string; content: string }> {
+  if (!isAbsolute(path)) throw new Error("Artifact path was not absolute");
+  const file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+  try {
+    const metadata = await file.stat();
+    if (!metadata.isFile() || metadata.size <= 0 || metadata.size > maximumBytes) {
+      throw new Error("Artifact was not a bounded regular file");
+    }
+    const canonicalRoots = await Promise.all(trustedRoots.map(async (root): Promise<string | undefined> => {
+      try { return await realpath(root); } catch { return undefined; }
+    }));
+    const canonicalPath = await realpath(path);
+    if (canonicalPath !== resolve(path) || !canonicalRoots.some((root): boolean => Boolean(root && isContained(root, canonicalPath)))) {
+      throw new Error("Artifact path escaped its canonical trusted roots");
+    }
+    const canonicalFile = await open(canonicalPath, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+    try {
+      const canonicalMetadata = await canonicalFile.stat();
+      if (canonicalMetadata.dev !== metadata.dev || canonicalMetadata.ino !== metadata.ino) {
+        throw new Error("Artifact path changed during canonical validation");
+      }
+    } finally {
+      await canonicalFile.close();
+    }
+    if (!readContent) return { canonicalPath, content: "" };
+    const data = Buffer.alloc(metadata.size + 1);
+    const { bytesRead } = await file.read(data, 0, data.length, 0);
+    if (bytesRead !== metadata.size) throw new Error("Artifact changed while it was read");
+    return { canonicalPath, content: data.subarray(0, bytesRead).toString("utf8") };
+  } finally {
+    await file.close();
+  }
+}
+
+function boundedDiagnostic(value: string): string {
+  return value.replace(/[\r\n:]+/g, " ").slice(0, 500) || "unknown asynchronous evidence failure";
 }
 
 function classifyNativeReviewResult(result: unknown): "passed" | "blocked" | "unrelated" {

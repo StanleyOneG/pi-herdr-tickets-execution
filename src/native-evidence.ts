@@ -89,26 +89,34 @@ function isProducerReceipt(
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const receipt = value as Record<string, unknown>;
   const hasReviewArtifacts = Object.hasOwn(receipt, "reviewArtifacts");
+  const hasWorkflowReceipt = Object.hasOwn(receipt, "workflowReceipt");
   const reviewArtifactsValid = !hasReviewArtifacts || (receipt.kind === "reviews" &&
-    Array.isArray(receipt.reviewArtifacts) && receipt.reviewArtifacts.length >= 2 && receipt.reviewArtifacts.length <= 8 &&
-    receipt.reviewArtifacts.every(isRetainedReviewArtifact));
-  return Object.keys(receipt).length === (hasReviewArtifacts ? 8 : 7) &&
-    receipt.schemaVersion === 1 && receipt.producer === "pi-native-skill" &&
+    Array.isArray(receipt.reviewArtifacts) && receipt.reviewArtifacts.length === 2 &&
+    receipt.reviewArtifacts.every(isRetainedReviewArtifact) &&
+    new Set(receipt.reviewArtifacts.map((artifact): unknown => (artifact as Record<string, unknown>).role)).size === 2 &&
+    new Set(receipt.reviewArtifacts.map((artifact): unknown => (artifact as Record<string, unknown>).workflowKey)).size === 2);
+  const workflowReceipt = receipt.workflowReceipt as Record<string, unknown> | undefined;
+  const workflowReceiptValid = !hasWorkflowReceipt || (receipt.kind === "reviews" && workflowReceipt !== undefined &&
+    !Array.isArray(workflowReceipt) && Object.keys(workflowReceipt).length === 2 &&
+    typeof workflowReceipt.reference === "string" && isAbsolute(workflowReceipt.reference) && workflowReceipt.reference.length <= 4_096 &&
+    typeof workflowReceipt.digest === "string" && /^[a-f0-9]{64}$/i.test(workflowReceipt.digest));
+  return Object.keys(receipt).length === 7 + Number(hasReviewArtifacts) + Number(hasWorkflowReceipt) &&
+    hasReviewArtifacts === hasWorkflowReceipt && receipt.schemaVersion === 1 && receipt.producer === "pi-native-skill" &&
     receipt.kind === manifest.kind && receipt.status === manifest.status && receipt.codeStateDigest === manifest.codeStateDigest &&
     receipt.completedAt === manifest.completedAt && Array.isArray(receipt.executionReferences) &&
     receipt.executionReferences.length > 0 && receipt.executionReferences.length <= 20 &&
     receipt.executionReferences.every((reference): boolean => typeof reference === "string" &&
-      reference.trim().length > 0 && reference.length <= 4_096) && reviewArtifactsValid;
+      reference.trim().length > 0 && reference.length <= 4_096) && reviewArtifactsValid && workflowReceiptValid;
 }
 
 function isRetainedReviewArtifact(value: unknown): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const artifact = value as Record<string, unknown>;
-  return Object.keys(artifact).length === 6 && typeof artifact.reviewerSession === "string" &&
-    isAbsolute(artifact.reviewerSession) && artifact.reviewerSession.length <= 4_096 &&
+  return Object.keys(artifact).length === 7 && (artifact.role === "standards" || artifact.role === "spec") &&
+    typeof artifact.workflowKey === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(artifact.workflowKey) &&
+    typeof artifact.reviewerSession === "string" && isAbsolute(artifact.reviewerSession) && artifact.reviewerSession.length <= 4_096 &&
     typeof artifact.reference === "string" && isAbsolute(artifact.reference) && artifact.reference.length <= 4_096 &&
     typeof artifact.digest === "string" && /^[a-f0-9]{64}$/i.test(artifact.digest) &&
-    typeof artifact.launchContractDigest === "string" && /^[a-f0-9]{64}$/i.test(artifact.launchContractDigest) &&
     (artifact.verdict === "OK" || artifact.verdict === "OK with notes") &&
     typeof artifact.report === "string" && artifact.report.length > 0 &&
     createHash("sha256").update(artifact.report).digest("hex") === artifact.digest;
