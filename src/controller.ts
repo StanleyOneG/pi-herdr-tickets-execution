@@ -1036,6 +1036,9 @@ export class PreparationController {
     if (attempt.lifecycle !== "paused" && attempt.lifecycle !== "restart-required") {
       return failure("execution-conflict", [`Attempt cannot be resumed from ${attempt.lifecycle}`]);
     }
+    if (attempt.lifecycle === "restart-required" && attempt.suspendedFrom === "starting") {
+      return failure("execution-conflict", ["Starting worker or dispatch state cannot be inferred after restart; exact worker reconciliation is required and its concurrency slot remains occupied"]);
+    }
     if (!attempt.worker) return this.attention(state, attempt, "Restarted attempt requires later recovery because no worker identity was durably established");
     if (attempt.lifecycle === "restart-required" && attempt.suspendedFrom === undefined) {
       return this.attention(state, attempt, "Implementation dispatch state is ambiguous after controller restart; later recovery is required");
@@ -1234,7 +1237,7 @@ export class PreparationController {
         attempt.suspendedFrom = attempt.lifecycle;
         attempt.lifecycle = "restart-required";
       } else if (attempt.lifecycle !== "paused" && attempt.lifecycle !== "takeover") {
-        if (attempt.lifecycle === "running" || attempt.lifecycle === "pending-decision" || attempt.lifecycle === "accepting") {
+        if (attempt.lifecycle === "starting" || attempt.lifecycle === "running" || attempt.lifecycle === "pending-decision" || attempt.lifecycle === "accepting") {
           attempt.suspendedFrom = attempt.lifecycle;
         }
         attempt.lifecycle = "restart-required";

@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { createConnection } from "node:net";
 import test, { afterEach } from "node:test";
+
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import {
   PreparationController,
@@ -44,6 +46,7 @@ import type {
 import { formatPreparationPreview } from "../src/presentation.js";
 import { LocalSetupRuntime } from "../src/setup-runtime.js";
 import { JsonControllerStateStore } from "../src/state-store.js";
+import herdrWorkerBridge from "../src/worker-bridge.js";
 
 interface TestRepository { root: string; statePath: string; head: string }
 
@@ -184,7 +187,7 @@ class ControlledWorker implements WorkerRuntimePort {
       initialHistoryEntries: 0,
       skillCommands: ["skill:implement", "skill:tdd", "skill:code-review", "skill:handoff"]
         .filter((skill): boolean => skill !== this.missingSkill),
-      toolNames: ["read", "bash", "edit", "write"],
+      toolNames: ["read", "bash", "edit", "write", "subagent"],
       contextFiles: [join(input.cwd, "AGENTS.md")],
     };
     return this.mutateIdentity?.(identity) ?? identity;
@@ -638,10 +641,25 @@ test("dashboard disappearance is inert while explicit controller restart blocks 
   assert.equal(value(await restartedWhilePaused.resumeAttempt(actor, { attemptId: running.attempt.id })).lifecycle, "running");
 });
 
-test("restart cannot infer that an unacknowledged implementation dispatch occurred", async (): Promise<void> => {
+test("restart preserves an unacknowledged starting attempt's concurrency slot until exact reconciliation", async (): Promise<void> => {
   const repo = await repository();
   const worker = new ControlledWorker();
-  const running = await start(repo, worker);
+  const instance = controller(repo, worker);
+  const batch = proposal(repo);
+  batch.sourceEvidence.push(evidence("ticket-5"));
+  batch.tickets.push({ identity: "ticket-5", title: "Next ticket", evidenceIdentity: "ticket-5", claimedBy: null });
+  const prepared = value(await instance.prepare(actor, { specReference: "spec-2", controllerName: "starting restart" }, admission(repo)));
+  const proposed = value(await instance.submitProposal(actor, prepared.id, batch));
+  value(await instance.approve(actor, prepared.id, {
+    approvedBy: "developer",
+    proposalDigest: proposed.proposalDigest!,
+    projectHead: repo.head,
+    model: batch.model,
+    evidence: batch.sourceEvidence.map((item): SourceEvidence => ({ ...item, retrievedAt: "2026-09-12T13:00:00.000Z" })),
+  }));
+  const running = value(await instance.startTicket(actor, {
+    preparationId: prepared.id, ticketIdentity: "ticket-4", workspaceId: "workspace-1",
+  }));
   const interrupted = JSON.parse(await readFile(repo.statePath, "utf8")) as ControllerState;
   interrupted.executionAttempts[0]!.lifecycle = "starting";
   interrupted.executionAttempts[0]!.artifactReferences = [];
@@ -650,10 +668,19 @@ test("restart cannot infer that an unacknowledged implementation dispatch occurr
   const replacement = controller(repo, worker, "controller-2", []);
   const restarted = value(await replacement.controllerRestarted(actor));
   assert.equal(restarted[0]?.lifecycle, "restart-required");
+  assert.equal(restarted[0]?.suspendedFrom, "starting");
 
-  const resumed = value(await replacement.resumeAttempt(actor, { attemptId: running.attempt.id }));
-  assert.equal(resumed.lifecycle, "needs-attention");
-  assert.match(resumed.diagnostics[0]!, /dispatch.*ambiguous/i);
+  const competing = await replacement.startTicket(actor, {
+    preparationId: prepared.id, ticketIdentity: "ticket-5", workspaceId: "workspace-1",
+  });
+  assert.equal(competing.ok, false);
+  if (!competing.ok) assert.match(competing.error.diagnostics.join("\n"), /concurrency limit/);
+
+  const resumed = await replacement.resumeAttempt(actor, { attemptId: running.id });
+  assert.equal(resumed.ok, false);
+  const retained = value(await replacement.status(actor, { limit: 10 })).executionAttempts[0]!;
+  assert.equal(retained.lifecycle, "restart-required");
+  assert.equal(retained.suspendedFrom, "starting");
   assert.equal(worker.dispatches, 1);
 });
 
@@ -881,6 +908,8 @@ class ControlledBridge implements WorkerBridgeTransport {
   reviewReceiptFactory: (() => WorkerReviewReceipt) | undefined;
   nativeVerificationReceiptFactory: (() => WorkerNativeVerificationReceipt) | undefined;
   lifecycleOutstandingJobs: string[] = [];
+  livePiPid = 4242;
+  lifecycleChallenges = 0;
 
   async openChannel(): Promise<WorkerBridgeChannel> {
     return this.channel;
@@ -906,10 +935,16 @@ class ControlledBridge implements WorkerBridgeTransport {
       schemaVersion: 1,
       nonce: this.channel.nonce,
       sessionId: "session-1",
+      piPid: this.livePiPid,
       state: "settled",
       observedAt: "2026-09-12T15:00:01.000Z",
       outstandingJobs: [...this.lifecycleOutstandingJobs],
     };
+  }
+
+  async challengeLifecycle(_channel: WorkerBridgeChannel, expectedPiPid: number): Promise<void> {
+    this.lifecycleChallenges += 1;
+    if (this.livePiPid !== expectedPiPid) throw new Error("live Pi process changed");
   }
 
   async channelForAgent(): Promise<WorkerBridgeChannel> {
@@ -988,7 +1023,7 @@ function readinessReceipt(cwd: string, agentName: string): WorkerReadinessReceip
       source: "skill",
       sourceInfo: { path: `/skills/${name}/SKILL.md`, source: "skills", scope: "user", origin: "top-level" },
     })),
-    toolNames: ["read", "bash", "edit", "write"],
+    toolNames: ["read", "bash", "edit", "write", "subagent"],
     contextFiles: [join(cwd, "AGENTS.md")],
   };
 }
@@ -1435,6 +1470,24 @@ test("daemon process restart is nonexecuting until an explicit remote resume", a
   }
 });
 
+test("file worker bridge rejects a FIFO receipt without waiting for a writer", async (): Promise<void> => {
+  const repo = await repository();
+  const bridge = new FileWorkerBridgeTransport(join(repo.root, ".git", "herdr", "bounded-worker-bridge"), {
+    generateNonce: (): string => "bounded-nonce",
+  });
+  const channel = await bridge.openChannel("bounded-worker");
+  execFileSync("mkfifo", [channel.endpoint]);
+  const writer = spawn("sh", ["-c", "sleep 0.5; printf x > \"$1\"", "sh", channel.endpoint]);
+  const startedAt = Date.now();
+  await assert.rejects(bridge.waitForReadiness(channel, 2_000));
+  assert.ok(Date.now() - startedAt < 250);
+  if (writer.exitCode === null) writer.kill("SIGKILL");
+  await new Promise<void>((resolvePromise): void => {
+    if (writer.exitCode !== null) resolvePromise();
+    else writer.once("close", (): void => resolvePromise());
+  });
+});
+
 test("daemon routes a worker decision and stops on an execution-time checkout mutation", async (): Promise<void> => {
   const repo = await repository();
   const worker = new ControlledWorker();
@@ -1503,6 +1556,127 @@ test("daemon routes a worker decision and stops on an execution-time checkout mu
   }
 });
 
+test("ordinary implementation tool events produce candidate-bound native test and review receipts", async (): Promise<void> => {
+  const repo = await repository();
+  const bridgeDirectory = join(repo.root, ".git", "herdr", "native-producer");
+  await mkdir(bridgeDirectory, { recursive: true });
+  const previousEndpoint = process.env.HERDR_WORKER_BRIDGE_ENDPOINT;
+  const previousNonce = process.env.HERDR_WORKER_BRIDGE_NONCE;
+  process.env.HERDR_WORKER_BRIDGE_ENDPOINT = join(bridgeDirectory, "readiness.json");
+  process.env.HERDR_WORKER_BRIDGE_NONCE = "native-producer-nonce";
+  const hostHandlers = new Map<string, (event: any, ctx: any) => unknown>();
+  const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
+  const fakePi = {
+    events: { on: (): (() => void) => (): void => {}, emit: (): void => {} },
+    on(name: string, handler: (event: any, ctx: any) => unknown): void { hostHandlers.set(name, handler); },
+    registerCommand(): void {},
+    registerTool(tool: { name: string; execute: (...args: any[]) => Promise<any> }): void { tools.set(tool.name, tool); },
+    getAllTools: (): Array<{ name: string }> => [{ name: "subagent" }],
+  } as unknown as ExtensionAPI;
+  const context = { cwd: repo.root, sessionManager: { getSessionId: (): string => "native-session" } };
+  try {
+    herdrWorkerBridge(fakePi);
+    assert.ok(tools.has("herdr_capture_native_evidence"));
+    await hostHandlers.get("tool_execution_start")!({ toolCallId: "test-call", toolName: "bash", args: { command: "npm test" } }, context);
+    await hostHandlers.get("tool_execution_end")!({ toolCallId: "test-call", toolName: "bash", isError: false, result: {} }, context);
+    await hostHandlers.get("tool_execution_start")!({ toolCallId: "review-call", toolName: "subagent", args: { task: "Review the implementation" } }, context);
+    await hostHandlers.get("tool_execution_end")!({
+      toolCallId: "review-call",
+      toolName: "subagent",
+      isError: false,
+      result: { details: { runId: "review-run", results: [{
+        agent: "reviewer", task: "Review the implementation", exitCode: 0,
+        structuredAcceptanceReport: {
+          criteriaSatisfied: [{ id: "review", status: "satisfied", evidence: "No blocking findings" }],
+          reviewFindings: ["no blockers"], residualRisks: ["none"],
+        },
+      }] } },
+    }, context);
+    const exported = await tools.get("herdr_capture_native_evidence")!.execute("capture-call", {}, undefined, undefined, context);
+    const records = exported.details.nativeEvidence as import("../src/contracts.js").NativeEvidenceRecord[];
+    assert.deepEqual(records.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+    const candidate = await new RealGitWorktreeAdapter().captureCandidate({ path: repo.root, sourceBase: repo.head });
+    const nativeEvidenceModule = await import("../src/native-evidence.js");
+    const indexed = await nativeEvidenceModule.readProducedNativeEvidence(
+      join(bridgeDirectory, "native-evidence", "latest.json"),
+      { sessionId: "native-session", codeStateDigest: candidate.codeStateDigest },
+    );
+    assert.deepEqual(indexed, records);
+    for (const record of records) {
+      await new nativeEvidenceModule.FileNativeEvidenceAdapter().verify({ record, candidate });
+    }
+  } finally {
+    if (previousEndpoint === undefined) delete process.env.HERDR_WORKER_BRIDGE_ENDPOINT;
+    else process.env.HERDR_WORKER_BRIDGE_ENDPOINT = previousEndpoint;
+    if (previousNonce === undefined) delete process.env.HERDR_WORKER_BRIDGE_NONCE;
+    else process.env.HERDR_WORKER_BRIDGE_NONCE = previousNonce;
+  }
+});
+
+test("worker bridge reports ordinary asynchronous subagent and provider work from the supported status protocol", async (): Promise<void> => {
+  const repo = await repository();
+  const bridgeDirectory = join(repo.root, ".git", "herdr", "worker-observation");
+  await mkdir(bridgeDirectory, { recursive: true });
+  const endpoint = join(bridgeDirectory, "readiness.json");
+  const previousEndpoint = process.env.HERDR_WORKER_BRIDGE_ENDPOINT;
+  const previousNonce = process.env.HERDR_WORKER_BRIDGE_NONCE;
+  process.env.HERDR_WORKER_BRIDGE_ENDPOINT = endpoint;
+  process.env.HERDR_WORKER_BRIDGE_NONCE = "observation-nonce";
+  const hostHandlers = new Map<string, (event: any, ctx: any) => unknown>();
+  const eventHandlers = new Map<string, Array<(payload: unknown) => void>>();
+  const events = {
+    on(name: string, handler: (payload: unknown) => void): () => void {
+      const handlers = eventHandlers.get(name) ?? [];
+      handlers.push(handler);
+      eventHandlers.set(name, handlers);
+      return (): void => { eventHandlers.set(name, (eventHandlers.get(name) ?? []).filter((item): boolean => item !== handler)); };
+    },
+    emit(name: string, payload: unknown): void {
+      if (name === "subagents:rpc:v1:request") {
+        const request = payload as { requestId: string };
+        this.emit(`subagents:rpc:v1:reply:${request.requestId}`, {
+          version: 1,
+          requestId: request.requestId,
+          success: true,
+          data: {
+            asyncSnapshot: {
+              kind: "pi-subagents.async-status-snapshot",
+              version: 1,
+              omitted: { runs: 0, children: 0, byteLimitExceeded: false },
+              runs: [{ id: "provider-review-1", kind: "external-job", label: "provider review", state: "running" }],
+            },
+          },
+        });
+        return;
+      }
+      for (const handler of eventHandlers.get(name) ?? []) handler(payload);
+    },
+  };
+  const fakePi = {
+    events,
+    on(name: string, handler: (event: any, ctx: any) => unknown): void { hostHandlers.set(name, handler); },
+    registerCommand(): void {},
+    registerTool(): void {},
+    getAllTools: (): Array<{ name: string }> => [{ name: "subagent" }],
+  } as unknown as ExtensionAPI;
+  const context = {
+    sessionManager: { getSessionId: (): string => "worker-session" },
+    hasPendingMessages: (): boolean => false,
+  };
+  try {
+    herdrWorkerBridge(fakePi);
+    await hostHandlers.get("agent_settled")!({}, context);
+    const lifecycle = JSON.parse(await readFile(join(bridgeDirectory, "lifecycle.json"), "utf8")) as WorkerLifecycleReceipt;
+    assert.equal(lifecycle.piPid, process.pid);
+    assert.deepEqual(lifecycle.outstandingJobs, ["pi-subagent:provider-review-1"]);
+  } finally {
+    if (previousEndpoint === undefined) delete process.env.HERDR_WORKER_BRIDGE_ENDPOINT;
+    else process.env.HERDR_WORKER_BRIDGE_ENDPOINT = previousEndpoint;
+    if (previousNonce === undefined) delete process.env.HERDR_WORKER_BRIDGE_NONCE;
+    else process.env.HERDR_WORKER_BRIDGE_NONCE = previousNonce;
+  }
+});
+
 test("production Herdr runtime starts only after shell and fresh Pi resource proofs", async (): Promise<void> => {
   const repo = await repository();
   const executor = new ControlledHerdr();
@@ -1533,6 +1707,20 @@ test("production Herdr runtime starts only after shell and fresh Pi resource pro
   assert.equal(prompts[0]?.args[3], "/herdr-worker-ready");
   assert.equal(prompts[1]?.args[3], "/skill:implement ticket-4");
   assert.equal(prompts[1]?.args.includes("--wait"), false);
+});
+
+test("production Herdr runtime rejects a resumed replacement Pi process without the owned live bridge", async (): Promise<void> => {
+  const repo = await repository();
+  const executor = new ControlledHerdr();
+  const bridge = new ControlledBridge();
+  const runtime = herdrRuntime(executor, bridge);
+  bridge.receiptFactory = (): WorkerReadinessReceipt => receiptFor(executor);
+  const allocation = await runtime.allocate({ workspaceId: "workspace-1", agentName: "worker-live-proof", cwd: repo.root });
+  const identity = await runtime.start({ allocation, cwd: repo.root, model: proposal(repo).model });
+  assert.ok(bridge.lifecycleChallenges > 0);
+
+  bridge.livePiPid = identity.piPid + 1;
+  await assert.rejects(runtime.inspect(identity), /live Pi process changed/);
 });
 
 test("production Herdr runtime rejects inherited Pi history before implementation dispatch", async (): Promise<void> => {

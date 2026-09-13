@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, readdir, unlink } from "node:fs/promises";
+import { constants } from "node:fs";
+import { chmod, mkdir, open, readdir, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join } from "node:path";
 
 import { atomicWritePrivateFile } from "./atomic-file.js";
@@ -64,6 +65,8 @@ export class FileWorkerBridgeTransport implements WorkerBridgeTransport {
       lifecycleEndpoint: join(channelDirectory, "lifecycle.json"),
       reviewEndpoint: join(channelDirectory, "review.json"),
       nativeVerificationEndpoint: join(channelDirectory, "native-verification.json"),
+      lifecycleChallengeEndpoint: join(channelDirectory, "lifecycle-challenge.json"),
+      lifecycleChallengeResponseEndpoint: join(channelDirectory, "lifecycle-challenge-response.json"),
     };
     await atomicWritePrivateFile(join(this.directory, `${agentName}.channel.json`), `${JSON.stringify(channel)}\n`);
     return channel;
@@ -129,6 +132,37 @@ export class FileWorkerBridgeTransport implements WorkerBridgeTransport {
     }
   }
 
+  async challengeLifecycle(channel: WorkerBridgeChannel, expectedPiPid: number, timeoutMs: number): Promise<void> {
+    this.assertOwnedChannel(channel);
+    if (!Number.isSafeInteger(expectedPiPid) || expectedPiPid <= 0) throw new Error("Worker lifecycle challenge PID is invalid");
+    const challenge = this.generateNonce();
+    if (!SAFE_ID.test(challenge)) throw new Error("Worker lifecycle challenge is unsafe");
+    await removeIfPresent(channel.lifecycleChallengeResponseEndpoint!);
+    await atomicWritePrivateFile(channel.lifecycleChallengeEndpoint!, `${JSON.stringify({
+      schemaVersion: 1,
+      nonce: channel.nonce,
+      challenge,
+      expectedPiPid,
+      requestedAt: new Date(this.now()).toISOString(),
+    })}\n`);
+    const deadline = this.now() + timeoutMs;
+    for (;;) {
+      try {
+        const parsed: unknown = JSON.parse(await readBounded(channel.lifecycleChallengeResponseEndpoint!));
+        if (!isLifecycleChallengeResponse(parsed) || parsed.nonce !== channel.nonce ||
+          parsed.challenge !== challenge || parsed.piPid !== expectedPiPid
+        ) throw new Error("Worker lifecycle challenge response is stale or belongs to another Pi process");
+        await removeIfPresent(channel.lifecycleChallengeEndpoint!);
+        await removeIfPresent(channel.lifecycleChallengeResponseEndpoint!);
+        return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      if (this.now() >= deadline) throw new Error("Worker lifecycle challenge timed out without a live bridge response");
+      await this.sleep(this.pollIntervalMs);
+    }
+  }
+
   async waitForNativeVerification(
     channel: WorkerBridgeChannel,
     timeoutMs: number,
@@ -185,14 +219,26 @@ export class FileWorkerBridgeTransport implements WorkerBridgeTransport {
       channel.responseDirectory === join(channelDirectory, "responses") &&
       channel.lifecycleEndpoint === join(channelDirectory, "lifecycle.json") &&
       channel.reviewEndpoint === join(channelDirectory, "review.json") &&
-      channel.nativeVerificationEndpoint === join(channelDirectory, "native-verification.json");
+      channel.nativeVerificationEndpoint === join(channelDirectory, "native-verification.json") &&
+      channel.lifecycleChallengeEndpoint === join(channelDirectory, "lifecycle-challenge.json") &&
+      channel.lifecycleChallengeResponseEndpoint === join(channelDirectory, "lifecycle-challenge-response.json");
   }
 }
 
 async function readBounded(path: string): Promise<string> {
-  const data = await readFile(path);
-  if (data.byteLength > MAX_RECEIPT_BYTES) throw new Error("Worker bridge record exceeds its bound");
-  return data.toString("utf8");
+  const file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+  try {
+    const metadata = await file.stat();
+    if (!metadata.isFile() || metadata.size <= 0 || metadata.size > MAX_RECEIPT_BYTES) {
+      throw new Error("Worker bridge record is not a bounded regular file");
+    }
+    const data = Buffer.alloc(metadata.size + 1);
+    const { bytesRead } = await file.read(data, 0, data.length, 0);
+    if (bytesRead !== metadata.size) throw new Error("Worker bridge record changed while it was read");
+    return data.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    await file.close();
+  }
 }
 
 function isChannel(value: unknown): value is Required<WorkerBridgeChannel> {
@@ -200,7 +246,8 @@ function isChannel(value: unknown): value is Required<WorkerBridgeChannel> {
   const channel = value as WorkerBridgeChannel;
   return [
     channel.endpoint, channel.requestDirectory, channel.responseDirectory, channel.lifecycleEndpoint,
-    channel.reviewEndpoint, channel.nativeVerificationEndpoint,
+    channel.reviewEndpoint, channel.nativeVerificationEndpoint, channel.lifecycleChallengeEndpoint,
+    channel.lifecycleChallengeResponseEndpoint,
   ]
     .every((path): boolean => typeof path === "string" && isAbsolute(path)) &&
     typeof channel.nonce === "string" && SAFE_ID.test(channel.nonce);
@@ -219,9 +266,25 @@ function isLifecycleReceipt(value: unknown): value is WorkerLifecycleReceipt {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const receipt = value as WorkerLifecycleReceipt;
   return receipt.schemaVersion === 1 && SAFE_ID.test(receipt.nonce) && safeText(receipt.sessionId, 4_096) &&
+    Number.isSafeInteger(receipt.piPid) && receipt.piPid > 0 &&
     (receipt.state === "working" || receipt.state === "settled") && Number.isFinite(Date.parse(receipt.observedAt)) &&
     Array.isArray(receipt.outstandingJobs) && receipt.outstandingJobs.length <= 50 &&
     receipt.outstandingJobs.every((job): boolean => safeText(job, 4_096));
+}
+
+function isLifecycleChallengeResponse(value: unknown): value is {
+  schemaVersion: 1;
+  nonce: string;
+  challenge: string;
+  piPid: number;
+  respondedAt: string;
+} {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const response = value as Record<string, unknown>;
+  return response.schemaVersion === 1 && typeof response.nonce === "string" && SAFE_ID.test(response.nonce) &&
+    typeof response.challenge === "string" && SAFE_ID.test(response.challenge) &&
+    Number.isSafeInteger(response.piPid) && (response.piPid as number) > 0 &&
+    typeof response.respondedAt === "string" && Number.isFinite(Date.parse(response.respondedAt));
 }
 
 function isNativeVerificationReceipt(value: unknown): value is WorkerNativeVerificationReceipt {

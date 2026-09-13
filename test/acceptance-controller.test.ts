@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test, { afterEach } from "node:test";
@@ -114,7 +114,7 @@ class SettledWorker implements WorkerRuntimePort {
     return { workspaceId: input.workspaceId, agentName: input.agentName, tabId: `tab-${input.agentName}`, paneId: `pane-${input.agentName}` };
   }
   async start(input: Parameters<WorkerRuntimePort["start"]>[0]): Promise<WorkerIdentity> {
-    return { ...input.allocation, piPid: 42, sessionId: `session-${input.allocation.agentName}`, sessionFile: `/sessions/${input.allocation.agentName}.jsonl`, cwd: input.cwd, model: input.model, mode: "tui", initialHistoryEntries: 0, skillCommands: ["skill:implement", "skill:tdd", "skill:code-review", "skill:handoff"], toolNames: ["read", "bash", "edit", "write"], contextFiles: [join(input.cwd, "AGENTS.md")] };
+    return { ...input.allocation, piPid: 42, sessionId: `session-${input.allocation.agentName}`, sessionFile: `/sessions/${input.allocation.agentName}.jsonl`, cwd: input.cwd, model: input.model, mode: "tui", initialHistoryEntries: 0, skillCommands: ["skill:implement", "skill:tdd", "skill:code-review", "skill:handoff"], toolNames: ["read", "bash", "edit", "write", "subagent"], contextFiles: [join(input.cwd, "AGENTS.md")] };
   }
   async inspect(identity: WorkerIdentity): Promise<WorkerObservation> {
     this.inspections += 1;
@@ -434,6 +434,36 @@ test("nonregular native evidence artifacts are rejected at the acceptance bounda
 
   assert.equal(rejected.ok, false);
   assert.equal(acceptance.reviewSessions.length, 0);
+});
+
+test("candidate staging rejects destination symlink ancestors before copying untracked files", async (): Promise<void> => {
+  const repo = await repository();
+  const gitAdapter = new RealGitWorktreeAdapter();
+  const outside = await mkdtemp(join(tmpdir(), "herdr-stage-outside-"));
+  evidenceRoots.add(outside);
+  const integration = await gitAdapter.prepareIntegrationWorktree({
+    originalRoot: repo.root,
+    preparationId: "symlink-ancestor",
+    targetBase: repo.head,
+  });
+  await symlink(outside, join(integration.path, "escape"));
+  git(integration.path, "add", "escape");
+  git(integration.path, "commit", "-qm", "tracked destination symlink");
+  const currentIntegration = { ...await gitAdapter.inspectWorktree(integration.path), preparationId: integration.preparationId };
+  await mkdir(join(repo.root, "escape"));
+  await writeFile(join(repo.root, "escape", "payload.txt"), "must not escape staging\n");
+  const candidate = await gitAdapter.captureCandidate({ path: repo.root, sourceBase: repo.head });
+
+  await assert.rejects(gitAdapter.stageCandidate({
+    originalRoot: repo.root,
+    preparationId: "symlink-ancestor",
+    attemptId: "attempt-symlink",
+    receiptId: "receipt-symlink",
+    integration: currentIntegration,
+    sourcePath: repo.root,
+    candidate,
+  }), /symbolic link ancestor/);
+  await assert.rejects(readFile(join(outside, "payload.txt")), { code: "ENOENT" });
 });
 
 test("content-equivalent staging and later commits retain native evidence through Git code-state identity", async (): Promise<void> => {
@@ -1161,18 +1191,22 @@ test("final batch advancement disables project Git hooks", async (): Promise<voi
   assert.equal(git(integrationPath, "rev-parse", "HEAD"), accepted.acceptedCommit);
 });
 
-test("gate timeouts kill commands that ignore graceful termination", async (): Promise<void> => {
+test("gate timeouts kill the complete process group before reporting the result", async (): Promise<void> => {
   const repo = await repository();
   const evidenceDirectory = join(repo.root, ".gate-timeout-evidence");
+  const descendantPidPath = join(repo.root, "gate-descendant.pid");
   const checks = new LocalGateCheckAdapter(evidenceDirectory, { timeoutMs: 25, generateId: () => "timeout" });
   const startedAt = Date.now();
   const result = await checks.execute({
     cwd: repo.root,
-    command: "trap '' TERM; sleep 10",
+    command: `sh -c 'trap "" TERM; echo $$ > "${descendantPidPath}"; exec >/dev/null 2>&1; while :; do sleep 1; done' & wait`,
     candidateCommit: repo.head,
   });
   assert.equal(result.exitCode, 1);
   assert.ok(Date.now() - startedAt < 4_000);
+  const descendantPid = Number(await readFile(descendantPidPath, "utf8"));
+  assert.throws((): void => { process.kill(descendantPid, 0); }, (error: unknown): boolean =>
+    (error as NodeJS.ErrnoException).code === "ESRCH");
   const metadata = JSON.parse(await readFile(result.logReference, "utf8")) as Record<string, unknown>;
   assert.equal(metadata.termination, "timeout");
   assert.equal(metadata.outputOmitted, true);

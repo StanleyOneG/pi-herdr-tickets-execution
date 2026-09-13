@@ -18,12 +18,15 @@ export interface WorkerBridgeChannel {
   lifecycleEndpoint?: string;
   reviewEndpoint?: string;
   nativeVerificationEndpoint?: string;
+  lifecycleChallengeEndpoint?: string;
+  lifecycleChallengeResponseEndpoint?: string;
 }
 
 export interface WorkerLifecycleReceipt {
   schemaVersion: 1;
   nonce: string;
   sessionId: string;
+  piPid: number;
   state: "working" | "settled";
   observedAt: string;
   outstandingJobs: string[];
@@ -114,6 +117,7 @@ export interface WorkerBridgeTransport {
   acknowledgeDecisionRequest?(channel: WorkerBridgeChannel, decisionId: string): Promise<void>;
   deliverDecision?(channel: WorkerBridgeChannel, answer: WorkerDecisionAnswer): Promise<void>;
   readLifecycle?(channel: WorkerBridgeChannel): Promise<WorkerLifecycleReceipt | undefined>;
+  challengeLifecycle?(channel: WorkerBridgeChannel, expectedPiPid: number, timeoutMs: number): Promise<void>;
   waitForReview?(channel: WorkerBridgeChannel, timeoutMs: number): Promise<WorkerReviewReceipt>;
   waitForNativeVerification?(channel: WorkerBridgeChannel, timeoutMs: number): Promise<WorkerNativeVerificationReceipt>;
 }

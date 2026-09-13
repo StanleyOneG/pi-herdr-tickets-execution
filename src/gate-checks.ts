@@ -66,11 +66,16 @@ async function executeBoundedShell(command: string, cwd: string, timeoutMs: numb
     let bytes = 0;
     let exceeded = false;
     let timedOut = false;
-    let killTimeout: NodeJS.Timeout | undefined;
+    let termination: Promise<void> | undefined;
     const terminate = (): void => {
+      if (termination) return;
       terminateProcessGroup(child.pid, "SIGTERM");
-      killTimeout ??= setTimeout((): void => { terminateProcessGroup(child.pid, "SIGKILL"); }, 2_000);
-      killTimeout.unref();
+      termination = new Promise((terminationResolved): void => {
+        setTimeout((): void => {
+          terminateProcessGroup(child.pid, "SIGKILL");
+          void waitForProcessGroupExit(child.pid).then(terminationResolved);
+        }, 2_000);
+      });
     };
     const capture = (chunk: Buffer): void => {
       bytes += chunk.length;
@@ -84,21 +89,23 @@ async function executeBoundedShell(command: string, cwd: string, timeoutMs: numb
     child.stderr.on("data", capture);
     const timeout = setTimeout((): void => { timedOut = true; terminate(); }, timeoutMs);
     timeout.unref();
-    child.once("error", (error): void => { clearTimeout(timeout); if (killTimeout) clearTimeout(killTimeout); reject(error); });
+    child.once("error", (error): void => { clearTimeout(timeout); reject(error); });
     child.once("close", (code, signal): void => {
       clearTimeout(timeout);
-      if (killTimeout) clearTimeout(killTimeout);
-      const suffix = exceeded
-        ? "\n[controller stopped the check because output exceeded 2 MiB]\n"
-        : timedOut
-          ? "\n[controller stopped the check because it exceeded its time limit]\n"
-          : signal ? `\n[controller check ended by signal ${signal}]\n` : "";
-      const termination: GateTermination = exceeded ? "output-limit" : timedOut ? "timeout" : signal ? "signal" : "completed";
-      resolve({
-        exitCode: exceeded || timedOut || signal ? 1 : code ?? 1,
-        output: `${Buffer.concat(chunks).toString("utf8")}${suffix}`,
-        termination,
-      });
+      void (async (): Promise<void> => {
+        if (termination) await termination;
+        const suffix = exceeded
+          ? "\n[controller stopped the check because output exceeded 2 MiB]\n"
+          : timedOut
+            ? "\n[controller stopped the check because it exceeded its time limit]\n"
+            : signal ? `\n[controller check ended by signal ${signal}]\n` : "";
+        const terminationKind: GateTermination = exceeded ? "output-limit" : timedOut ? "timeout" : signal ? "signal" : "completed";
+        resolve({
+          exitCode: exceeded || timedOut || signal ? 1 : code ?? 1,
+          output: `${Buffer.concat(chunks).toString("utf8")}${suffix}`,
+          termination: terminationKind,
+        });
+      })().catch(reject);
     });
   });
 }
@@ -106,4 +113,19 @@ async function executeBoundedShell(command: string, cwd: string, timeoutMs: numb
 function terminateProcessGroup(pid: number | undefined, signal: NodeJS.Signals): void {
   if (!pid) return;
   try { process.kill(-pid, signal); } catch { /* Process may already have exited. */ }
+}
+
+async function waitForProcessGroupExit(pid: number | undefined): Promise<void> {
+  if (!pid) return;
+  const deadline = Date.now() + 1_000;
+  for (;;) {
+    try {
+      process.kill(-pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+      throw error;
+    }
+    if (Date.now() >= deadline) throw new Error("Gate process group remained alive after forced termination");
+    await new Promise((resolvePromise): void => { setTimeout(resolvePromise, 10); });
+  }
 }

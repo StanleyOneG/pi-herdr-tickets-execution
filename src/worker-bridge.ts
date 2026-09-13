@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, unlink } from "node:fs/promises";
+import { constants } from "node:fs";
+import { mkdir, open, readFile, unlink } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -13,7 +14,8 @@ import type {
 import { Type, type Static } from "typebox";
 
 import { atomicWritePrivateFile } from "./atomic-file.js";
-import type { CapturedModel, ThinkingLevel } from "./contracts.js";
+import type { CapturedModel, NativeEvidenceRecord, ThinkingLevel } from "./contracts.js";
+import { RealGitWorktreeAdapter } from "./git-worktrees.js";
 import {
   WORKER_BRIDGE_AGENT_ENV,
   WORKER_BRIDGE_ENDPOINT_ENV,
@@ -44,6 +46,7 @@ const NATIVE_VERIFICATION_SCHEMA = Type.Object({
   findings: Type.Array(Type.String({ minLength: 1, maxLength: 4_000 }), { maxItems: 50 }),
 });
 type NativeVerificationInput = Static<typeof NATIVE_VERIFICATION_SCHEMA>;
+const NATIVE_EVIDENCE_CAPTURE_SCHEMA = Type.Object({});
 const DECISION_SCHEMA = Type.Object({
   question: Type.String({ minLength: 1, maxLength: 4_000 }),
   context: Type.String({ minLength: 1, maxLength: 4_000 }),
@@ -58,16 +61,39 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   const activeTools = new Set<string>();
   const bashCommands = new Map<string, string>();
   const observedCommandDigests: string[] = [];
+  const activeSubagentRuns = new Set<string>();
+  const nativeExecutions = new Map<string, {
+    kind: "tests" | "reviews";
+    codeStateDigest: string;
+    completedAt: string;
+    executionReference: string;
+  }>();
   let failedBashCommand = false;
   let mutationToolUsed = false;
   let isAgentRunning = false;
+  let challengeResponseRunning = false;
+  const challengeTimer = setInterval((): void => {
+    if (challengeResponseRunning) return;
+    challengeResponseRunning = true;
+    void respondToLifecycleChallenge().finally((): void => { challengeResponseRunning = false; });
+  }, 50);
+  challengeTimer.unref();
   const outstandingJobs = (): string[] => [
     ...(isAgentRunning ? ["pi-agent-run"] : []),
     ...[...activeTools].sort().map((id): string => `pi-tool:${id}`),
   ];
+  pi.events.on("subagent:async-started", (payload: unknown): void => {
+    const id = eventIdentity(payload);
+    if (id) activeSubagentRuns.add(id);
+  });
+  pi.events.on("subagent:async-complete", (payload: unknown): void => {
+    const id = eventIdentity(payload);
+    if (id) activeSubagentRuns.delete(id);
+  });
   pi.on("session_start", (event, _ctx): void => {
     sessionStartReason = event.reason;
     activeTools.clear();
+    activeSubagentRuns.clear();
     bashCommands.clear();
     observedCommandDigests.length = 0;
     failedBashCommand = false;
@@ -92,7 +118,12 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     if (command !== undefined) {
       observedCommandDigests.push(createHash("sha256").update(command).digest("hex"));
       failedBashCommand ||= event.isError;
+      if (!event.isError && isTestCommand(command)) {
+        await retainNativeExecution(nativeExecutions, event.toolCallId, "tests", ctx.cwd, ctx.sessionManager.getSessionId(), `bash:${createHash("sha256").update(command).digest("hex")}`);
+      }
       bashCommands.delete(event.toolCallId);
+    } else if (event.toolName === "subagent" && !event.isError && isPassingReviewResult(event.result)) {
+      await retainNativeExecution(nativeExecutions, event.toolCallId, "reviews", ctx.cwd, ctx.sessionManager.getSessionId(), "subagent:structured-acceptance:no-blockers");
     }
     await writeLifecycle(ctx, "working", outstandingJobs());
   });
@@ -100,6 +131,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     isAgentRunning = false;
     const jobs = outstandingJobs();
     if (ctx.hasPendingMessages()) jobs.push("pi-queued-message");
+    jobs.push(...await reconcileSubagentWork(pi, activeSubagentRuns));
     await writeLifecycle(ctx, "settled", jobs);
   });
 
@@ -108,6 +140,85 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     handler: async (_args: string, ctx: ExtensionCommandContext): Promise<void> => {
       const receipt = collectWorkerReadiness(pi, ctx);
       await writeReceipt(receipt);
+    },
+  });
+
+  pi.on("before_agent_start", (event): { systemPrompt: string } => ({
+    systemPrompt: `${event.systemPrompt}\n\nHerdr native evidence requirements: run project-native tests through bash after the final edit. Perform the implementation skill's final review with the installed subagent tool in foreground mode and require a structured acceptance report whose reviewFindings explicitly says no blockers. After both succeed on the unchanged final code state, call herdr_capture_native_evidence. Do not manufacture receipt files or substitute a prose completion claim.`,
+  }));
+
+  pi.registerTool({
+    name: "herdr_capture_native_evidence",
+    label: "Capture Native Implementation Evidence",
+    description: "Produce immutable tests and review receipts only from successful ordinary implementation-skill executions observed by this live Pi process and bound to current Git content.",
+    parameters: NATIVE_EVIDENCE_CAPTURE_SCHEMA,
+    async execute(
+      _toolCallId: string,
+      _params: Record<string, never>,
+      _signal: AbortSignal | undefined,
+      _onUpdate: AgentToolUpdateCallback<unknown> | undefined,
+      ctx: ExtensionContext,
+    ): Promise<AgentToolResult<unknown>> {
+      const candidate = await new RealGitWorktreeAdapter().captureCandidate({
+        path: ctx.cwd,
+        sourceBase: (await new RealGitWorktreeAdapter().inspectWorktree(ctx.cwd)).head,
+      });
+      const selected = (["tests", "reviews"] as const).map((kind) =>
+        [...nativeExecutions.entries()].reverse().find(([, proof]): boolean =>
+          proof.kind === kind && proof.codeStateDigest === candidate.codeStateDigest));
+      if (selected.some((proof): boolean => proof === undefined)) {
+        throw new Error("Current Git code state lacks observed successful native tests or a structured no-blocker review; rerun the missing obligation before acceptance");
+      }
+      const endpoint = process.env[WORKER_BRIDGE_ENDPOINT_ENV];
+      if (!endpoint || !isAbsolute(endpoint)) throw new Error("Attempt-bound worker bridge endpoint is unavailable");
+      const evidenceDirectory = join(dirname(endpoint), "native-evidence");
+      await mkdir(evidenceDirectory, { recursive: true, mode: 0o700 });
+      const nativeEvidence: NativeEvidenceRecord[] = [];
+      for (const selectedProof of selected) {
+        const [, proof] = selectedProof!;
+        const completedAt = new Date().toISOString();
+        const id = randomUUID();
+        const sourcePath = join(evidenceDirectory, `${proof.kind}-${id}-execution.json`);
+        const source = `${JSON.stringify({
+          schemaVersion: 1,
+          producer: "pi-native-skill",
+          kind: proof.kind,
+          status: "passed",
+          codeStateDigest: candidate.codeStateDigest,
+          completedAt,
+          executionReferences: [proof.executionReference],
+        })}\n`;
+        await atomicWritePrivateFile(sourcePath, source);
+        const manifestPath = join(evidenceDirectory, `${proof.kind}-${id}-receipt.json`);
+        const manifest = `${JSON.stringify({
+          schemaVersion: 1,
+          kind: proof.kind,
+          status: "passed",
+          codeStateDigest: candidate.codeStateDigest,
+          completedAt,
+          artifacts: [{ reference: sourcePath, digest: createHash("sha256").update(source).digest("hex") }],
+        })}\n`;
+        await atomicWritePrivateFile(manifestPath, manifest);
+        nativeEvidence.push({
+          kind: proof.kind,
+          status: "passed",
+          codeStateDigest: candidate.codeStateDigest,
+          evidenceReference: manifestPath,
+          evidenceDigest: createHash("sha256").update(manifest).digest("hex"),
+          completedAt,
+        });
+      }
+      await atomicWritePrivateFile(join(evidenceDirectory, "latest.json"), `${JSON.stringify({
+        schemaVersion: 1,
+        producer: "herdr-worker-bridge",
+        sessionId: ctx.sessionManager.getSessionId(),
+        codeStateDigest: candidate.codeStateDigest,
+        nativeEvidence,
+      })}\n`);
+      return {
+        content: [{ type: "text", text: `Captured immutable native evidence from observed executions:\n${JSON.stringify(nativeEvidence, null, 2)}` }],
+        details: { codeStateDigest: candidate.codeStateDigest, nativeEvidence },
+      };
     },
   });
 
@@ -290,10 +401,167 @@ async function writeLifecycle(
     schemaVersion: 1,
     nonce,
     sessionId: ctx.sessionManager.getSessionId(),
+    piPid: process.pid,
     state,
     observedAt: new Date().toISOString(),
     outstandingJobs,
   })}\n`);
+}
+
+function isTestCommand(command: string): boolean {
+  return /(?:^|[;&|]\s*|\b)(?:npm\s+(?:test|run\s+(?:test|check|lint|typecheck))|pnpm\s+(?:test|run\s+(?:test|check|lint|typecheck))|yarn\s+(?:test|run\s+(?:test|check|lint|typecheck))|bun\s+(?:test|run\s+(?:test|check|lint|typecheck))|npx\s+(?:tsc|vitest|jest)|node\s+--test|pytest\b|go\s+test\b|cargo\s+test\b)/i.test(command);
+}
+
+async function retainNativeExecution(
+  executions: Map<string, { kind: "tests" | "reviews"; codeStateDigest: string; completedAt: string; executionReference: string }>,
+  toolCallId: string,
+  kind: "tests" | "reviews",
+  cwd: string,
+  sessionId: string,
+  detail: string,
+): Promise<void> {
+  const git = new RealGitWorktreeAdapter();
+  const worktree = await git.inspectWorktree(cwd);
+  const candidate = await git.captureCandidate({ path: cwd, sourceBase: worktree.head });
+  executions.set(toolCallId, {
+    kind,
+    codeStateDigest: candidate.codeStateDigest,
+    completedAt: new Date().toISOString(),
+    executionReference: `pi-session:${sessionId}:tool:${toolCallId}:${detail}`,
+  });
+}
+
+function isPassingReviewResult(result: unknown): boolean {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return false;
+  const details = (result as Record<string, unknown>).details;
+  if (!details || typeof details !== "object" || Array.isArray(details)) return false;
+  const record = details as Record<string, unknown>;
+  if (record.background === true || !Array.isArray(record.results) || record.results.length === 0) return false;
+  return record.results.every((value): boolean => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const child = value as Record<string, unknown>;
+    if (child.exitCode !== 0 || child.error !== undefined ||
+      !/review/i.test(`${String(child.agent ?? "")} ${String(child.task ?? "")}`)
+    ) return false;
+    const report = child.structuredAcceptanceReport ??
+      (child.acceptance && typeof child.acceptance === "object" && !Array.isArray(child.acceptance)
+        ? (child.acceptance as Record<string, unknown>).childReport
+        : undefined);
+    if (!report || typeof report !== "object" || Array.isArray(report)) return false;
+    const acceptance = report as Record<string, unknown>;
+    const criteria = acceptance.criteriaSatisfied;
+    const findings = acceptance.reviewFindings;
+    return Array.isArray(criteria) && criteria.some((criterion): boolean =>
+      Boolean(criterion) && typeof criterion === "object" && !Array.isArray(criterion) &&
+      (criterion as Record<string, unknown>).status === "satisfied") && criteria.every((criterion): boolean =>
+      Boolean(criterion) && typeof criterion === "object" && !Array.isArray(criterion) &&
+      ["satisfied", "not-applicable"].includes(String((criterion as Record<string, unknown>).status))) &&
+      Array.isArray(findings) && findings.length > 0 && findings.every((finding): boolean =>
+        typeof finding === "string" && /^(?:no blockers?|none|no findings?)\.?$/i.test(finding.trim()));
+  });
+}
+
+function eventIdentity(value: unknown): string | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const event = value as Record<string, unknown>;
+  const id = typeof event.id === "string" ? event.id : typeof event.runId === "string" ? event.runId : undefined;
+  return id && /^[A-Za-z0-9._:-]{1,500}$/.test(id) ? id : undefined;
+}
+
+async function reconcileSubagentWork(pi: ExtensionAPI, observed: Set<string>): Promise<string[]> {
+  const hasSubagentTool = pi.getAllTools().some((tool): boolean => tool.name === "subagent");
+  if (!hasSubagentTool) {
+    return ["subagent-observer-unavailable: required subagent tool or provider adapter is not loaded"];
+  }
+  const requestId = randomUUID();
+  const replyEvent = `subagents:rpc:v1:reply:${requestId}`;
+  const reply = await new Promise<unknown>((resolvePromise): void => {
+    let unsubscribe: (() => void) | void;
+    const timer = setTimeout((): void => {
+      if (typeof unsubscribe === "function") unsubscribe();
+      resolvePromise(undefined);
+    }, 500);
+    unsubscribe = pi.events.on(replyEvent, (payload: unknown): void => {
+      clearTimeout(timer);
+      if (typeof unsubscribe === "function") unsubscribe();
+      resolvePromise(payload);
+    });
+    pi.events.emit("subagents:rpc:v1:request", {
+      version: 1,
+      requestId,
+      method: "status",
+      source: { extension: "herdr-worker-bridge" },
+    });
+  });
+  if (!reply || typeof reply !== "object" || Array.isArray(reply)) {
+    return ["subagent-observer-unavailable: status RPC did not answer; inspect subagent/provider status before acceptance"];
+  }
+  const envelope = reply as Record<string, unknown>;
+  if (envelope.success !== true || !envelope.data || typeof envelope.data !== "object" || Array.isArray(envelope.data)) {
+    return ["subagent-observer-unavailable: status RPC failed; inspect subagent/provider status before acceptance"];
+  }
+  const snapshot = (envelope.data as Record<string, unknown>).asyncSnapshot;
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
+    return ["subagent-observer-unavailable: status RPC omitted its async snapshot"];
+  }
+  const projected = snapshot as Record<string, unknown>;
+  const omitted = projected.omitted as Record<string, unknown> | undefined;
+  if (!Array.isArray(projected.runs) || (typeof omitted?.runs === "number" && omitted.runs > 0) || omitted?.byteLimitExceeded === true) {
+    return ["subagent-status-unknown: async status snapshot was incomplete; inspect active subagent/provider work"];
+  }
+  const active = new Set<string>();
+  for (const value of projected.runs) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const run = value as Record<string, unknown>;
+    if (typeof run.id === "string" && typeof run.state === "string" &&
+      ["queued", "running", "partial", "paused"].includes(run.state)
+    ) active.add(run.id);
+  }
+  observed.clear();
+  for (const id of active) observed.add(id);
+  return [...active].sort().map((id): string => `pi-subagent:${id}`);
+}
+
+async function respondToLifecycleChallenge(): Promise<void> {
+  const endpoint = process.env[WORKER_BRIDGE_ENDPOINT_ENV];
+  const nonce = process.env[WORKER_BRIDGE_NONCE_ENV];
+  if (!endpoint || !nonce || !isAbsolute(endpoint)) return;
+  const challengePath = join(dirname(endpoint), "lifecycle-challenge.json");
+  const responsePath = join(dirname(endpoint), "lifecycle-challenge-response.json");
+  try {
+    const parsed = JSON.parse(await readBoundedRegularFile(challengePath)) as Record<string, unknown>;
+    if (parsed.schemaVersion !== 1 || parsed.nonce !== nonce || typeof parsed.challenge !== "string" ||
+      !/^[A-Za-z0-9_-]{1,200}$/.test(parsed.challenge) || !Number.isSafeInteger(parsed.expectedPiPid) ||
+      typeof parsed.requestedAt !== "string" || !Number.isFinite(Date.parse(parsed.requestedAt))
+    ) return;
+    await atomicWritePrivateFile(responsePath, `${JSON.stringify({
+      schemaVersion: 1,
+      nonce,
+      challenge: parsed.challenge,
+      piPid: process.pid,
+      respondedAt: new Date().toISOString(),
+    })}\n`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      // Malformed or unsafe challenges are ignored; the controller fails closed on timeout.
+    }
+  }
+}
+
+async function readBoundedRegularFile(path: string): Promise<string> {
+  const file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+  try {
+    const metadata = await file.stat();
+    if (!metadata.isFile() || metadata.size <= 0 || metadata.size > 256 * 1024) {
+      throw new Error("Worker bridge challenge is not a bounded regular file");
+    }
+    const bytes = Buffer.alloc(metadata.size + 1);
+    const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+    if (bytesRead !== metadata.size) throw new Error("Worker bridge challenge changed while it was read");
+    return bytes.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    await file.close();
+  }
 }
 
 async function writeReceipt(receipt: WorkerReadinessReceipt): Promise<void> {

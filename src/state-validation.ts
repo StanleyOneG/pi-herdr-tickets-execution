@@ -47,7 +47,7 @@ const EXECUTION_LIFECYCLES = new Set([
 ]);
 const DECISION_STATES = new Set(["pending", "answered", "delivered"]);
 const REQUIRED_WORKER_SKILLS = ["skill:implement", "skill:tdd", "skill:code-review", "skill:handoff"];
-const REQUIRED_WORKER_TOOLS = ["read", "bash", "edit", "write"];
+const REQUIRED_WORKER_TOOLS = ["read", "bash", "edit", "write", "subagent"];
 
 export function isControllerState(value: unknown): value is ControllerState {
   if (!isObject(value) || value.schemaVersion !== 1) return false;
@@ -188,7 +188,7 @@ function isExecutionAttempt(value: unknown): value is ExecutionAttempt {
   )) return false;
   if (value.setupOperations !== undefined && (!Array.isArray(value.setupOperations) || !value.setupOperations.every(isSetupOperationRecord))) return false;
   if (value.suspendedFrom !== undefined && ![
-    "running", "pending-decision", "completed-unaccepted", "accepting", "integration-blocked",
+    "starting", "running", "pending-decision", "completed-unaccepted", "accepting", "integration-blocked",
   ].includes(value.suspendedFrom as string)) return false;
   if (!Array.isArray(value.decisions) || value.decisions.length > MAX_ATTEMPT_DECISIONS || !value.decisions.every(isDecision)) return false;
   const decisionIds = value.decisions.map((decision): string => decision.id);

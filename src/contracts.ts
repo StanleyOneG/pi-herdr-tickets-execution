@@ -381,7 +381,7 @@ export interface ExecutionAttempt {
   /** Omitted schema-1 attempts are generation zero until their next control mutation. */
   controlGeneration?: number;
   setupOperations?: SetupOperationRecord[];
-  suspendedFrom?: "running" | "pending-decision" | "completed-unaccepted" | "accepting" | "integration-blocked";
+  suspendedFrom?: "starting" | "running" | "pending-decision" | "completed-unaccepted" | "accepting" | "integration-blocked";
   decisions: DecisionRecord[];
   artifactReferences: string[];
   diagnostics: string[];
@@ -393,7 +393,7 @@ export interface ExecutionAttempt {
 export function occupiesImplementationSlot(attempt: ExecutionAttempt): boolean {
   if (["claimed", "preparing-worktree", "starting", "running", "pending-decision"].includes(attempt.lifecycle)) return true;
   if (attempt.lifecycle === "paused" || attempt.lifecycle === "takeover" || attempt.lifecycle === "restart-required") {
-    return attempt.suspendedFrom === "running" || attempt.suspendedFrom === "pending-decision";
+    return attempt.suspendedFrom === "starting" || attempt.suspendedFrom === "running" || attempt.suspendedFrom === "pending-decision";
   }
   return false;
 }

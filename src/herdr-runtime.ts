@@ -36,7 +36,7 @@ import {
 
 const execFileAsync = promisify(execFile);
 const REQUIRED_SKILLS = ["skill:implement", "skill:tdd", "skill:code-review", "skill:handoff"];
-const REQUIRED_TOOLS = ["read", "bash", "edit", "write"];
+const REQUIRED_TOOLS = ["read", "bash", "edit", "write", "subagent"];
 const HERDR_AGENT_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
 export const WORKER_BRIDGE_EXTENSION_PATH = fileURLToPath(new URL("./worker-bridge.ts", import.meta.url));
 
@@ -173,6 +173,7 @@ export class HerdrWorkerRuntime implements WorkerRuntimePort, AcceptanceReviewPo
     const identity = identityFromReceipt(receipt, channel, input.allocation, input.cwd, input.model, sessionFile);
     const current = parseAgent(await this.command(["agent", "get", input.allocation.agentName], 10_000));
     assertOwnedAgent(current, identity);
+    await this.assertLiveBridge(identity, channel);
     return identity;
   }
 
@@ -182,7 +183,9 @@ export class HerdrWorkerRuntime implements WorkerRuntimePort, AcceptanceReviewPo
     let lifecycle: Awaited<ReturnType<NonNullable<WorkerBridgeTransport["readLifecycle"]>>>;
     if (this.options.bridge.channelForAgent && this.options.bridge.readLifecycle) {
       const channel = await this.options.bridge.channelForAgent(identity.agentName);
+      await this.assertLiveBridge(identity, channel);
       lifecycle = await this.options.bridge.readLifecycle(channel);
+      if (lifecycle && lifecycle.piPid !== identity.piPid) throw new Error("Worker lifecycle receipt belongs to another Pi process");
     }
     const settled = lifecycle?.sessionId === identity.sessionId && lifecycle.state === "settled";
     return {
@@ -373,6 +376,13 @@ export class HerdrWorkerRuntime implements WorkerRuntimePort, AcceptanceReviewPo
     assertOwnedAgent(current, identity);
     if (agentStatus(current) === "unknown") throw new Error("Owned Herdr worker state is unknown");
     await this.command(["agent", "focus", identity.agentName], 10_000);
+  }
+
+  private async assertLiveBridge(identity: WorkerIdentity, channel: WorkerBridgeChannel): Promise<void> {
+    if (!this.options.bridge.challengeLifecycle) {
+      throw new Error("Worker lifecycle challenge transport is unavailable");
+    }
+    await this.options.bridge.challengeLifecycle(channel, identity.piPid, this.bridgeReadyTimeoutMs);
   }
 
   private async assertDispatchable(identity: WorkerIdentity): Promise<void> {

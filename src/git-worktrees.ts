@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { createReadStream } from "node:fs";
 import { copyFile, lstat, mkdir, readlink, realpath, stat, symlink, unlink, writeFile } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
 import type {
@@ -109,8 +109,7 @@ export class RealGitWorktreeAdapter implements GitWorktreePort {
     const originalRoot = await this.repositoryRoot(input.originalRoot);
     if (!isAbsolute(input.plan.path)) throw new Error("Ticket worktree path must be absolute");
     const worktreeRoot = dirname(input.plan.path);
-    await mkdir(worktreeRoot, { recursive: true, mode: 0o700 });
-    await assertOrdinaryDirectory(worktreeRoot);
+    await ensureOrdinaryDirectoryPath(worktreeRoot);
     await assertMissing(input.plan.path);
     await this.gitText(originalRoot, [
       "worktree", "add", "-b", input.plan.branch, "--", input.plan.path, input.baseCommit,
@@ -221,8 +220,7 @@ export class RealGitWorktreeAdapter implements GitWorktreePort {
         }
       }
     }
-    await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-    await assertOrdinaryDirectory(dirname(path));
+    await ensureOrdinaryDirectoryPath(dirname(path));
     await assertMissing(path);
     await this.gitText(originalRoot, ["worktree", "add", "-b", branch, "--", path, input.targetBase]);
     const created = await this.inspectWorktree(path);
@@ -387,7 +385,7 @@ async function copyCandidatePath(sourceRoot: string, destinationRoot: string, re
   const source = join(sourceRoot, relativePath);
   const destination = join(destinationRoot, relativePath);
   const metadata = await lstat(source);
-  await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
+  await ensureDestinationDirectory(destinationRoot, dirname(destination));
   try {
     await lstat(destination);
     throw new Error(`Candidate untracked path collides with accepted content: ${relativePath}`);
@@ -400,6 +398,46 @@ async function copyCandidatePath(sourceRoot: string, destinationRoot: string, re
   }
   if (!metadata.isFile()) throw new Error("Candidate untracked path is not a regular file or symbolic link");
   await copyFile(source, destination);
+}
+
+async function ensureDestinationDirectory(destinationRoot: string, directory: string): Promise<void> {
+  const root = resolve(destinationRoot);
+  const target = resolve(directory);
+  if (target !== root && !target.startsWith(`${root}${sep}`)) throw new Error("Candidate destination escapes its staging worktree");
+  await assertOrdinaryDirectory(root);
+  let current = root;
+  for (const segment of relative(root, target).split(sep).filter(Boolean)) {
+    current = join(current, segment);
+    try {
+      const metadata = await lstat(current);
+      if (metadata.isSymbolicLink()) throw new Error(`Candidate destination has a symbolic link ancestor: ${current}`);
+      if (!metadata.isDirectory()) throw new Error(`Candidate destination ancestor is not a directory: ${current}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      await mkdir(current, { mode: 0o700 });
+      const created = await lstat(current);
+      if (!created.isDirectory() || created.isSymbolicLink()) {
+        throw new Error(`Candidate destination has an unsafe ancestor: ${current}`);
+      }
+    }
+  }
+}
+
+async function ensureOrdinaryDirectoryPath(directory: string): Promise<void> {
+  const target = resolve(directory);
+  const root = parse(target).root;
+  let current = root;
+  for (const segment of relative(root, target).split(sep).filter(Boolean)) {
+    current = join(current, segment);
+    try {
+      const metadata = await lstat(current);
+      if (metadata.isSymbolicLink()) throw new Error(`Worktree path has a symbolic link ancestor: ${current}`);
+      if (!metadata.isDirectory()) throw new Error(`Worktree path ancestor is not a directory: ${current}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      await mkdir(current, { mode: 0o700 });
+    }
+  }
 }
 
 async function fingerprintPaths(root: string, paths: string[]): Promise<GitFileFingerprint[]> {

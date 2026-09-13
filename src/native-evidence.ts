@@ -7,6 +7,27 @@ import type { NativeEvidencePort, NativeEvidenceRecord } from "./contracts.js";
 
 const MAX_NATIVE_EVIDENCE_BYTES = 1024 * 1024;
 
+export async function readProducedNativeEvidence(
+  path: string,
+  expected: { sessionId: string; codeStateDigest: string },
+): Promise<NativeEvidenceRecord[]> {
+  if (!isAbsolute(path)) throw new Error("Native evidence index path must be absolute");
+  const parsed: unknown = JSON.parse((await readBoundedRegularFile(path)).toString("utf8"));
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Native evidence index is malformed");
+  const index = parsed as Record<string, unknown>;
+  if (index.schemaVersion !== 1 || index.producer !== "herdr-worker-bridge" ||
+    index.sessionId !== expected.sessionId || index.codeStateDigest !== expected.codeStateDigest ||
+    !Array.isArray(index.nativeEvidence) || index.nativeEvidence.length !== 2
+  ) throw new Error("Native evidence index is stale or mismatched");
+  const records = index.nativeEvidence;
+  if (!records.every(isNativeEvidenceRecord) ||
+    !records.some((record): boolean => record.kind === "tests") ||
+    !records.some((record): boolean => record.kind === "reviews") ||
+    records.some((record): boolean => record.codeStateDigest !== expected.codeStateDigest)
+  ) throw new Error("Native evidence index does not contain exact tests and review proofs");
+  return structuredClone(records);
+}
+
 /** Resolves a retained native-skill receipt and verifies its immutable code-state binding. */
 export class FileNativeEvidenceAdapter implements NativeEvidencePort {
   async verify(input: { record: NativeEvidenceRecord; candidate: { codeStateDigest: string } }): Promise<void> {
@@ -29,6 +50,16 @@ export class FileNativeEvidenceAdapter implements NativeEvidencePort {
       }
     }
   }
+}
+
+function isNativeEvidenceRecord(value: unknown): value is NativeEvidenceRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return (record.kind === "tests" || record.kind === "reviews") && record.status === "passed" &&
+    typeof record.codeStateDigest === "string" && /^[a-f0-9]{64}$/i.test(record.codeStateDigest) &&
+    typeof record.evidenceReference === "string" && isAbsolute(record.evidenceReference) && record.evidenceReference.length <= 4_096 &&
+    typeof record.evidenceDigest === "string" && /^[a-f0-9]{64}$/i.test(record.evidenceDigest) &&
+    typeof record.completedAt === "string" && Number.isFinite(Date.parse(record.completedAt));
 }
 
 function isReceipt(value: unknown): value is {
