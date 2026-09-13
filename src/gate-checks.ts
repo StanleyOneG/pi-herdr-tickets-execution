@@ -54,32 +54,42 @@ async function executeBoundedShell(command: string, cwd: string, timeoutMs: numb
     const chunks: Buffer[] = [];
     let bytes = 0;
     let exceeded = false;
+    let timedOut = false;
+    let killTimeout: NodeJS.Timeout | undefined;
+    const terminate = (): void => {
+      terminateProcessGroup(child.pid, "SIGTERM");
+      killTimeout ??= setTimeout((): void => { terminateProcessGroup(child.pid, "SIGKILL"); }, 2_000);
+      killTimeout.unref();
+    };
     const capture = (chunk: Buffer): void => {
       bytes += chunk.length;
       if (bytes <= MAX_CHECK_OUTPUT_BYTES) chunks.push(chunk);
       else {
         exceeded = true;
-        terminateProcessGroup(child.pid);
+        terminate();
       }
     };
     child.stdout.on("data", capture);
     child.stderr.on("data", capture);
-    const timeout = setTimeout((): void => { terminateProcessGroup(child.pid); }, timeoutMs);
+    const timeout = setTimeout((): void => { timedOut = true; terminate(); }, timeoutMs);
     timeout.unref();
-    child.once("error", (error): void => { clearTimeout(timeout); reject(error); });
+    child.once("error", (error): void => { clearTimeout(timeout); if (killTimeout) clearTimeout(killTimeout); reject(error); });
     child.once("close", (code, signal): void => {
       clearTimeout(timeout);
+      if (killTimeout) clearTimeout(killTimeout);
       const suffix = exceeded
         ? "\n[controller stopped the check because output exceeded 2 MiB]\n"
-        : signal ? `\n[controller check ended by signal ${signal}]\n` : "";
-      resolve({ exitCode: exceeded || signal ? 1 : code ?? 1, output: `${Buffer.concat(chunks).toString("utf8")}${suffix}` });
+        : timedOut
+          ? "\n[controller stopped the check because it exceeded its time limit]\n"
+          : signal ? `\n[controller check ended by signal ${signal}]\n` : "";
+      resolve({ exitCode: exceeded || timedOut || signal ? 1 : code ?? 1, output: `${Buffer.concat(chunks).toString("utf8")}${suffix}` });
     });
   });
 }
 
-function terminateProcessGroup(pid: number | undefined): void {
+function terminateProcessGroup(pid: number | undefined, signal: NodeJS.Signals): void {
   if (!pid) return;
-  try { process.kill(-pid, "SIGTERM"); } catch { /* Process may already have exited. */ }
+  try { process.kill(-pid, signal); } catch { /* Process may already have exited. */ }
 }
 
 function redactCredentials(value: string): string {

@@ -493,6 +493,21 @@ test("approved gate commands execute independently in staging and retain their r
   assert.equal(check.candidateCommit, accepted.acceptedCommit);
 });
 
+test("gate timeouts kill commands that ignore graceful termination", async (): Promise<void> => {
+  const repo = await repository();
+  const evidenceDirectory = join(repo.root, ".gate-timeout-evidence");
+  const checks = new LocalGateCheckAdapter(evidenceDirectory, { timeoutMs: 25, generateId: () => "timeout" });
+  const startedAt = Date.now();
+  const result = await checks.execute({
+    cwd: repo.root,
+    command: "trap '' TERM; sleep 10",
+    candidateCommit: repo.head,
+  });
+  assert.equal(result.exitCode, 1);
+  assert.ok(Date.now() - startedAt < 4_000);
+  assert.match(await readFile(result.logReference, "utf8"), /exceeded its time limit/);
+});
+
 test("settled uncommitted candidate is reviewed, checked, integrated, persisted, and its owned worker closes", async (): Promise<void> => {
   const repo = await repository();
   const worker = new SettledWorker();
