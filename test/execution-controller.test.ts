@@ -1629,12 +1629,31 @@ test("ordinary implementation tool events produce candidate-bound native test an
       }] } },
     }, context);
     const candidate = await new RealGitWorktreeAdapter().captureCandidate({ path: repo.root, sourceBase: repo.head });
+    const nodeHelpOutput = execFileSync(process.execPath, ["--test", "--help"], {
+      cwd: repo.root,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    assert.match(nodeHelpOutput, /Usage: node/);
     for (const [toolCallId, command] of [
       ["echo-call", "echo 'npm test'"],
       ["masked-call", "npm test || true"],
       ["node-script-call", "node helper.js --test"],
       ["npx-wrapper-call", "npx echo vitest"],
       ["typecheck-call", "npm run typecheck"],
+      ["node-help-call", "node --test --help"],
+      ["node-short-help-call", "node --test -h"],
+      ["node-version-call", "node --test --version"],
+      ["package-help-call", "npm test -- --help"],
+      ["optional-package-call", "npm run test --if-present"],
+      ["jest-list-call", "npx jest --listTests"],
+      ["vitest-list-call", "npx vitest list"],
+      ["pytest-collect-call", "pytest --collect-only"],
+      ["go-list-call", "go test -list Test"],
+      ["go-compile-call", "go test -c"],
+      ["cargo-no-run-call", "cargo test --no-run"],
+      ["cargo-list-call", "cargo test -- --list"],
+      ["bun-dry-run-call", "bun test --dry-run"],
     ]) {
       const announcedCommand = toolCallId === "echo-call" ? "npm test" : command;
       await hostHandlers.get("tool_execution_start")!({ toolCallId, toolName: "bash", args: { command: announcedCommand } }, context);
@@ -1642,7 +1661,7 @@ test("ordinary implementation tool events produce candidate-bound native test an
       await hostHandlers.get("tool_execution_end")!({ toolCallId, toolName: "bash", isError: false, result: {} }, context);
       await assert.rejects(
         tools.get("herdr_capture_native_evidence")!.execute("rejected-capture", {}, undefined, undefined, context),
-        /directly executed test command|typecheck and lint do not satisfy native tests/i,
+        /directly executed test command|typecheck and lint do not satisfy native tests|do not execute tests/i,
       );
     }
     await assert.rejects(tools.get("herdr_submit_native_verification")!.execute("rejected-verification", {
@@ -1669,6 +1688,60 @@ test("ordinary implementation tool events produce candidate-bound native test an
       codeStateDigest: candidate.codeStateDigest,
       findings: [],
     }, undefined, undefined, context);
+    await hostHandlers.get("tool_result")!({
+      toolCallId: "failed-test-rerun",
+      toolName: "bash",
+      input: { command: "node --import tsx --test test/execution-controller.test.ts" },
+      isError: true,
+    }, context);
+    await assert.rejects(
+      tools.get("herdr_capture_native_evidence")!.execute("stale-test-capture", {}, undefined, undefined, context),
+      /lacks observed successful native tests/i,
+    );
+    await hostHandlers.get("tool_result")!({
+      toolCallId: "successful-test-rerun",
+      toolName: "bash",
+      input: { command: "node --import tsx --test test/execution-controller.test.ts" },
+      isError: false,
+    }, context);
+    await hostHandlers.get("tool_execution_start")!({
+      toolCallId: "blocking-review-rerun",
+      toolName: "subagent",
+      args: { task: "Review the implementation again" },
+    }, context);
+    await hostHandlers.get("tool_execution_end")!({
+      toolCallId: "blocking-review-rerun",
+      toolName: "subagent",
+      isError: false,
+      result: { details: { runId: "blocking-review-run", results: [{
+        agent: "reviewer", task: "Review the implementation again", exitCode: 0,
+        structuredAcceptanceReport: {
+          criteriaSatisfied: [{ id: "review", status: "not-satisfied", evidence: "A blocker remains" }],
+          reviewFindings: ["blocker: native evidence is stale"], residualRisks: ["acceptance bypass"],
+        },
+      }] } },
+    }, context);
+    await assert.rejects(
+      tools.get("herdr_capture_native_evidence")!.execute("stale-review-capture", {}, undefined, undefined, context),
+      /structured no-blocker review/i,
+    );
+    await hostHandlers.get("tool_execution_start")!({
+      toolCallId: "passing-review-rerun",
+      toolName: "subagent",
+      args: { task: "Review the corrected implementation" },
+    }, context);
+    await hostHandlers.get("tool_execution_end")!({
+      toolCallId: "passing-review-rerun",
+      toolName: "subagent",
+      isError: false,
+      result: { details: { runId: "passing-review-run", results: [{
+        agent: "reviewer", task: "Review the corrected implementation", exitCode: 0,
+        structuredAcceptanceReport: {
+          criteriaSatisfied: [{ id: "review", status: "satisfied", evidence: "No blocking findings" }],
+          reviewFindings: ["no blockers"], residualRisks: ["none"],
+        },
+      }] } },
+    }, context);
     await hostHandlers.get("agent_settled")!({}, context);
     const nativeEvidenceModule = await import("../src/native-evidence.js");
     const records = await nativeEvidenceModule.readProducedNativeEvidence(

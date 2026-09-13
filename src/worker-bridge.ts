@@ -125,6 +125,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
       if (!event.isError) {
         await retainNativeExecution(nativeExecutions, event.toolCallId, "tests", ctx.cwd, ctx.sessionManager.getSessionId(), `bash:${commandDigest}`);
       } else {
+        await invalidateNativeExecutions(nativeExecutions, "tests", ctx.cwd);
         nativeTestDiagnostics.push("The directly executed native test command failed according to Pi's tool execution result; rerun it successfully after the final edit");
       }
     } else if (testCommand.status === "unsupported") {
@@ -133,8 +134,13 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   });
   pi.on("tool_execution_end", async (event, ctx): Promise<void> => {
     activeTools.delete(event.toolCallId);
-    if (event.toolName === "subagent" && !event.isError && isPassingReviewResult(event.result)) {
-      await retainNativeExecution(nativeExecutions, event.toolCallId, "reviews", ctx.cwd, ctx.sessionManager.getSessionId(), "subagent:structured-acceptance:no-blockers");
+    if (event.toolName === "subagent" && !event.isError) {
+      const reviewResult = classifyNativeReviewResult(event.result);
+      if (reviewResult === "passed") {
+        await retainNativeExecution(nativeExecutions, event.toolCallId, "reviews", ctx.cwd, ctx.sessionManager.getSessionId(), "subagent:structured-acceptance:no-blockers");
+      } else if (reviewResult === "blocked") {
+        await invalidateNativeExecutions(nativeExecutions, "reviews", ctx.cwd);
+      }
     }
     await writeLifecycle(ctx, "working", outstandingJobs());
   });
@@ -162,7 +168,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   });
 
   pi.on("before_agent_start", (event): { systemPrompt: string } => ({
-    systemPrompt: `${event.systemPrompt}\n\nHerdr native evidence requirements: run project-native tests through one directly executed bash test command after the final edit; shell wrappers, chaining, output claims, status masking, typecheck, and lint do not count as tests. Perform the implementation skill's final review with the installed subagent tool in foreground mode and require a structured acceptance report whose reviewFindings explicitly says no blockers. The live worker bridge automatically captures both execution-backed results when Pi settles on the unchanged final code state. Do not manufacture receipt files or substitute a prose completion claim.`,
+    systemPrompt: `${event.systemPrompt}\n\nHerdr native evidence requirements: run project-native tests through one directly executed bash test command after the final edit; shell wrappers, chaining, output claims, status masking, help/version/list/collect-only/no-run/dry-run modes, typecheck, and lint do not count as tests. Rerun an obligation successfully if a later test fails or review blocks on the same code state. Perform the implementation skill's final review with the installed subagent tool in foreground mode and require a structured acceptance report whose reviewFindings explicitly says no blockers. The live worker bridge automatically captures both execution-backed results when Pi settles on the unchanged final code state. Do not manufacture receipt files or substitute a prose completion claim.`,
   }));
 
   pi.registerTool({
@@ -390,7 +396,26 @@ function classifyNativeTestCommand(command: string): NativeTestCommandClassifica
     };
   }
   const tokens = trimmed.split(/\s+/);
-  const executable = tokens[0]?.toLowerCase();
+  const normalizedTokens = tokens.map((token): string => token.toLowerCase());
+  const executable = normalizedTokens[0];
+  const hasOption = (option: string): boolean => normalizedTokens.some((token): boolean =>
+    token === option || token.startsWith(`${option}=`));
+  const hasNonExecutingMode = [
+    "--help", "-h", "--version", "--dry-run", "--dryrun", "--no-run", "--if-present",
+    "--ignore-scripts", "--passwithnotests", "--collect-only", "--collectonly", "--co",
+    "--list", "--listtests", "--list-tests", "--showconfig", "--show-config", "--clearcache",
+    "--markers", "--fixtures", "--fixtures-per-test",
+  ].some(hasOption) ||
+    (executable === "node" && ["-v", "--v8-options", "--completion-bash"].some(hasOption)) ||
+    (executable === "go" && normalizedTokens[1] === "test" && (["-c", "-list"].some(hasOption))) ||
+    (executable === "npx" && normalizedTokens.some((token, index): boolean =>
+      token === "list" && normalizedTokens.slice(1, index).some((candidate): boolean => ["jest", "vitest"].includes(candidate))));
+  if (hasNonExecutingMode) {
+    return {
+      status: "unsupported",
+      diagnostic: "Help, version, list, collect-only, no-run, and dry-run modes do not execute tests and cannot satisfy native test evidence",
+    };
+  }
   const directPackageTest = (runner: string): boolean => {
     if (executable !== runner) return false;
     if (tokens[1] === "test") return true;
@@ -398,22 +423,26 @@ function classifyNativeTestCommand(command: string): NativeTestCommandClassifica
   };
   const directNodeTest = (): boolean => {
     if (executable !== "node") return false;
-    for (let index = 1; index < tokens.length; index += 1) {
-      const token = tokens[index]!;
-      if (token === "--test" || token.startsWith("--test=")) return true;
+    let sawTestMode = false;
+    for (let index = 1; index < normalizedTokens.length; index += 1) {
+      const token = normalizedTokens[index]!;
+      if (token === "--test" || token.startsWith("--test=")) {
+        sawTestMode = true;
+        continue;
+      }
       if (["-e", "--eval", "-p", "--print"].includes(token)) return false;
       if (token === "--import" || token === "--require" || token === "-r") {
         index += 1;
         if (index >= tokens.length) return false;
-      } else if (!token.startsWith("-")) {
+      } else if (!token.startsWith("-") && !sawTestMode) {
         return false;
       }
     }
-    return false;
+    return sawTestMode;
   };
   const directNpxTest = executable === "npx" &&
-    (["jest", "vitest"].includes(tokens[1] ?? "") ||
-      (tokens[1] === "--yes" && ["jest", "vitest"].includes(tokens[2] ?? "")));
+    (["jest", "vitest"].includes(normalizedTokens[1] ?? "") ||
+      (normalizedTokens[1] === "--yes" && ["jest", "vitest"].includes(normalizedTokens[2] ?? "")));
   const supported = directPackageTest("npm") || directPackageTest("pnpm") || directPackageTest("yarn") ||
     directPackageTest("bun") || directNodeTest() || directNpxTest || executable === "pytest" ||
     ((executable === "python" || executable === "python3") && tokens[1] === "-m" && tokens[2] === "pytest") ||
@@ -506,45 +535,67 @@ async function retainNativeExecution(
   sessionId: string,
   detail: string,
 ): Promise<void> {
-  const git = new RealGitWorktreeAdapter();
-  const worktree = await git.inspectWorktree(cwd);
-  const candidate = await git.captureCandidate({ path: cwd, sourceBase: worktree.head });
+  const codeStateDigest = await captureCodeStateDigest(cwd);
   executions.set(toolCallId, {
     kind,
-    codeStateDigest: candidate.codeStateDigest,
+    codeStateDigest,
     completedAt: new Date().toISOString(),
     executionReference: `pi-session:${sessionId}:tool:${toolCallId}:${detail}`,
   });
 }
 
-function isPassingReviewResult(result: unknown): boolean {
-  if (!result || typeof result !== "object" || Array.isArray(result)) return false;
+async function invalidateNativeExecutions(
+  executions: Map<string, NativeExecutionProof>,
+  kind: "tests" | "reviews",
+  cwd: string,
+): Promise<void> {
+  const codeStateDigest = await captureCodeStateDigest(cwd);
+  for (const [toolCallId, proof] of executions) {
+    if (proof.kind === kind && proof.codeStateDigest === codeStateDigest) executions.delete(toolCallId);
+  }
+}
+
+async function captureCodeStateDigest(cwd: string): Promise<string> {
+  const git = new RealGitWorktreeAdapter();
+  const worktree = await git.inspectWorktree(cwd);
+  const candidate = await git.captureCandidate({ path: cwd, sourceBase: worktree.head });
+  return candidate.codeStateDigest;
+}
+
+function classifyNativeReviewResult(result: unknown): "passed" | "blocked" | "unrelated" {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return "unrelated";
   const details = (result as Record<string, unknown>).details;
-  if (!details || typeof details !== "object" || Array.isArray(details)) return false;
+  if (!details || typeof details !== "object" || Array.isArray(details)) return "unrelated";
   const record = details as Record<string, unknown>;
-  if (record.background === true || !Array.isArray(record.results) || record.results.length === 0) return false;
-  return record.results.every((value): boolean => {
-    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  if (record.background === true || !Array.isArray(record.results) || record.results.length === 0) return "unrelated";
+  let blocked = false;
+  for (const value of record.results) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return "unrelated";
     const child = value as Record<string, unknown>;
-    if (child.exitCode !== 0 || child.error !== undefined ||
-      !/review/i.test(`${String(child.agent ?? "")} ${String(child.task ?? "")}`)
-    ) return false;
+    if (!/review/i.test(`${String(child.agent ?? "")} ${String(child.task ?? "")}`)) return "unrelated";
     const report = child.structuredAcceptanceReport ??
       (child.acceptance && typeof child.acceptance === "object" && !Array.isArray(child.acceptance)
         ? (child.acceptance as Record<string, unknown>).childReport
         : undefined);
-    if (!report || typeof report !== "object" || Array.isArray(report)) return false;
+    if (child.exitCode !== 0 || child.error !== undefined ||
+      !report || typeof report !== "object" || Array.isArray(report)
+    ) {
+      blocked = true;
+      continue;
+    }
     const acceptance = report as Record<string, unknown>;
     const criteria = acceptance.criteriaSatisfied;
     const findings = acceptance.reviewFindings;
-    return Array.isArray(criteria) && criteria.some((criterion): boolean =>
+    const passed = Array.isArray(criteria) && criteria.some((criterion): boolean =>
       Boolean(criterion) && typeof criterion === "object" && !Array.isArray(criterion) &&
       (criterion as Record<string, unknown>).status === "satisfied") && criteria.every((criterion): boolean =>
       Boolean(criterion) && typeof criterion === "object" && !Array.isArray(criterion) &&
       ["satisfied", "not-applicable"].includes(String((criterion as Record<string, unknown>).status))) &&
       Array.isArray(findings) && findings.length > 0 && findings.every((finding): boolean =>
         typeof finding === "string" && /^(?:no blockers?|none|no findings?)\.?$/i.test(finding.trim()));
-  });
+    if (!passed) blocked = true;
+  }
+  return blocked ? "blocked" : "passed";
 }
 
 function eventIdentity(value: unknown): string | undefined {
