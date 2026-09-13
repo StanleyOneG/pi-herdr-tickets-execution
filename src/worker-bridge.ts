@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import { mkdir, readFile, unlink } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 
 import type {
@@ -11,6 +11,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 
+import { atomicWritePrivateFile } from "./atomic-file.js";
 import type { CapturedModel, ThinkingLevel } from "./contracts.js";
 import {
   WORKER_BRIDGE_AGENT_ENV,
@@ -133,7 +134,7 @@ export async function requestLocalDecision(input: DecisionInput, signal?: AbortS
   };
   await mkdir(requestDirectory, { recursive: true, mode: 0o700 });
   await mkdir(responseDirectory, { recursive: true, mode: 0o700 });
-  await atomicWrite(join(requestDirectory, `${id}.json`), `${JSON.stringify(request)}\n`);
+  await atomicWritePrivateFile(join(requestDirectory, `${id}.json`), `${JSON.stringify(request)}\n`);
   const responsePath = join(responseDirectory, `${id}.json`);
   for (;;) {
     if (signal?.aborted) throw new Error("Local decision wait was interrupted; the durable question remains pending");
@@ -153,48 +154,8 @@ export async function requestLocalDecision(input: DecisionInput, signal?: AbortS
   }
 }
 
-async function atomicWrite(path: string, content: string): Promise<void> {
-  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  let renamed = false;
-  try {
-    const file = await open(temporary, "wx", 0o600);
-    try {
-      await file.writeFile(content, "utf8");
-      await file.sync();
-    } finally {
-      await file.close();
-    }
-    await rename(temporary, path);
-    renamed = true;
-  } finally {
-    if (!renamed) {
-      try { await unlink(temporary); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    }
-  }
-}
-
 async function writeReceipt(receipt: WorkerReadinessReceipt): Promise<void> {
   const endpoint = process.env[WORKER_BRIDGE_ENDPOINT_ENV]!;
   await mkdir(dirname(endpoint), { recursive: true, mode: 0o700 });
-  const temporary = `${endpoint}.${process.pid}.${randomUUID()}.tmp`;
-  let renamed = false;
-  try {
-    const file = await open(temporary, "wx", 0o600);
-    try {
-      await file.writeFile(`${JSON.stringify(receipt)}\n`, "utf8");
-      await file.sync();
-    } finally {
-      await file.close();
-    }
-    await rename(temporary, endpoint);
-    renamed = true;
-  } finally {
-    if (!renamed) {
-      try {
-        await unlink(temporary);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      }
-    }
-  }
+  await atomicWritePrivateFile(endpoint, `${JSON.stringify(receipt)}\n`);
 }

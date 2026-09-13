@@ -18,16 +18,20 @@ import type {
   PaginationRequest,
   PreparationRecord,
   WorkerIdentity,
+  WorkerObservation,
   PrepareRequest,
+  StartTicketRequest,
   RecordWorkerObservationRequest,
 } from "./contracts.js";
 import { PreparationController } from "./controller.js";
+import { isBatchProposal, isCapturedModel, isSourceEvidence, isWorkerIdentity } from "./state-validation.js";
 import type { WorkerDecisionRequest } from "./worker-bridge-protocol.js";
 
 const MAX_IPC_BYTES = 6 * 1024 * 1024;
 const DAEMON_BIN_PATH = fileURLToPath(new URL("../bin/herdr-controller.mjs", import.meta.url));
 
-export interface WorkerDecisionMonitor {
+export interface WorkerExecutionMonitor {
+  inspect(identity: WorkerIdentity): Promise<WorkerObservation>;
   nextDecision(identity: WorkerIdentity): Promise<WorkerDecisionRequest | undefined>;
   acknowledgeDecision(identity: WorkerIdentity, decisionId: string): Promise<void>;
 }
@@ -74,7 +78,7 @@ export class LocalControllerDaemon {
     private readonly actor: symbol,
     private readonly socketPath: string,
     private readonly token: string,
-    private readonly decisionMonitor?: WorkerDecisionMonitor,
+    private readonly workerMonitor?: WorkerExecutionMonitor,
   ) {}
 
   async start(options: { markRestarted?: boolean } = {}): Promise<void> {
@@ -108,8 +112,8 @@ export class LocalControllerDaemon {
         });
       });
       await chmod(this.socketPath, 0o600);
-      if (this.decisionMonitor) {
-        this.monitorTimer = setInterval((): void => { void this.pollDecisions(); }, 500);
+      if (this.workerMonitor) {
+        this.monitorTimer = setInterval((): void => { void this.pollWorkers(); }, 500);
         this.monitorTimer.unref();
       }
     } catch (error) {
@@ -172,8 +176,8 @@ export class LocalControllerDaemon {
     }
   }
 
-  private async pollDecisions(): Promise<void> {
-    if (!this.decisionMonitor || this.monitoring) return;
+  private async pollWorkers(): Promise<void> {
+    if (!this.workerMonitor || this.monitoring) return;
     this.monitoring = true;
     try {
       let cursor: string | undefined;
@@ -182,29 +186,68 @@ export class LocalControllerDaemon {
         if (!status.ok) return;
         for (const attempt of status.value.executionAttempts) {
           if (!attempt.worker || (attempt.lifecycle !== "running" && attempt.lifecycle !== "pending-decision")) continue;
-          const request = await this.decisionMonitor.nextDecision(attempt.worker);
-          if (!request) continue;
-          const recorded = await this.controller.recordWorkerObservation(this.actor, {
-            attemptId: attempt.id,
-            observation: {
-              identity: attempt.worker,
-              status: "blocked",
-              artifactReferences: [],
-              decision: {
-                transportId: request.id,
-                question: request.question,
-                context: request.context,
-                options: request.options,
-                recommendation: request.recommendation,
-              },
-            },
-          });
-          if (recorded.ok) await this.decisionMonitor.acknowledgeDecision(attempt.worker, request.id);
+          const controlGeneration = attempt.controlGeneration ?? 0;
+          let failureControlGeneration = controlGeneration;
+          try {
+            const request = await this.workerMonitor.nextDecision(attempt.worker);
+            if (request) {
+              const recorded = await this.controller.recordWorkerObservation(this.actor, {
+                attemptId: attempt.id,
+                controlGeneration,
+                observation: {
+                  identity: attempt.worker,
+                  status: "blocked",
+                  artifactReferences: [],
+                  decision: {
+                    transportId: request.id,
+                    question: request.question,
+                    context: request.context,
+                    options: request.options,
+                    recommendation: request.recommendation,
+                  },
+                },
+              });
+              const durableDecision = recorded.ok
+                ? recorded.value.decisions.find((decision): boolean => decision.id === request.id)
+                : undefined;
+              if (
+                recorded.ok && recorded.value.controlGeneration === controlGeneration + 1 &&
+                recorded.value.lifecycle !== "needs-attention" && durableDecision &&
+                durableDecision.question === request.question && durableDecision.context === request.context &&
+                durableDecision.recommendation === request.recommendation &&
+                JSON.stringify(durableDecision.options) === JSON.stringify(request.options)
+              ) {
+                failureControlGeneration = recorded.value.controlGeneration;
+                await this.workerMonitor.acknowledgeDecision(attempt.worker, request.id);
+              }
+              continue;
+            }
+            const observation = await this.workerMonitor.inspect(attempt.worker);
+            await this.controller.recordWorkerObservation(this.actor, {
+              attemptId: attempt.id,
+              controlGeneration,
+              observation,
+            });
+          } catch {
+            try {
+              await this.controller.recordWorkerObservation(this.actor, {
+                attemptId: attempt.id,
+                controlGeneration: failureControlGeneration,
+                observation: {
+                  identity: attempt.worker,
+                  status: "unknown",
+                  artifactReferences: [],
+                },
+              });
+            } catch {
+              // A later status poll may retry only if durable state still permits monitoring.
+            }
+          }
         }
         cursor = status.value.nextCursor ?? undefined;
       } while (cursor);
     } catch {
-      // The durable request stays in the private channel for a later bounded poll.
+      // A controller status failure leaves durable state unchanged for a later bounded poll.
     } finally {
       this.monitoring = false;
     }
@@ -247,6 +290,7 @@ export class LocalControllerDaemon {
   }
 
   private async dispatch(method: RequestMethod, params: unknown[]): Promise<unknown> {
+    validateMethodParams(method, params);
     if (method === "ping") return { pid: process.pid };
     switch (method) {
       case "prepare": return this.controller.prepare(this.actor, params[0] as PrepareRequest, params[1] as AdmissionSnapshot);
@@ -391,6 +435,122 @@ function parseRequest(record: string): IpcRequest {
   if (typeof request.id !== "string" || request.id.length > 200 || typeof request.token !== "string" ||
     !methods.has(request.method as RequestMethod) || !Array.isArray(request.params)) throw new Error("Malformed IPC request");
   return request as IpcRequest;
+}
+
+function validateMethodParams(method: RequestMethod, params: unknown[]): void {
+  let valid = false;
+  switch (method) {
+    case "ping": valid = params.length === 0; break;
+    case "prepare": valid = params.length === 2 && isPrepareRequest(params[0]) && isAdmissionSnapshot(params[1]); break;
+    case "submitProposal": valid = params.length === 2 && boundedText(params[0]) && isBatchProposal(params[1]); break;
+    case "approve":
+    case "validateApproval": valid = params.length === 2 && boundedText(params[0]) && isApprovalRequest(params[1]); break;
+    case "preview":
+    case "getPreparation": valid = params.length === 1 && boundedText(params[0]); break;
+    case "startTicket": valid = params.length === 1 && isStartTicketRequest(params[0]); break;
+    case "attachAttempt":
+    case "pauseAttempt":
+    case "resumeAttempt":
+    case "takeOverAttempt":
+    case "returnAttempt": valid = params.length === 1 && isAttemptRequest(params[0]); break;
+    case "answerDecision": valid = params.length === 1 && isAnswerDecisionRequest(params[0]); break;
+    case "recordWorkerObservation": valid = params.length === 1 && isRecordWorkerObservationRequest(params[0]); break;
+    case "status": valid = params.length === 1 && isPaginationRequest(params[0]); break;
+  }
+  if (!valid) throw new Error("Malformed IPC method parameters");
+}
+
+function isPrepareRequest(value: unknown): value is PrepareRequest {
+  return isObjectWithKeys(value, ["specReference", "controllerName"]) &&
+    boundedText(value.specReference) && boundedText(value.controllerName);
+}
+
+function isAdmissionSnapshot(value: unknown): value is AdmissionSnapshot {
+  if (!isObjectWithKeys(value, ["project", "runtime", "model"])) return false;
+  const project = value.project;
+  const runtime = value.runtime;
+  const model = value.model;
+  return isObjectWithKeys(project, ["root", "identity", "head", "branch", "instructionFiles"]) &&
+    [project.root, project.identity, project.head, project.branch].every((item): boolean => boundedText(item)) &&
+    boundedStringArray(project.instructionFiles, 200) &&
+    isObjectWithKeys(runtime, ["platform", "piVersion", "herdrVersion", "projectTrusted", "skillCommands", "toolNames"]) &&
+    (runtime.platform === "linux" || runtime.platform === "darwin") &&
+    (runtime.piVersion === undefined || boundedText(runtime.piVersion)) &&
+    (runtime.herdrVersion === undefined || boundedText(runtime.herdrVersion)) &&
+    typeof runtime.projectTrusted === "boolean" && boundedStringArray(runtime.skillCommands, 200) &&
+    boundedStringArray(runtime.toolNames, 200) &&
+    isObjectWithKeys(model, ["provider", "id", "thinkingLevel", "contextWindow", "authenticated", "available", "authError"]) &&
+    isCapturedModel(model) && typeof model.authenticated === "boolean" && typeof model.available === "boolean" &&
+    (model.authError === undefined || boundedText(model.authError));
+}
+
+function isApprovalRequest(value: unknown): value is ApprovalRequest {
+  return isObjectWithKeys(value, ["approvedBy", "proposalDigest", "projectHead", "model", "evidence"]) &&
+    boundedText(value.approvedBy) && digestText(value.proposalDigest) && boundedText(value.projectHead) &&
+    isCapturedModel(value.model) && Array.isArray(value.evidence) && value.evidence.length <= 1_000 &&
+    value.evidence.every(isSourceEvidence);
+}
+
+function isStartTicketRequest(value: unknown): value is StartTicketRequest {
+  return isObjectWithKeys(value, ["preparationId", "ticketIdentity", "workspaceId"]) &&
+    [value.preparationId, value.ticketIdentity, value.workspaceId].every((item): boolean => boundedText(item));
+}
+
+function isAttemptRequest(value: unknown): value is AttemptRequest {
+  return isObjectWithKeys(value, ["attemptId"]) && boundedText(value.attemptId);
+}
+
+function isAnswerDecisionRequest(value: unknown): value is AnswerDecisionRequest {
+  return isObjectWithKeys(value, ["attemptId", "decisionId", "answer", "answeredBy"]) &&
+    boundedText(value.attemptId) && boundedText(value.decisionId) && boundedText(value.answer, 4_000) &&
+    boundedText(value.answeredBy, 500);
+}
+
+function isRecordWorkerObservationRequest(value: unknown): value is RecordWorkerObservationRequest {
+  return isObjectWithKeys(value, ["attemptId", "controlGeneration", "observation"]) && boundedText(value.attemptId) &&
+    typeof value.controlGeneration === "number" && Number.isSafeInteger(value.controlGeneration) &&
+    value.controlGeneration >= 0 && isWorkerObservation(value.observation);
+}
+
+function isWorkerObservation(value: unknown): value is WorkerObservation {
+  if (!isObjectWithKeys(value, ["identity", "status", "artifactReferences", "decision", "diagnostic", "completionText"])) return false;
+  if (!isWorkerIdentity(value.identity) || !["ready", "working", "idle", "done", "blocked", "missing", "unknown"].includes(value.status as string)) return false;
+  if (!boundedStringArray(value.artifactReferences, 50, true)) return false;
+  if (value.diagnostic !== undefined && !boundedText(value.diagnostic, 4_096)) return false;
+  if (value.completionText !== undefined && !boundedText(value.completionText, 64_000)) return false;
+  if (value.decision === undefined) return true;
+  const decision = value.decision;
+  return isObjectWithKeys(decision, ["transportId", "question", "context", "options", "recommendation"]) &&
+    (decision.transportId === undefined || (
+      typeof decision.transportId === "string" && /^[A-Za-z0-9_-]{1,200}$/.test(decision.transportId)
+    )) &&
+    boundedText(decision.question, 4_000) && boundedText(decision.context, 4_000) &&
+    boundedStringArray(decision.options, 20) && decision.options.length >= 1 &&
+    decision.options.every((option): boolean => option.length <= 1_000) && boundedText(decision.recommendation, 4_000);
+}
+
+function isPaginationRequest(value: unknown): value is PaginationRequest {
+  return isObjectWithKeys(value, ["limit", "cursor"]) && Number.isSafeInteger(value.limit) &&
+    (value.cursor === undefined || boundedText(value.cursor));
+}
+
+function isObjectWithKeys(value: unknown, allowed: string[]): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = new Set(allowed);
+  return Object.keys(value).every((key): boolean => keys.has(key));
+}
+
+function boundedText(value: unknown, maximum = 4_096): value is string {
+  return typeof value === "string" && value.trim().length > 0 && value.length <= maximum;
+}
+
+function boundedStringArray(value: unknown, maximumItems: number, allowEmpty = false): value is string[] {
+  return Array.isArray(value) && value.length <= maximumItems && (allowEmpty || value.length > 0) &&
+    value.every((item): boolean => boundedText(item));
+}
+
+function digestText(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/i.test(value);
 }
 
 function constantTimeEqual(left: string, right: string): boolean {

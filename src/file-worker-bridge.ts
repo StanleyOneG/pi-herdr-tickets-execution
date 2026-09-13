@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, open, readFile, readdir, rename, unlink } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join } from "node:path";
 
+import { atomicWritePrivateFile } from "./atomic-file.js";
 import type {
   WorkerBridgeChannel,
   WorkerBridgeTransport,
@@ -58,7 +59,7 @@ export class FileWorkerBridgeTransport implements WorkerBridgeTransport {
       requestDirectory,
       responseDirectory,
     };
-    await atomicWrite(join(this.directory, `${agentName}.channel.json`), `${JSON.stringify(channel)}\n`);
+    await atomicWritePrivateFile(join(this.directory, `${agentName}.channel.json`), `${JSON.stringify(channel)}\n`);
     return channel;
   }
 
@@ -107,7 +108,7 @@ export class FileWorkerBridgeTransport implements WorkerBridgeTransport {
   async deliverDecision(channel: WorkerBridgeChannel, answer: WorkerDecisionAnswer): Promise<void> {
     this.assertOwnedChannel(channel);
     if (!isDecisionAnswer(answer) || answer.nonce !== channel.nonce) throw new Error("Worker decision answer is malformed or stale");
-    await atomicWrite(join(channel.responseDirectory!, `${answer.id}.json`), `${JSON.stringify(answer)}\n`);
+    await atomicWritePrivateFile(join(channel.responseDirectory!, `${answer.id}.json`), `${JSON.stringify(answer)}\n`);
   }
 
   private async prepareRoot(): Promise<void> {
@@ -134,24 +135,6 @@ async function readBounded(path: string): Promise<string> {
   const data = await readFile(path);
   if (data.byteLength > MAX_RECEIPT_BYTES) throw new Error("Worker bridge record exceeds its bound");
   return data.toString("utf8");
-}
-
-async function atomicWrite(path: string, content: string): Promise<void> {
-  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  let renamed = false;
-  try {
-    const file = await open(temporary, "wx", 0o600);
-    try {
-      await file.writeFile(content, "utf8");
-      await file.sync();
-    } finally {
-      await file.close();
-    }
-    await rename(temporary, path);
-    renamed = true;
-  } finally {
-    if (!renamed) await removeIfPresent(temporary);
-  }
 }
 
 function isChannel(value: unknown): value is Required<WorkerBridgeChannel> {

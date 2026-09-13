@@ -137,6 +137,20 @@ export class RealGitWorktreeAdapter implements GitWorktreePort {
     return { path: root, commonDir, head, branch };
   }
 
+  async isCommitAncestor(path: string, ancestor: string, descendant: string): Promise<boolean> {
+    try {
+      await executeFile("git", ["merge-base", "--is-ancestor", ancestor, descendant], {
+        cwd: path,
+        encoding: "utf8",
+        maxBuffer: MAX_GIT_OUTPUT_BYTES,
+      });
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException & { code?: number }).code === 1) return false;
+      throw error;
+    }
+  }
+
   private async repositoryRoot(cwd: string): Promise<string> {
     return realpath(await this.gitText(cwd, ["rev-parse", "--show-toplevel"]));
   }

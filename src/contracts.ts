@@ -209,10 +209,13 @@ export interface PendingDecisionInput {
   recommendation: string;
 }
 
-export interface WorkerObservation {
+export interface WorkerDispatchAcknowledgement {
   identity: WorkerIdentity;
   status: WorkerStatus;
   artifactReferences: string[];
+}
+
+export interface WorkerObservation extends WorkerDispatchAcknowledgement {
   decision?: PendingDecisionInput;
   diagnostic?: string;
   completionText?: string;
@@ -250,8 +253,12 @@ export interface ExecutionAttempt {
   originalCheckout?: OriginalCheckoutSnapshot;
   worktreePlan?: TicketWorktreePlan;
   worktree?: WorktreeIdentity;
+  candidateHead?: string;
   workerAllocation?: WorkerAllocation;
   worker?: WorkerIdentity;
+  workerActiveAt?: string;
+  /** Omitted schema-1 attempts are generation zero until their next control mutation. */
+  controlGeneration?: number;
   setupOperations?: SetupOperationRecord[];
   suspendedFrom?: "running" | "pending-decision";
   decisions: DecisionRecord[];
@@ -276,6 +283,7 @@ export interface AnswerDecisionRequest extends AttemptRequest {
 }
 
 export interface RecordWorkerObservationRequest extends AttemptRequest {
+  controlGeneration: number;
   observation: WorkerObservation;
 }
 
@@ -292,6 +300,7 @@ export interface GitWorktreePort {
     plan: TicketWorktreePlan;
   }): Promise<WorktreeIdentity>;
   inspectWorktree(path: string): Promise<WorktreeIdentity>;
+  isCommitAncestor(path: string, ancestor: string, descendant: string): Promise<boolean>;
 }
 
 export interface WorkerRuntimePort {
@@ -306,7 +315,7 @@ export interface WorkerRuntimePort {
     model: CapturedModel;
   }): Promise<WorkerIdentity>;
   inspect(identity: WorkerIdentity): Promise<WorkerObservation>;
-  dispatchImplementation(identity: WorkerIdentity, ticketReference: string): Promise<WorkerObservation>;
+  dispatchImplementation(identity: WorkerIdentity, ticketReference: string): Promise<WorkerDispatchAcknowledgement>;
   deliverDecision(identity: WorkerIdentity, decisionId: string, answer: string): Promise<WorkerObservation>;
   focus(identity: WorkerIdentity): Promise<void>;
 }

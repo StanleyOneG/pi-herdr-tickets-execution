@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import type {
   CapturedModel,
   WorkerAllocation,
+  WorkerDispatchAcknowledgement,
   WorkerIdentity,
   WorkerObservation,
   WorkerRuntimePort,
@@ -92,7 +93,7 @@ export class HerdrWorkerRuntime implements WorkerRuntimePort {
     this.shellReadyTimeoutMs = positiveTimeout(options.shellReadyTimeoutMs ?? 30_000);
     this.agentStartTimeoutMs = positiveTimeout(options.agentStartTimeoutMs ?? 60_000);
     this.bridgeReadyTimeoutMs = positiveTimeout(options.bridgeReadyTimeoutMs ?? 10_000);
-    this.promptTimeoutMs = positiveTimeout(options.promptTimeoutMs ?? 1_800_000);
+    this.promptTimeoutMs = positiveTimeout(options.promptTimeoutMs ?? 30_000);
     this.pollIntervalMs = positiveTimeout(options.pollIntervalMs ?? 100);
     this.now = options.now ?? Date.now;
     this.sleep = options.sleep ?? ((milliseconds): Promise<void> =>
@@ -168,13 +169,12 @@ export class HerdrWorkerRuntime implements WorkerRuntimePort {
     return { identity: structuredClone(identity), status: agentStatus(current), artifactReferences: [] };
   }
 
-  async dispatchImplementation(identity: WorkerIdentity, ticketReference: string): Promise<WorkerObservation> {
+  async dispatchImplementation(identity: WorkerIdentity, ticketReference: string): Promise<WorkerDispatchAcknowledgement> {
     if (!bounded(ticketReference) || /[\r\n\0]/.test(ticketReference)) throw new Error("Ticket reference is unsafe for interactive dispatch");
     await this.assertDispatchable(identity);
     const result = await this.command([
       "agent", "prompt", identity.agentName, `/skill:implement ${ticketReference}`,
-      "--wait", "--timeout", String(this.promptTimeoutMs),
-    ], this.promptTimeoutMs + 5_000);
+    ], this.promptTimeoutMs);
     const agent = parseAgent(result);
     assertOwnedAgent(agent, identity);
     return { identity: structuredClone(identity), status: agentStatus(agent), artifactReferences: [] };

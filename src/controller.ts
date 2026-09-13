@@ -24,6 +24,7 @@ import type {
   StartTicketRequest,
   TicketWorktreePlan,
   WorkerAllocation,
+  WorkerDispatchAcknowledgement,
   WorkerIdentity,
   WorkerObservation,
 } from "./contracts.js";
@@ -72,6 +73,7 @@ export type {
   ThinkingLevel,
   TicketWorktreePlan,
   WorkerAllocation,
+  WorkerDispatchAcknowledgement,
   WorkerIdentity,
   WorkerObservation,
   WorkerRuntimePort,
@@ -390,6 +392,7 @@ export class PreparationController {
       createdAt: now,
       updatedAt: now,
       worktreePlan: structuredClone(plan),
+      controlGeneration: 0,
       setupOperations: [],
       decisions: [],
       artifactReferences: [],
@@ -425,6 +428,7 @@ export class PreparationController {
         return this.attention(loaded.value, attempt, "Created ticket worktree identity does not match its durable plan");
       }
       attempt.worktree = structuredClone(worktree);
+      attempt.candidateHead = worktree.head;
       attempt.lifecycle = "starting";
       const worktreeSaved = await this.persistAttempt(loaded.value, attempt);
       if (!worktreeSaved.ok) return worktreeSaved;
@@ -461,8 +465,8 @@ export class PreparationController {
       if (!guardedBeforeDispatch.ok || guardedBeforeDispatch.value.lifecycle === "needs-attention") return guardedBeforeDispatch;
       const ownership = await this.verifyWorkerOwnership(loaded.value, attempt);
       if (!ownership.ok || ownership.value.lifecycle === "needs-attention") return ownership;
-      const observation = await execution.worker.dispatchImplementation(worker, ticket.identity);
-      return this.applyWorkerObservation(loaded.value, attempt, observation);
+      const acknowledgement = await execution.worker.dispatchImplementation(worker, ticket.identity);
+      return this.applyDispatchAcknowledgement(loaded.value, attempt, acknowledgement);
     } catch {
       return this.attention(loaded.value, attempt, "Execution infrastructure returned an error or ambiguous timeout");
     }
@@ -534,6 +538,7 @@ export class PreparationController {
     }
     attempt.suspendedFrom = attempt.lifecycle;
     attempt.lifecycle = "paused";
+    advanceControlGeneration(attempt);
     return this.persistAttempt(state, attempt);
   }
 
@@ -555,6 +560,7 @@ export class PreparationController {
     if (!guarded.ok || guarded.value.lifecycle === "needs-attention") return guarded;
     attempt.lifecycle = hasPendingDecision(attempt) ? "pending-decision" : "running";
     delete attempt.suspendedFrom;
+    advanceControlGeneration(attempt);
     const resumed = await this.persistAttempt(state, attempt);
     if (!resumed.ok) return resumed;
     return this.deliverAnsweredDecisions(state, attempt);
@@ -574,6 +580,7 @@ export class PreparationController {
       attempt.suspendedFrom = attempt.lifecycle === "pending-decision" ? "pending-decision" : "running";
     }
     attempt.lifecycle = "takeover";
+    advanceControlGeneration(attempt);
     const stopped = await this.persistAttempt(state, attempt);
     if (!stopped.ok) return stopped;
     const guarded = await this.verifyOwnedWorkerAndGit(state, attempt);
@@ -600,6 +607,7 @@ export class PreparationController {
     if (!guarded.ok || guarded.value.lifecycle === "needs-attention") return guarded;
     attempt.lifecycle = hasPendingDecision(attempt) ? "pending-decision" : "running";
     delete attempt.suspendedFrom;
+    advanceControlGeneration(attempt);
     const returned = await this.persistAttempt(state, attempt);
     if (!returned.ok) return returned;
     return this.deliverAnsweredDecisions(state, attempt, execution.worker);
@@ -628,6 +636,7 @@ export class PreparationController {
     decision.answer = request.answer;
     decision.answeredBy = request.answeredBy;
     decision.answeredAt = this.dependencies.now().toISOString();
+    advanceControlGeneration(attempt);
     const answered = await this.persistAttempt(state, attempt);
     if (!answered.ok) return answered;
     if (attempt.lifecycle === "takeover" || attempt.lifecycle === "paused" || attempt.lifecycle === "restart-required") {
@@ -656,7 +665,19 @@ export class PreparationController {
   ): Promise<ControllerResult<ExecutionAttempt>> {
     const context = await this.mutableAttempt(actor, request.attemptId);
     if (!context.ok) return context;
-    return this.applyWorkerObservation(context.value.state, context.value.attempt, request.observation);
+    const { state, attempt } = context.value;
+    if (!Number.isSafeInteger(request.controlGeneration) || request.controlGeneration < 0) {
+      return failure("execution-validation", ["A nonnegative worker observation control generation is required"]);
+    }
+    if (request.controlGeneration !== currentControlGeneration(attempt)) {
+      return success(structuredClone(attempt));
+    }
+    if (attempt.lifecycle !== "running" && attempt.lifecycle !== "pending-decision") {
+      return success(structuredClone(attempt));
+    }
+    const guarded = await this.verifyGitGuard(state, attempt);
+    if (!guarded.ok || guarded.value.lifecycle === "needs-attention") return guarded;
+    return this.applyWorkerObservation(state, attempt, request.observation);
   }
 
   private async controllerRestartedOperation(
@@ -672,6 +693,7 @@ export class PreparationController {
     for (const attempt of loaded.value.executionAttempts) {
       if (!isExecuting(attempt.lifecycle)) continue;
       attempt.owner = structuredClone(execution.owner);
+      advanceControlGeneration(attempt);
       if (attempt.lifecycle !== "paused" && attempt.lifecycle !== "takeover") {
         if (attempt.lifecycle === "running" || attempt.lifecycle === "pending-decision") {
           attempt.suspendedFrom = attempt.lifecycle;
@@ -762,6 +784,7 @@ export class PreparationController {
     attempt.lifecycle = "needs-attention";
     delete attempt.suspendedFrom;
     attempt.diagnostics = [diagnostic];
+    advanceControlGeneration(attempt);
     return this.persistAttempt(state, attempt);
   }
 
@@ -779,8 +802,18 @@ export class PreparationController {
         return this.attention(state, attempt, "Original checkout changed after its execution baseline");
       }
       const currentWorktree = await execution.git.inspectWorktree(attempt.worktree.path);
-      if (digest(currentWorktree) !== digest(attempt.worktree)) {
-        return this.attention(state, attempt, "Ticket worktree path, branch, base, or common directory changed");
+      if (
+        currentWorktree.path !== attempt.worktree.path || currentWorktree.branch !== attempt.worktree.branch ||
+        currentWorktree.commonDir !== attempt.worktree.commonDir
+      ) {
+        return this.attention(state, attempt, "Ticket worktree path, branch, or common directory changed");
+      }
+      if (!await execution.git.isCommitAncestor(attempt.worktree.path, attempt.worktree.head, currentWorktree.head)) {
+        return this.attention(state, attempt, "Ticket candidate no longer descends from the approved base");
+      }
+      if (attempt.candidateHead !== currentWorktree.head) {
+        attempt.candidateHead = currentWorktree.head;
+        return this.persistAttempt(state, attempt);
       }
       return success(structuredClone(attempt));
     } catch {
@@ -844,6 +877,31 @@ export class PreparationController {
     }
   }
 
+  private async applyDispatchAcknowledgement(
+    state: ControllerState,
+    attempt: ExecutionAttempt,
+    acknowledgement: WorkerDispatchAcknowledgement,
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    if (!attempt.worker || !sameWorker(acknowledgement.identity, attempt.worker)) {
+      return this.attention(state, attempt, "Worker occupant or saved Pi session changed during implementation dispatch");
+    }
+    if (!isWorkerStatus(acknowledgement.status) || acknowledgement.status === "missing" || acknowledgement.status === "unknown") {
+      return this.attention(state, attempt, "Implementation dispatch returned an invalid worker state");
+    }
+    if (!validReferences(acknowledgement.artifactReferences)) {
+      return this.attention(state, attempt, "Implementation dispatch returned invalid or excessive artifact references");
+    }
+    attempt.artifactReferences = uniqueReferences([...attempt.artifactReferences, ...acknowledgement.artifactReferences]);
+    if (attempt.artifactReferences.length > MAX_ATTEMPT_REFERENCES) {
+      return this.attention(state, attempt, "Attempt artifact reference capacity was reached");
+    }
+    if (acknowledgement.status === "working" || acknowledgement.status === "blocked") {
+      attempt.workerActiveAt = this.dependencies.now().toISOString();
+    }
+    attempt.lifecycle = "running";
+    return this.persistAttempt(state, attempt);
+  }
+
   private async applyWorkerObservation(
     state: ControllerState,
     attempt: ExecutionAttempt,
@@ -865,36 +923,49 @@ export class PreparationController {
     }
     attempt.artifactReferences = references;
     if (observation.status === "missing" || observation.status === "unknown") {
-      return this.attention(state, attempt, "Owned worker is missing or in an unknown state");
+      return this.attention(state, attempt, "Worker monitoring failed or worker ownership changed");
+    }
+    if (observation.decision?.transportId !== undefined && typeof observation.decision.transportId !== "string") {
+      return this.attention(state, attempt, "Worker returned a malformed local decision identity");
+    }
+    if (observation.status === "blocked" && (!observation.decision || !validDecisionInput(observation.decision))) {
+      return this.attention(state, attempt, "Worker is blocked without a bounded structured local decision");
     }
     if (observation.status === "blocked") {
-      if (!observation.decision || !validDecisionInput(observation.decision)) {
-        return this.attention(state, attempt, "Worker is blocked without a bounded structured local decision");
-      }
+      const decisionInput = observation.decision!;
       const existing = attempt.decisions.find((decision): boolean =>
-        (observation.decision!.transportId !== undefined && decision.id === observation.decision!.transportId) ||
-        (decision.state === "pending" && decision.question === observation.decision!.question)
+        (decisionInput.transportId !== undefined && decision.id === decisionInput.transportId) ||
+        (decision.state === "pending" && decision.question === decisionInput.question)
       );
       if (existing && (
-        existing.question !== observation.decision.question || existing.context !== observation.decision.context ||
-        digest(existing.options) !== digest(observation.decision.options) || existing.recommendation !== observation.decision.recommendation
+        existing.question !== decisionInput.question || existing.context !== decisionInput.context ||
+        digest(existing.options) !== digest(decisionInput.options) || existing.recommendation !== decisionInput.recommendation
       )) return this.attention(state, attempt, "Worker reused a local decision identity with different content");
+      if (!existing && attempt.decisions.length >= MAX_ATTEMPT_DECISIONS) {
+        return this.attention(state, attempt, "Attempt decision capacity was reached");
+      }
+      advanceControlGeneration(attempt);
+      attempt.workerActiveAt ??= this.dependencies.now().toISOString();
       if (!existing) {
-        if (attempt.decisions.length >= MAX_ATTEMPT_DECISIONS) {
-          return this.attention(state, attempt, "Attempt decision capacity was reached");
-        }
         attempt.decisions.push({
-          id: observation.decision.transportId ?? this.dependencies.generateId(),
+          id: decisionInput.transportId ?? this.dependencies.generateId(),
           state: "pending",
           requestedAt: this.dependencies.now().toISOString(),
-          ...structuredClone(observation.decision),
+          ...structuredClone(decisionInput),
         });
       }
       if (attempt.lifecycle !== "paused" && attempt.lifecycle !== "takeover" && attempt.lifecycle !== "restart-required") {
         attempt.lifecycle = "pending-decision";
       }
-    } else if (
-      (observation.status === "idle" || observation.status === "done") &&
+    } else {
+      advanceControlGeneration(attempt);
+      if (observation.status === "working" && attempt.workerActiveAt === undefined) {
+        attempt.workerActiveAt = this.dependencies.now().toISOString();
+      }
+    }
+    if (
+      observation.status !== "blocked" &&
+      (observation.status === "idle" || observation.status === "done") && attempt.workerActiveAt !== undefined &&
       attempt.lifecycle !== "paused" && attempt.lifecycle !== "takeover" && attempt.lifecycle !== "restart-required"
     ) {
       attempt.lifecycle = hasPendingDecision(attempt) ? "pending-decision" : "completed-unaccepted";
@@ -937,6 +1008,14 @@ export class PreparationController {
       return failure("storage", ["Controller state could not be written durably"]);
     }
   }
+}
+
+function currentControlGeneration(attempt: ExecutionAttempt): number {
+  return attempt.controlGeneration ?? 0;
+}
+
+function advanceControlGeneration(attempt: ExecutionAttempt): void {
+  attempt.controlGeneration = currentControlGeneration(attempt) + 1;
 }
 
 function isExecuting(lifecycle: ExecutionAttempt["lifecycle"]): boolean {
@@ -1026,7 +1105,9 @@ function uniqueReferences(references: string[]): string[] {
 
 function validDecisionInput(input: NonNullable<WorkerObservation["decision"]>): boolean {
   const text = [input.question, input.context, input.recommendation, ...input.options];
-  return (input.transportId === undefined || /^[A-Za-z0-9_-]{1,200}$/.test(input.transportId)) &&
+  return (input.transportId === undefined || (
+    typeof input.transportId === "string" && /^[A-Za-z0-9_-]{1,200}$/.test(input.transportId)
+  )) &&
     validBoundedText(input.question, 4_000) && validBoundedText(input.context, 4_000) &&
     validBoundedText(input.recommendation, 4_000) && input.options.length >= 1 && input.options.length <= 20 &&
     input.options.every((option): boolean => validBoundedText(option, 1_000)) &&

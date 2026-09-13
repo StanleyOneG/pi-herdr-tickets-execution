@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { createConnection } from "node:net";
 import test, { afterEach } from "node:test";
 
 import {
@@ -56,6 +57,27 @@ afterEach(async (): Promise<void> => {
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+}
+
+async function rawControllerRequest(
+  socketPath: string,
+  request: { id: string; token: string; method: string; params: unknown[] },
+): Promise<{ id: string; ok: boolean; error?: string }> {
+  return new Promise((resolveRequest, reject): void => {
+    const socket = createConnection(socketPath);
+    let body = "";
+    socket.setEncoding("utf8");
+    socket.once("connect", (): void => { socket.write(`${JSON.stringify(request)}\n`); });
+    socket.on("data", (chunk: string): void => { body += chunk; });
+    socket.once("error", reject);
+    socket.once("end", (): void => {
+      try {
+        resolveRequest(JSON.parse(body.trim()) as { id: string; ok: boolean; error?: string });
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
 }
 
 async function repository(): Promise<TestRepository> {
@@ -209,6 +231,18 @@ function controller(
 function value<T>(result: ControllerResult<T>): T {
   assert.equal(result.ok, true, result.ok ? undefined : result.error.diagnostics.join("\n"));
   return result.value;
+}
+
+function monitoredObservation(attempt: ExecutionAttempt, observation: WorkerObservation): {
+  attemptId: string;
+  controlGeneration: number;
+  observation: WorkerObservation;
+} {
+  return {
+    attemptId: attempt.id,
+    controlGeneration: attempt.controlGeneration ?? 0,
+    observation,
+  };
 }
 
 async function approved(repo: TestRepository, worker: WorkerRuntimePort, claimedBy: string | null = null): Promise<{ controller: PreparationController; preparationId: string }> {
@@ -452,6 +486,49 @@ test("approved environment template setup copies only inside the real ticket wor
   await assert.rejects(readFile(join(repo.root, ".env"), "utf8"), { code: "ENOENT" });
 });
 
+test("an idle sample before worker activity does not become completion", async (): Promise<void> => {
+  const repo = await repository();
+  const worker = new ControlledWorker();
+  worker.status = "idle";
+  const running = await start(repo, worker);
+
+  const sampled = value(await running.controller.recordWorkerObservation(actor, monitoredObservation(
+    running.attempt,
+    { identity: running.attempt.worker!, status: "idle", artifactReferences: [] },
+  )));
+
+  assert.equal(running.attempt.lifecycle, "running");
+  assert.equal(sampled.lifecycle, "running");
+  assert.equal(sampled.workerActiveAt, undefined);
+});
+
+test("controller rejects a non-string worker decision identity before persistence", async (): Promise<void> => {
+  const repo = await repository();
+  const worker = new ControlledWorker();
+  const running = await start(repo, worker);
+  const malformedObservation = {
+    identity: running.attempt.worker!,
+    status: "blocked",
+    artifactReferences: [],
+    decision: {
+      transportId: 7,
+      question: "Choose?",
+      context: "A local choice is required.",
+      options: ["A"],
+      recommendation: "A",
+    },
+  } as unknown as WorkerObservation;
+
+  const observed = value(await running.controller.recordWorkerObservation(
+    actor,
+    monitoredObservation(running.attempt, malformedObservation),
+  ));
+
+  assert.equal(observed.lifecycle, "needs-attention");
+  assert.deepEqual(observed.decisions, []);
+  assert.equal(value(await running.controller.status(actor, { limit: 10 })).executionAttempts[0]?.lifecycle, "needs-attention");
+});
+
 test("worker allocation is durable before readiness and dispatch", async (): Promise<void> => {
   const repo = await repository();
   const worker = new ControlledWorker();
@@ -494,6 +571,23 @@ test("missing Pi identity, TUI freshness, model, skill, tools, context, and time
   }
 });
 
+test("normal worker commits preserve approved base provenance during dashboard attach", async (): Promise<void> => {
+  const repo = await repository();
+  const worker = new ControlledWorker();
+  const running = await start(repo, worker);
+  await writeFile(join(running.attempt.worktree!.path, "worker.txt"), "candidate\n");
+  git(running.attempt.worktree!.path, "add", "worker.txt");
+  git(running.attempt.worktree!.path, "commit", "-qm", "implement candidate");
+  const candidateHead = git(running.attempt.worktree!.path, "rev-parse", "HEAD");
+
+  const attached = value(await running.controller.attachAttempt(actor, { attemptId: running.attempt.id }));
+
+  assert.equal(attached.lifecycle, "running");
+  assert.equal(attached.worktree?.head, repo.head);
+  assert.equal(attached.candidateHead, candidateHead);
+  assert.equal(worker.focuses, 1);
+});
+
 test("worktree branch and worker occupant mismatches fail closed before resumed automation", async (): Promise<void> => {
   const branchRepo = await repository();
   const branchWorker = new ControlledWorker();
@@ -502,17 +596,7 @@ test("worktree branch and worker occupant mismatches fail closed before resumed 
   git(branchRun.attempt.worktree!.path, "checkout", "-qb", "foreign-branch");
   const branchResult = value(await branchRun.controller.resumeAttempt(actor, { attemptId: branchRun.attempt.id }));
   assert.equal(branchResult.lifecycle, "needs-attention");
-  assert.match(branchResult.diagnostics[0]!, /worktree path, branch, base/);
-
-  const headRepo = await repository();
-  const headWorker = new ControlledWorker();
-  const headRun = await start(headRepo, headWorker);
-  value(await headRun.controller.pauseAttempt(actor, { attemptId: headRun.attempt.id }));
-  await writeFile(join(headRun.attempt.worktree!.path, "worker.txt"), "candidate\n");
-  git(headRun.attempt.worktree!.path, "add", "worker.txt");
-  git(headRun.attempt.worktree!.path, "commit", "-qm", "unexpected head");
-  const headResult = value(await headRun.controller.resumeAttempt(actor, { attemptId: headRun.attempt.id }));
-  assert.equal(headResult.lifecycle, "needs-attention");
+  assert.match(branchResult.diagnostics[0]!, /worktree path, branch, or common directory/);
 
   const workerRepo = await repository();
   const occupant = new ControlledWorker();
@@ -537,9 +621,11 @@ test("dashboard disappearance is inert while explicit controller restart blocks 
 
   const restarted = value(await replacementDashboard.controllerRestarted(actor));
   assert.equal(restarted[0]?.lifecycle, "restart-required");
+  assert.ok(restarted[0]!.controlGeneration! > (running.attempt.controlGeneration ?? 0));
   assert.equal(worker.inspections, inspectionsBefore);
   const resumed = value(await replacementDashboard.resumeAttempt(actor, { attemptId: running.attempt.id }));
   assert.equal(resumed.lifecycle, "running");
+  assert.ok(resumed.controlGeneration! > restarted[0]!.controlGeneration!);
   assert.ok(worker.inspections > inspectionsBefore);
 
   value(await replacementDashboard.pauseAttempt(actor, { attemptId: running.attempt.id }));
@@ -572,9 +658,9 @@ test("takeover retains a durable local answer and delivers it only after explici
   const repo = await repository();
   const worker = new ControlledWorker();
   const running = await start(repo, worker);
-  const blocked = value(await running.controller.recordWorkerObservation(actor, {
-    attemptId: running.attempt.id,
-    observation: {
+  const blocked = value(await running.controller.recordWorkerObservation(actor, monitoredObservation(
+    running.attempt,
+    {
       identity: running.attempt.worker!, status: "blocked", artifactReferences: ["/evidence/question.json"],
       decision: {
         question: "Which compatible format should be used?",
@@ -583,8 +669,9 @@ test("takeover retains a durable local answer and delivers it only after explici
         recommendation: "Use A for compatibility.",
       },
     },
-  }));
+  )));
   assert.equal(blocked.lifecycle, "pending-decision");
+  assert.ok(blocked.controlGeneration! > (running.attempt.controlGeneration ?? 0));
   const decision = blocked.decisions[0]!;
   const dashboard = value(await running.controller.status(actor, { limit: 10 }));
   assert.equal(dashboard.executionAttempts[0]?.decisions[0]?.question, "Which compatible format should be used?");
@@ -592,19 +679,21 @@ test("takeover retains a durable local answer and delivers it only after explici
 
   const takeover = value(await running.controller.takeOverAttempt(actor, { attemptId: running.attempt.id }));
   assert.equal(takeover.lifecycle, "takeover");
-  const manualObservation = value(await running.controller.recordWorkerObservation(actor, {
-    attemptId: running.attempt.id,
-    observation: { identity: running.attempt.worker!, status: "done", artifactReferences: [] },
-  }));
+  const manualObservation = value(await running.controller.recordWorkerObservation(actor, monitoredObservation(
+    blocked,
+    { identity: running.attempt.worker!, status: "done", artifactReferences: [] },
+  )));
   assert.equal(manualObservation.lifecycle, "takeover");
   const answered = value(await running.controller.answerDecision(actor, {
     attemptId: running.attempt.id, decisionId: decision.id, answer: "A", answeredBy: "developer",
   }));
   assert.equal(answered.decisions[0]?.state, "answered");
+  assert.ok(answered.controlGeneration! > takeover.controlGeneration!);
   assert.deepEqual(worker.deliveries, []);
 
   const returned = value(await running.controller.returnAttempt(actor, { attemptId: running.attempt.id }));
   assert.equal(returned.lifecycle, "running");
+  assert.ok(returned.controlGeneration! > answered.controlGeneration!);
   assert.equal(returned.decisions[0]?.state, "delivered");
   assert.deepEqual(worker.deliveries, ["A"]);
 });
@@ -613,13 +702,13 @@ test("pause retains an explicit answer and resume delivers it after ownership ch
   const repo = await repository();
   const worker = new ControlledWorker();
   const running = await start(repo, worker);
-  const blocked = value(await running.controller.recordWorkerObservation(actor, {
-    attemptId: running.attempt.id,
-    observation: {
+  const blocked = value(await running.controller.recordWorkerObservation(actor, monitoredObservation(
+    running.attempt,
+    {
       identity: running.attempt.worker!, status: "blocked", artifactReferences: [],
       decision: { question: "Choose?", context: "A local choice is required.", options: ["A"], recommendation: "A" },
     },
-  }));
+  )));
   value(await running.controller.pauseAttempt(actor, { attemptId: running.attempt.id }));
   const answered = value(await running.controller.answerDecision(actor, {
     attemptId: running.attempt.id, decisionId: blocked.decisions[0]!.id, answer: "A", answeredBy: "developer",
@@ -633,17 +722,37 @@ test("pause retains an explicit answer and resume delivers it after ownership ch
   assert.deepEqual(worker.deliveries, ["A"]);
 });
 
+test("an original-checkout mutation stops completion observation and preserves the change", async (): Promise<void> => {
+  const repo = await repository();
+  const worker = new ControlledWorker();
+  const running = await start(repo, worker);
+  await writeFile(join(repo.root, "README.md"), "unexpected worker-side mutation\n");
+
+  const observed = value(await running.controller.recordWorkerObservation(actor, monitoredObservation(
+    running.attempt,
+    {
+      identity: running.attempt.worker!,
+      status: "done",
+      artifactReferences: ["/evidence/summary.txt"],
+    },
+  )));
+
+  assert.equal(observed.lifecycle, "needs-attention");
+  assert.deepEqual(observed.diagnostics, ["Original checkout changed after its execution baseline"]);
+  assert.equal(await readFile(join(repo.root, "README.md"), "utf8"), "unexpected worker-side mutation\n");
+});
+
 test("idle, done, and completion text can only produce completed-unaccepted lifecycle", async (): Promise<void> => {
   const repo = await repository();
   const worker = new ControlledWorker();
   const running = await start(repo, worker);
-  const completed = value(await running.controller.recordWorkerObservation(actor, {
-    attemptId: running.attempt.id,
-    observation: {
+  const completed = value(await running.controller.recordWorkerObservation(actor, monitoredObservation(
+    running.attempt,
+    {
       identity: running.attempt.worker!, status: "done", artifactReferences: ["/evidence/summary.txt"],
       completionText: "Everything is accepted and the issue can close.",
     },
-  }));
+  )));
 
   assert.equal(completed.lifecycle, "completed-unaccepted");
   const state = JSON.parse(await readFile(repo.statePath, "utf8")) as ControllerState;
@@ -702,9 +811,9 @@ test("worker completion cannot hide an unresolved local decision", async (): Pro
   const repo = await repository();
   const worker = new ControlledWorker();
   const running = await start(repo, worker);
-  const blocked = value(await running.controller.recordWorkerObservation(actor, {
-    attemptId: running.attempt.id,
-    observation: {
+  const blocked = value(await running.controller.recordWorkerObservation(actor, monitoredObservation(
+    running.attempt,
+    {
       identity: running.attempt.worker!,
       status: "blocked",
       artifactReferences: [],
@@ -715,17 +824,17 @@ test("worker completion cannot hide an unresolved local decision", async (): Pro
         recommendation: "A",
       },
     },
-  }));
+  )));
 
-  const completed = value(await running.controller.recordWorkerObservation(actor, {
-    attemptId: running.attempt.id,
-    observation: {
+  const completed = value(await running.controller.recordWorkerObservation(actor, monitoredObservation(
+    blocked,
+    {
       identity: running.attempt.worker!,
       status: "done",
       artifactReferences: ["/evidence/early-summary.txt"],
       completionText: "Done despite the unanswered question.",
     },
-  }));
+  )));
 
   assert.equal(blocked.lifecycle, "pending-decision");
   assert.equal(completed.lifecycle, "pending-decision");
@@ -736,6 +845,7 @@ test("malformed nested durable execution identity and lifecycle fail closed thro
   const corruptions: Array<(state: ControllerState) => void> = [
     (state): void => { state.executionAttempts[0]!.worker!.sessionId = ""; },
     (state): void => { state.executionAttempts[0]!.lifecycle = "claimed"; },
+    (state): void => { state.executionAttempts[0]!.controlGeneration = -1; },
   ];
 
   for (const corrupt of corruptions) {
@@ -866,6 +976,79 @@ function herdrRuntime(executor: ControlledHerdr, bridge: ControlledBridge): Herd
   });
 }
 
+test("authenticated Unix requests reject malformed method payloads at the daemon boundary", async (): Promise<void> => {
+  const repo = await repository();
+  const worker = new ControlledWorker();
+  const running = await start(repo, worker);
+  const socketPath = join(repo.root, ".git", "herdr", "payload-validation.sock");
+  const daemon = new LocalControllerDaemon(running.controller, actor, socketPath, "test-token");
+  await daemon.start({ markRestarted: false });
+  try {
+    const invalidDecisionIdentities = [7, null, true, []];
+    const malformed: Array<{ method: string; params: unknown[] }> = [
+      { method: "ping", params: [null] },
+      { method: "prepare", params: [{ specReference: "spec-2", controllerName: "controller" }, null] },
+      { method: "submitProposal", params: ["preparation-1", null] },
+      { method: "approve", params: ["preparation-1", null] },
+      { method: "preview", params: [null] },
+      { method: "getPreparation", params: ["preparation-1", "extra"] },
+      { method: "validateApproval", params: ["preparation-1", null] },
+      { method: "startTicket", params: [{ preparationId: "preparation-1", ticketIdentity: null, workspaceId: "workspace-1" }] },
+      { method: "attachAttempt", params: [null] },
+      { method: "pauseAttempt", params: [null] },
+      { method: "resumeAttempt", params: [{ attemptId: 4 }] },
+      { method: "takeOverAttempt", params: [{}] },
+      { method: "returnAttempt", params: [{ attemptId: "attempt-1" }, null] },
+      { method: "answerDecision", params: [{ attemptId: "attempt-1", decisionId: "decision-1", answer: null, answeredBy: "developer" }] },
+      { method: "recordWorkerObservation", params: [{ attemptId: "attempt-1", controlGeneration: 0, observation: null }] },
+      { method: "recordWorkerObservation", params: [{ attemptId: "attempt-1", controlGeneration: -1, observation: {
+        identity: running.attempt.worker!, status: "working", artifactReferences: [],
+      } }] },
+      { method: "status", params: [{ limit: "10" }] },
+      ...invalidDecisionIdentities.map((transportId): { method: string; params: unknown[] } => ({
+        method: "recordWorkerObservation",
+        params: [{
+          attemptId: running.attempt.id,
+          controlGeneration: running.attempt.controlGeneration ?? 0,
+          observation: {
+            identity: running.attempt.worker!,
+            status: "blocked",
+            artifactReferences: [],
+            decision: {
+              transportId,
+              question: "Choose?",
+              context: "A local choice is required.",
+              options: ["A"],
+              recommendation: "A",
+            },
+          },
+        }],
+      })),
+    ];
+
+    for (const [index, request] of malformed.entries()) {
+      const response = await rawControllerRequest(socketPath, {
+        id: `malformed-${index}`,
+        token: "test-token",
+        method: request.method,
+        params: request.params,
+      });
+      assert.deepEqual(response, {
+        id: `malformed-${index}`,
+        ok: false,
+        error: "Local controller request failed",
+      });
+    }
+    const client = new UnixControllerClient(socketPath, "test-token");
+    const attempts = value(await client.status({ limit: 10 })).executionAttempts;
+    assert.equal(attempts.length, 1);
+    assert.equal(attempts[0]?.lifecycle, "running");
+    assert.deepEqual(attempts[0]?.decisions, []);
+  } finally {
+    await daemon.close();
+  }
+});
+
 test("remote daemon client serializes preparation and duplicate execution while client replacement is inert", async (): Promise<void> => {
   const repo = await repository();
   const worker = new ControlledWorker();
@@ -911,6 +1094,281 @@ test("remote daemon client serializes preparation and duplicate execution while 
   }
 });
 
+test("remote daemon rejects a held completion released after takeover and return", async (): Promise<void> => {
+  const repo = await repository();
+  const worker = new ControlledWorker();
+  const running = await start(repo, worker);
+  const socketPath = join(repo.root, ".git", "herdr", "monitor-controller.sock");
+  let notifyInspectionStarted!: () => void;
+  const inspectionStarted = new Promise<void>((resolve): void => { notifyInspectionStarted = resolve; });
+  let releaseInspection!: () => void;
+  const inspectionReleased = new Promise<void>((resolve): void => { releaseInspection = resolve; });
+  let inspections = 0;
+  const monitor = {
+    async inspect(identity: WorkerIdentity): Promise<WorkerObservation> {
+      inspections += 1;
+      if (inspections === 1) {
+        notifyInspectionStarted();
+        await inspectionReleased;
+        return { identity, status: "done", artifactReferences: ["/evidence/stale-monitor.json"] };
+      }
+      return { identity, status: "working", artifactReferences: [] };
+    },
+    async nextDecision(): Promise<WorkerDecisionRequest | undefined> { return undefined; },
+    async acknowledgeDecision(): Promise<void> {},
+  };
+  const daemon = new LocalControllerDaemon(running.controller, actor, socketPath, "test-token", monitor);
+  await daemon.start({ markRestarted: false });
+  try {
+    const client = new UnixControllerClient(socketPath, "test-token");
+    await Promise.race([
+      inspectionStarted,
+      new Promise<never>((_resolve, reject): void => { setTimeout((): void => { reject(new Error("monitor did not inspect active worker")); }, 1_000); }),
+    ]);
+
+    const takeover = await Promise.race([
+      client.takeOverAttempt({ attemptId: running.attempt.id }),
+      new Promise<never>((_resolve, reject): void => { setTimeout((): void => { reject(new Error("monitor blocked dashboard takeover")); }, 1_500); }),
+    ]);
+    const takenOver = value(takeover);
+    assert.equal(takenOver.lifecycle, "takeover");
+    assert.ok(takenOver.controlGeneration! > (running.attempt.controlGeneration ?? 0));
+    const returned = value(await client.returnAttempt({ attemptId: running.attempt.id }));
+    assert.equal(returned.lifecycle, "running");
+    assert.ok(returned.controlGeneration! > takenOver.controlGeneration!);
+    releaseInspection();
+    await new Promise((resolveWait): void => { setTimeout(resolveWait, 250); });
+    const afterStaleObservation = value(await client.status({ limit: 10 })).executionAttempts[0]!;
+    assert.equal(afterStaleObservation.lifecycle, "running");
+    assert.equal(afterStaleObservation.artifactReferences.includes("/evidence/stale-monitor.json"), false);
+  } finally {
+    releaseInspection();
+    await daemon.close();
+  }
+});
+
+test("remote daemon records acknowledgement failures without losing the repeated decision or stopping other attempts", async (): Promise<void> => {
+  const repo = await repository();
+  const worker = new ControlledWorker();
+  const first = await start(repo, worker);
+  const instance = controller(repo, worker, "controller-1", ["preparation-2", "attempt-2"]);
+  const secondPrepared = value(await instance.prepare(
+    actor,
+    { specReference: "spec-2", controllerName: "example / issue 4 second batch" },
+    admission(repo),
+  ));
+  const secondProposal = { ...proposal(repo), controllerName: "example / issue 4 second batch" };
+  const secondProposed = value(await instance.submitProposal(actor, secondPrepared.id, secondProposal));
+  value(await instance.approve(actor, secondPrepared.id, {
+    approvedBy: "developer",
+    proposalDigest: secondProposed.proposalDigest!,
+    projectHead: repo.head,
+    model: secondProposal.model,
+    evidence: secondProposal.sourceEvidence.map((source): SourceEvidence => ({
+      ...structuredClone(source),
+      retrievedAt: "2026-09-12T13:00:00.000Z",
+    })),
+  }));
+  const second = value(await instance.startTicket(actor, {
+    preparationId: secondPrepared.id,
+    ticketIdentity: "ticket-4",
+    workspaceId: "workspace-1",
+  }));
+  const repeatedRequest: WorkerDecisionRequest = {
+    schemaVersion: 1,
+    nonce: "fresh-nonce",
+    id: "decision-repeat",
+    requestedAt: "2026-09-12T13:30:00.000Z",
+    question: "Which compatible format should be used?",
+    context: "The approved requirements permit either format.",
+    options: ["A", "B"],
+    recommendation: "Use A for compatibility.",
+  };
+  const acknowledged: string[] = [];
+  const socketPath = join(repo.root, ".git", "herdr", "acknowledgement-failure-controller.sock");
+  const monitor = {
+    async inspect(identity: WorkerIdentity): Promise<WorkerObservation> {
+      return { identity, status: "working", artifactReferences: ["/evidence/continued-monitor.json"] };
+    },
+    async nextDecision(identity: WorkerIdentity): Promise<WorkerDecisionRequest | undefined> {
+      return identity.cwd === first.attempt.worker!.cwd ? repeatedRequest : undefined;
+    },
+    async acknowledgeDecision(_identity: WorkerIdentity, decisionId: string): Promise<void> {
+      acknowledged.push(decisionId);
+      throw new Error("token=secret acknowledgement failure");
+    },
+  };
+  const daemon = new LocalControllerDaemon(instance, actor, socketPath, "test-token", monitor);
+  await daemon.start({ markRestarted: false });
+  try {
+    const client = new UnixControllerClient(socketPath, "test-token");
+    let attempts: ExecutionAttempt[] = [];
+    for (let index = 0; index < 75; index += 1) {
+      attempts = value(await client.status({ limit: 10 })).executionAttempts;
+      const failed = attempts.find((attempt): boolean => attempt.id === first.attempt.id);
+      const continued = attempts.find((attempt): boolean => attempt.id === second.id);
+      if (failed?.lifecycle === "needs-attention" && continued?.artifactReferences.includes("/evidence/continued-monitor.json")) break;
+      await new Promise((resolveWait): void => { setTimeout(resolveWait, 20); });
+    }
+
+    const failed = attempts.find((attempt): boolean => attempt.id === first.attempt.id)!;
+    const continued = attempts.find((attempt): boolean => attempt.id === second.id)!;
+    assert.equal(failed.lifecycle, "needs-attention");
+    assert.deepEqual(failed.diagnostics, ["Worker monitoring failed or worker ownership changed"]);
+    assert.equal(failed.diagnostics.some((diagnostic): boolean => /token|secret/i.test(diagnostic)), false);
+    assert.deepEqual(failed.artifactReferences, ["/evidence/turn-1.json"]);
+    assert.deepEqual(failed.decisions, [{
+      id: repeatedRequest.id,
+      transportId: repeatedRequest.id,
+      state: "pending",
+      requestedAt: "2026-09-12T14:00:00.000Z",
+      question: repeatedRequest.question,
+      context: repeatedRequest.context,
+      options: repeatedRequest.options,
+      recommendation: repeatedRequest.recommendation,
+    }]);
+    assert.deepEqual(acknowledged, [repeatedRequest.id]);
+    assert.equal(continued.lifecycle, "running");
+    assert.equal(continued.artifactReferences.includes("/evidence/continued-monitor.json"), true);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("remote daemon rejects a held acknowledgement failure after takeover and return", async (): Promise<void> => {
+  const repo = await repository();
+  const worker = new ControlledWorker();
+  const running = await start(repo, worker);
+  const socketPath = join(repo.root, ".git", "herdr", "stale-acknowledgement-controller.sock");
+  const request: WorkerDecisionRequest = {
+    schemaVersion: 1,
+    nonce: "fresh-nonce",
+    id: "decision-held-ack",
+    requestedAt: "2026-09-12T13:30:00.000Z",
+    question: "Which compatible format should be used?",
+    context: "The approved requirements permit either format.",
+    options: ["A", "B"],
+    recommendation: "Use A for compatibility.",
+  };
+  let decisionReads = 0;
+  let notifyAcknowledgementStarted!: () => void;
+  const acknowledgementStarted = new Promise<void>((resolve): void => { notifyAcknowledgementStarted = resolve; });
+  let releaseAcknowledgement!: () => void;
+  const acknowledgementReleased = new Promise<void>((resolve): void => { releaseAcknowledgement = resolve; });
+  let notifyLaterInspection!: () => void;
+  const laterInspection = new Promise<void>((resolve): void => { notifyLaterInspection = resolve; });
+  const monitor = {
+    async inspect(identity: WorkerIdentity): Promise<WorkerObservation> {
+      notifyLaterInspection();
+      return { identity, status: "working", artifactReferences: ["/evidence/post-stale-ack.json"] };
+    },
+    async nextDecision(): Promise<WorkerDecisionRequest | undefined> {
+      decisionReads += 1;
+      return decisionReads === 1 ? request : undefined;
+    },
+    async acknowledgeDecision(): Promise<void> {
+      notifyAcknowledgementStarted();
+      await acknowledgementReleased;
+      throw new Error("held acknowledgement failed");
+    },
+  };
+  const daemon = new LocalControllerDaemon(running.controller, actor, socketPath, "test-token", monitor);
+  await daemon.start({ markRestarted: false });
+  try {
+    const client = new UnixControllerClient(socketPath, "test-token");
+    await Promise.race([
+      acknowledgementStarted,
+      new Promise<never>((_resolve, reject): void => { setTimeout((): void => { reject(new Error("monitor did not acknowledge decision")); }, 1_000); }),
+    ]);
+    const recorded = value(await client.status({ limit: 10 })).executionAttempts[0]!;
+    assert.equal(recorded.lifecycle, "pending-decision");
+    assert.equal(recorded.decisions[0]?.id, request.id);
+
+    const takenOver = value(await client.takeOverAttempt({ attemptId: running.attempt.id }));
+    assert.equal(takenOver.lifecycle, "takeover");
+    const returned = value(await client.returnAttempt({ attemptId: running.attempt.id }));
+    assert.equal(returned.lifecycle, "pending-decision");
+    assert.ok(returned.controlGeneration! > recorded.controlGeneration!);
+    releaseAcknowledgement();
+    await Promise.race([
+      laterInspection,
+      new Promise<never>((_resolve, reject): void => { setTimeout((): void => { reject(new Error("monitor did not continue after held acknowledgement")); }, 1_500); }),
+    ]);
+
+    let afterStaleFailure = value(await client.status({ limit: 10 })).executionAttempts[0]!;
+    for (let index = 0; index < 25 && !afterStaleFailure.artifactReferences.includes("/evidence/post-stale-ack.json"); index += 1) {
+      await new Promise((resolveWait): void => { setTimeout(resolveWait, 10); });
+      afterStaleFailure = value(await client.status({ limit: 10 })).executionAttempts[0]!;
+    }
+    assert.equal(afterStaleFailure.lifecycle, "pending-decision");
+    assert.deepEqual(afterStaleFailure.diagnostics, []);
+    assert.equal(afterStaleFailure.decisions[0]?.id, request.id);
+    assert.equal(afterStaleFailure.artifactReferences.includes("/evidence/post-stale-ack.json"), true);
+    await new Promise((resolveWait): void => { setTimeout(resolveWait, 50); });
+  } finally {
+    releaseAcknowledgement();
+    await daemon.close();
+  }
+});
+
+test("remote daemon records sanitized monitor failures per attempt and still runs Git guardrails", async (): Promise<void> => {
+  const repo = await repository();
+  const worker = new ControlledWorker();
+  const first = await start(repo, worker);
+  const instance = controller(repo, worker, "controller-1", ["preparation-2", "attempt-2"]);
+  const secondPrepared = value(await instance.prepare(
+    actor,
+    { specReference: "spec-2", controllerName: "example / issue 4 second batch" },
+    admission(repo),
+  ));
+  const secondProposal = { ...proposal(repo), controllerName: "example / issue 4 second batch" };
+  const secondProposed = value(await instance.submitProposal(actor, secondPrepared.id, secondProposal));
+  value(await instance.approve(actor, secondPrepared.id, {
+    approvedBy: "developer",
+    proposalDigest: secondProposed.proposalDigest!,
+    projectHead: repo.head,
+    model: secondProposal.model,
+    evidence: secondProposal.sourceEvidence.map((source): SourceEvidence => ({
+      ...structuredClone(source),
+      retrievedAt: "2026-09-12T13:00:00.000Z",
+    })),
+  }));
+  const second = value(await instance.startTicket(actor, {
+    preparationId: secondPrepared.id,
+    ticketIdentity: "ticket-4",
+    workspaceId: "workspace-1",
+  }));
+  git(second.worktree!.path, "checkout", "-qb", "foreign-monitor-branch");
+
+  const socketPath = join(repo.root, ".git", "herdr", "throwing-monitor-controller.sock");
+  const monitor = {
+    async inspect(): Promise<WorkerObservation> { throw new Error("token=secret monitor failure"); },
+    async nextDecision(): Promise<WorkerDecisionRequest | undefined> { return undefined; },
+    async acknowledgeDecision(): Promise<void> {},
+  };
+  const daemon = new LocalControllerDaemon(instance, actor, socketPath, "test-token", monitor);
+  await daemon.start({ markRestarted: false });
+  try {
+    const client = new UnixControllerClient(socketPath, "test-token");
+    let attempts: ExecutionAttempt[] = [];
+    for (let index = 0; index < 75; index += 1) {
+      attempts = value(await client.status({ limit: 10 })).executionAttempts;
+      if (attempts.every((attempt): boolean => attempt.lifecycle === "needs-attention")) break;
+      await new Promise((resolveWait): void => { setTimeout(resolveWait, 20); });
+    }
+
+    const failedMonitor = attempts.find((attempt): boolean => attempt.id === first.attempt.id)!;
+    const failedMonitorWithGitMismatch = attempts.find((attempt): boolean => attempt.id === second.id)!;
+    assert.equal(failedMonitor.lifecycle, "needs-attention");
+    assert.deepEqual(failedMonitor.diagnostics, ["Worker monitoring failed or worker ownership changed"]);
+    assert.equal(failedMonitor.diagnostics.some((diagnostic): boolean => /token|secret/i.test(diagnostic)), false);
+    assert.equal(failedMonitorWithGitMismatch.lifecycle, "needs-attention");
+    assert.deepEqual(failedMonitorWithGitMismatch.diagnostics, ["Ticket worktree path, branch, or common directory changed"]);
+  } finally {
+    await daemon.close();
+  }
+});
+
 test("daemon process restart is nonexecuting until an explicit remote resume", async (): Promise<void> => {
   const repo = await repository();
   const worker = new ControlledWorker();
@@ -933,7 +1391,7 @@ test("daemon process restart is nonexecuting until an explicit remote resume", a
   }
 });
 
-test("daemon durably surfaces a worker bridge question and routes an explicit remote answer", async (): Promise<void> => {
+test("daemon routes a worker decision and stops on an execution-time checkout mutation", async (): Promise<void> => {
   const repo = await repository();
   const worker = new ControlledWorker();
   const instance = controller(repo, worker);
@@ -942,7 +1400,11 @@ test("daemon durably surfaces a worker bridge question and routes an explicit re
     generateNonce: (): string => "worker-nonce",
   });
   const channel = await bridge.openChannel("herdr-worker");
+  let monitoredStatus: WorkerObservation["status"] = "working";
   const monitor = {
+    async inspect(identity: WorkerIdentity): Promise<WorkerObservation> {
+      return { identity, status: monitoredStatus, artifactReferences: [] };
+    },
     async nextDecision(): Promise<WorkerDecisionRequest | undefined> { return bridge.nextDecisionRequest(channel); },
     async acknowledgeDecision(_identity: WorkerIdentity, decisionId: string): Promise<void> {
       await bridge.acknowledgeDecisionRequest(channel, decisionId);
@@ -981,6 +1443,17 @@ test("daemon durably surfaces a worker bridge question and routes an explicit re
     }));
     assert.equal(answered.decisions[0]?.state, "delivered");
     assert.deepEqual(worker.deliveries, ["A"]);
+
+    monitoredStatus = "done";
+    await writeFile(join(repo.root, "README.md"), "unexpected execution mutation\n");
+    for (let index = 0; index < 50; index += 1) {
+      observed = value(await client.status({ limit: 10 })).executionAttempts[0];
+      if (observed?.lifecycle === "needs-attention") break;
+      await new Promise((resolveWait): void => { setTimeout(resolveWait, 20); });
+    }
+    assert.equal(observed?.lifecycle, "needs-attention");
+    assert.deepEqual(observed?.diagnostics, ["Original checkout changed after its execution baseline"]);
+    assert.equal(await readFile(join(repo.root, "README.md"), "utf8"), "unexpected execution mutation\n");
   } finally {
     await daemon.close();
   }
@@ -1015,6 +1488,7 @@ test("production Herdr runtime starts only after shell and fresh Pi resource pro
   const prompts = executor.calls.filter((call): boolean => call.args[0] === "agent" && call.args[1] === "prompt");
   assert.equal(prompts[0]?.args[3], "/herdr-worker-ready");
   assert.equal(prompts[1]?.args[3], "/skill:implement ticket-4");
+  assert.equal(prompts[1]?.args.includes("--wait"), false);
 });
 
 test("production Herdr runtime rejects inherited Pi history before implementation dispatch", async (): Promise<void> => {

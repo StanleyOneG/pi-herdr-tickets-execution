@@ -92,8 +92,8 @@ export function isControllerState(value: unknown): value is ControllerState {
 function isExecutionAttempt(value: unknown): value is ExecutionAttempt {
   if (!isObject(value) || !hasOnlyKeys(value, [
     "id", "preparationId", "proposalDigest", "ticketIdentity", "workspaceId", "lifecycle", "owner",
-    "createdAt", "updatedAt", "originalCheckout", "worktreePlan", "worktree", "workerAllocation",
-    "worker", "setupOperations", "suspendedFrom", "decisions", "artifactReferences", "diagnostics",
+    "createdAt", "updatedAt", "originalCheckout", "worktreePlan", "worktree", "candidateHead", "workerAllocation",
+    "worker", "workerActiveAt", "controlGeneration", "setupOperations", "suspendedFrom", "decisions", "artifactReferences", "diagnostics",
   ])) return false;
   if (
     !isBoundedString(value.id) || !isBoundedString(value.preparationId) || !isDigest(value.proposalDigest) ||
@@ -104,8 +104,13 @@ function isExecutionAttempt(value: unknown): value is ExecutionAttempt {
   if (value.originalCheckout !== undefined && !isOriginalCheckout(value.originalCheckout)) return false;
   if (!isWorktreePlan(value.worktreePlan)) return false;
   if (value.worktree !== undefined && !isWorktreeIdentity(value.worktree)) return false;
+  if (value.candidateHead !== undefined && !isBoundedString(value.candidateHead)) return false;
   if (value.workerAllocation !== undefined && !isWorkerAllocation(value.workerAllocation)) return false;
   if (value.worker !== undefined && !isWorkerIdentity(value.worker)) return false;
+  if (value.workerActiveAt !== undefined && !isTimestamp(value.workerActiveAt)) return false;
+  if (value.controlGeneration !== undefined && (
+    typeof value.controlGeneration !== "number" || !Number.isSafeInteger(value.controlGeneration) || value.controlGeneration < 0
+  )) return false;
   if (value.setupOperations !== undefined && (!Array.isArray(value.setupOperations) || !value.setupOperations.every(isSetupOperationRecord))) return false;
   if (value.suspendedFrom !== undefined && value.suspendedFrom !== "running" && value.suspendedFrom !== "pending-decision") return false;
   if (!Array.isArray(value.decisions) || value.decisions.length > MAX_ATTEMPT_DECISIONS || !value.decisions.every(isDecision)) return false;
@@ -121,11 +126,13 @@ function isExecutionAttempt(value: unknown): value is ExecutionAttempt {
   ) return false;
   if ((value.lifecycle === "paused" || value.lifecycle === "takeover") && value.suspendedFrom === undefined) return false;
   if (value.worktree && (value.worktree.path !== value.worktreePlan.path || value.worktree.branch !== value.worktreePlan.branch)) return false;
+  if (value.candidateHead !== undefined && !value.worktree) return false;
   if (value.workerAllocation && (!value.worktree || value.workerAllocation.workspaceId !== value.workspaceId)) return false;
   if (value.worker && (
     !value.workerAllocation || !sameAllocation(value.worker, value.workerAllocation) ||
     !value.worktree || value.worker.cwd !== value.worktree.path
   )) return false;
+  if (value.workerActiveAt !== undefined && !value.worker) return false;
   if (value.originalCheckout && value.worktree && value.originalCheckout.commonDir !== value.worktree.commonDir) return false;
   if (value.decisions.length > 0 && !value.worker) return false;
   const unresolvedDecision = value.decisions.some((decision): boolean => decision.state !== "delivered");
@@ -206,7 +213,7 @@ function isWorkerAllocation(value: unknown): value is WorkerAllocation {
     isBoundedString(value.paneId) && isBoundedString(value.agentName);
 }
 
-function isWorkerIdentity(value: unknown): value is WorkerIdentity {
+export function isWorkerIdentity(value: unknown): value is WorkerIdentity {
   if (!isObject(value) || !hasOnlyKeys(value, [
     "workspaceId", "tabId", "paneId", "agentName", "piPid", "sessionId", "sessionFile", "cwd",
     "model", "mode", "initialHistoryEntries", "skillCommands", "toolNames", "contextFiles",
@@ -239,7 +246,10 @@ function isDecision(value: unknown): value is DecisionRecord {
     "id", "transportId", "state", "requestedAt", "question", "context", "options", "recommendation",
     "answeredAt", "answeredBy", "answer", "deliveredAt",
   ]) || !isBoundedString(value.id) || !DECISION_STATES.has(value.state as string)) return false;
-  if (value.transportId !== undefined && (value.transportId !== value.id || !/^[A-Za-z0-9_-]{1,200}$/.test(value.transportId as string))) return false;
+  if (value.transportId !== undefined && (
+    typeof value.transportId !== "string" || value.transportId !== value.id ||
+    !/^[A-Za-z0-9_-]{1,200}$/.test(value.transportId)
+  )) return false;
   if (!isTimestamp(value.requestedAt) || !isSafeText(value.question, 4_000) || !isSafeText(value.context, 4_000)) return false;
   if (!Array.isArray(value.options) || value.options.length < 1 || value.options.length > 20 || !value.options.every((option): boolean => isSafeText(option, 1_000))) return false;
   if (!isSafeText(value.recommendation, 4_000)) return false;
@@ -294,7 +304,7 @@ function isProject(value: unknown): value is PreparationRecord["project"] {
     isStringArray(value.instructionFiles, true);
 }
 
-function isCapturedModel(value: unknown): value is CapturedModel {
+export function isCapturedModel(value: unknown): value is CapturedModel {
   return isObject(value) &&
     isNonemptyString(value.provider) &&
     isNonemptyString(value.id) &&
@@ -302,7 +312,7 @@ function isCapturedModel(value: unknown): value is CapturedModel {
     isPositiveInteger(value.contextWindow);
 }
 
-function isBatchProposal(value: unknown): value is BatchProposal {
+export function isBatchProposal(value: unknown): value is BatchProposal {
   if (!isObject(value) || value.schemaVersion !== 1 || !isNonemptyString(value.controllerName)) return false;
   if (!isProposalProject(value.project) || !Array.isArray(value.sourceEvidence) || !value.sourceEvidence.every(isSourceEvidence)) return false;
   if (!isSpec(value.spec) || !Array.isArray(value.tickets) || value.tickets.length === 0 || !value.tickets.every(isTicket)) return false;
@@ -319,7 +329,7 @@ function isProposalProject(value: unknown): boolean {
     isStringArray(value.tracker.instructionEvidenceIdentities, true);
 }
 
-function isSourceEvidence(value: unknown): value is SourceEvidence {
+export function isSourceEvidence(value: unknown): value is SourceEvidence {
   return isObject(value) &&
     isNonemptyString(value.identity) &&
     isNonemptyString(value.revision) &&
