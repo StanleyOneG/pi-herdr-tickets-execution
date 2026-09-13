@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { createConnection } from "node:net";
@@ -17,6 +17,7 @@ import {
   type ControllerResult,
   type ControllerState,
   type ExecutionAttempt,
+  type ExecutionControllerDependencies,
   type PreparationRecord,
   type SetupRuntimePort,
   type SourceEvidence,
@@ -34,6 +35,7 @@ import {
 import { registerHerdrExtension } from "../src/extension.js";
 import { FileWorkerBridgeTransport } from "../src/file-worker-bridge.js";
 import { LocalControllerDaemon, UnixControllerClient } from "../src/local-daemon.js";
+import { FileNativeEvidenceAdapter } from "../src/native-evidence.js";
 import { digest } from "../src/policy.js";
 import type {
   WorkerBridgeChannel,
@@ -165,6 +167,7 @@ class ControlledWorker implements WorkerRuntimePort {
   failAt: "allocate" | "start" | "dispatch" | undefined;
   beforeStart: (() => Promise<void>) | undefined;
   mutateIdentity: ((identity: WorkerIdentity) => WorkerIdentity) | undefined;
+  inspectOverride: ((identity: WorkerIdentity) => Promise<WorkerObservation>) | undefined;
 
   async allocate(input: Parameters<WorkerRuntimePort["allocate"]>[0]): Promise<WorkerAllocation> {
     this.allocations += 1;
@@ -196,6 +199,7 @@ class ControlledWorker implements WorkerRuntimePort {
 
   async inspect(identity: WorkerIdentity): Promise<WorkerObservation> {
     this.inspections += 1;
+    if (this.inspectOverride) return this.inspectOverride(identity);
     return { identity: this.mismatch ? { ...identity, paneId: "foreign-pane" } : identity, status: this.status, artifactReferences: [] };
   }
 
@@ -213,12 +217,15 @@ class ControlledWorker implements WorkerRuntimePort {
   async focus(): Promise<void> { this.focuses += 1; }
 }
 
+type AcceptanceAdapters = NonNullable<ExecutionControllerDependencies["acceptance"]>;
+
 function controller(
   repo: TestRepository,
   worker: WorkerRuntimePort,
   instanceId = "controller-1",
   ids = ["preparation-1", "attempt-1", "decision-1"],
   setup?: SetupRuntimePort,
+  acceptance?: AcceptanceAdapters,
 ): PreparationController {
   const pending = [...ids];
   return new PreparationController(new JsonControllerStateStore(repo.statePath), {
@@ -231,6 +238,7 @@ function controller(
       git: new RealGitWorktreeAdapter(),
       worker,
       ...(setup ? { setup } : {}),
+      ...(acceptance ? { acceptance } : {}),
     },
   });
 }
@@ -252,8 +260,13 @@ function monitoredObservation(attempt: ExecutionAttempt, observation: WorkerObse
   };
 }
 
-async function approved(repo: TestRepository, worker: WorkerRuntimePort, claimedBy: string | null = null): Promise<{ controller: PreparationController; preparationId: string }> {
-  const instance = controller(repo, worker);
+async function approved(
+  repo: TestRepository,
+  worker: WorkerRuntimePort,
+  claimedBy: string | null = null,
+  acceptance?: AcceptanceAdapters,
+): Promise<{ controller: PreparationController; preparationId: string }> {
+  const instance = controller(repo, worker, "controller-1", ["preparation-1", "attempt-1", "decision-1"], undefined, acceptance);
   const prepared = value(await instance.prepare(actor, { specReference: "spec-2", controllerName: "example / issue 4" }, admission(repo)));
   const proposed = value(await instance.submitProposal(actor, prepared.id, proposal(repo, claimedBy)));
   const approval: ApprovalRequest = {
@@ -267,8 +280,12 @@ async function approved(repo: TestRepository, worker: WorkerRuntimePort, claimed
   return { controller: instance, preparationId: prepared.id };
 }
 
-async function start(repo: TestRepository, worker: WorkerRuntimePort): Promise<{ controller: PreparationController; attempt: ExecutionAttempt }> {
-  const ready = await approved(repo, worker);
+async function start(
+  repo: TestRepository,
+  worker: WorkerRuntimePort,
+  acceptance?: AcceptanceAdapters,
+): Promise<{ controller: PreparationController; attempt: ExecutionAttempt }> {
+  const ready = await approved(repo, worker, null, acceptance);
   return {
     controller: ready.controller,
     attempt: value(await ready.controller.startTicket(actor, { preparationId: ready.preparationId, ticketIdentity: "ticket-4", workspaceId: "workspace-1" })),
@@ -1559,16 +1576,28 @@ test("daemon routes a worker decision and stops on an execution-time checkout mu
 
 test("ordinary implementation tool events produce candidate-bound native test and review receipts", async (): Promise<void> => {
   const repo = await repository();
+  const worker = new ControlledWorker();
+  const acceptance: AcceptanceAdapters = {
+    nativeEvidence: new FileNativeEvidenceAdapter(),
+    checks: { async execute(): Promise<never> { throw new Error("checks must not run while lifecycle evidence is blocked"); } },
+    reviewer: { async review(): Promise<never> { throw new Error("reviews must not run while lifecycle evidence is blocked"); } },
+    nativeVerifier: { async verify(): Promise<never> { throw new Error("verification must not run while lifecycle evidence is blocked"); } },
+  };
+  const running = await start(repo, worker, acceptance);
+  const workerRoot = running.attempt.worktree!.path;
   const bridgeDirectory = join(repo.root, ".git", "herdr", "native-producer");
   await mkdir(bridgeDirectory, { recursive: true });
   const previousEndpoint = process.env.HERDR_WORKER_BRIDGE_ENDPOINT;
   const previousNonce = process.env.HERDR_WORKER_BRIDGE_NONCE;
   const previousVerificationEndpoint = process.env.HERDR_WORKER_NATIVE_VERIFICATION_ENDPOINT;
   const previousReviewNonce = process.env.HERDR_WORKER_REVIEW_NONCE;
+  const previousPiSubagentsTempRoot = process.env.PI_SUBAGENTS_TEMP_ROOT;
+  const piSubagentsTempRoot = join(bridgeDirectory, "pi-subagents-temp");
   process.env.HERDR_WORKER_BRIDGE_ENDPOINT = join(bridgeDirectory, "readiness.json");
   process.env.HERDR_WORKER_BRIDGE_NONCE = "native-producer-nonce";
   process.env.HERDR_WORKER_NATIVE_VERIFICATION_ENDPOINT = join(bridgeDirectory, "native-verification.json");
   process.env.HERDR_WORKER_REVIEW_NONCE = "native-verification-nonce";
+  process.env.PI_SUBAGENTS_TEMP_ROOT = piSubagentsTempRoot;
   const hostHandlers = new Map<string, (event: any, ctx: any) => unknown>();
   const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
   const eventHandlers = new Map<string, Array<(payload: unknown) => void>>();
@@ -1608,10 +1637,12 @@ test("ordinary implementation tool events produce candidate-bound native test an
     getAllTools: (): Array<{ name: string }> => [{ name: "subagent" }],
   } as unknown as ExtensionAPI;
   const context = {
-    cwd: repo.root,
-    sessionManager: { getSessionId: (): string => "native-session" },
+    cwd: workerRoot,
+    sessionManager: { getSessionId: (): string => running.attempt.worker!.sessionId },
     hasPendingMessages: (): boolean => false,
   };
+  const evidenceDirectory = join(bridgeDirectory, "native-evidence");
+  let evidencePermissionsRestricted = false;
   try {
     herdrWorkerBridge(fakePi);
     assert.ok(tools.has("herdr_capture_native_evidence"));
@@ -1628,9 +1659,12 @@ test("ordinary implementation tool events produce candidate-bound native test an
         },
       }] } },
     }, context);
-    const candidate = await new RealGitWorktreeAdapter().captureCandidate({ path: repo.root, sourceBase: repo.head });
+    const candidate = await new RealGitWorktreeAdapter().captureCandidate({
+      path: workerRoot,
+      sourceBase: running.attempt.worktree!.head,
+    });
     const nodeHelpOutput = execFileSync(process.execPath, ["--test", "--help"], {
-      cwd: repo.root,
+      cwd: workerRoot,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -1689,11 +1723,158 @@ test("ordinary implementation tool events produce candidate-bound native test an
       findings: [],
     }, undefined, undefined, context);
     const nativeEvidenceModule = await import("../src/native-evidence.js");
-    const latestEvidencePath = join(bridgeDirectory, "native-evidence", "latest.json");
-    const expectedEvidence = { sessionId: "native-session", codeStateDigest: candidate.codeStateDigest };
+    const latestEvidencePath = join(evidenceDirectory, "latest.json");
+    const expectedEvidence = { sessionId: running.attempt.worker!.sessionId, codeStateDigest: candidate.codeStateDigest };
     await hostHandlers.get("agent_settled")!({}, context);
     const firstPublishedRecords = await nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence);
     const immutableArtifacts = firstPublishedRecords.flatMap((record) => [record.evidenceReference]);
+    const lifecyclePath = join(bridgeDirectory, "lifecycle.json");
+    worker.inspectOverride = async (identity): Promise<WorkerObservation> => {
+      const lifecycle = JSON.parse(await readFile(lifecyclePath, "utf8")) as WorkerLifecycleReceipt;
+      return {
+        identity,
+        status: "done",
+        artifactReferences: [],
+        settled: lifecycle.state === "settled",
+        outstandingJobs: lifecycle.outstandingJobs,
+      };
+    };
+    const completed = value(await running.controller.recordWorkerObservation(actor, monitoredObservation(
+      running.attempt,
+      await worker.inspect(running.attempt.worker!),
+    )));
+    const captured = value(await running.controller.captureCandidate(actor, { attemptId: completed.id }));
+    const assertPublicAcceptanceBlocked = async (records: typeof firstPublishedRecords): Promise<void> => {
+      const rejected = await running.controller.acceptCandidate(actor, {
+        attemptId: completed.id,
+        candidateDigest: captured.candidate.candidateDigest,
+        nativeEvidence: records,
+      });
+      assert.equal(rejected.ok, false);
+      if (!rejected.ok) {
+        assert.deepEqual(rejected.error.diagnostics, [
+          "Acceptance requires the exact settled implementation worker with no outstanding jobs",
+        ]);
+      }
+    };
+
+    await chmod(evidenceDirectory, 0o500);
+    evidencePermissionsRestricted = true;
+    await hostHandlers.get("tool_execution_start")!({
+      toolCallId: "failed-test-revocation",
+      toolName: "bash",
+      args: { command: "node --import tsx --test test/execution-controller.test.ts" },
+    }, context);
+    await hostHandlers.get("tool_result")!({
+      toolCallId: "failed-test-revocation",
+      toolName: "bash",
+      input: { command: "node --import tsx --test test/execution-controller.test.ts" },
+      isError: true,
+    }, context);
+    await hostHandlers.get("tool_execution_end")!({
+      toolCallId: "failed-test-revocation",
+      toolName: "bash",
+      isError: true,
+      result: {},
+    }, context);
+    await hostHandlers.get("agent_settled")!({}, context);
+    const readableStaleTestRecords = await nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence);
+    const failedTestLifecycle = JSON.parse(await readFile(lifecyclePath, "utf8")) as WorkerLifecycleReceipt;
+    assert.ok(failedTestLifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("failed-test-revocation:revocation-failed")));
+    await assertPublicAcceptanceBlocked(readableStaleTestRecords);
+    await Promise.all(immutableArtifacts.map((artifact) => readFile(artifact)));
+
+    await hostHandlers.get("tool_execution_start")!({
+      toolCallId: "failed-review-revocation",
+      toolName: "subagent",
+      args: { task: "Review the implementation again" },
+    }, context);
+    await hostHandlers.get("tool_execution_end")!({
+      toolCallId: "failed-review-revocation",
+      toolName: "subagent",
+      isError: true,
+      result: { details: { runId: "failed-review-run", results: [] } },
+    }, context);
+    await hostHandlers.get("agent_settled")!({}, context);
+    const readableStaleReviewRecords = await nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence);
+    const failedReviewLifecycle = JSON.parse(await readFile(lifecyclePath, "utf8")) as WorkerLifecycleReceipt;
+    assert.ok(failedReviewLifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("failed-review-revocation:revocation-failed")));
+    await assertPublicAcceptanceBlocked(readableStaleReviewRecords);
+
+    const startedReviewAsyncDir = join(piSubagentsTempRoot, "async-subagent-runs", "started-review-run");
+    await mkdir(startedReviewAsyncDir, { recursive: true });
+    await hostHandlers.get("tool_execution_start")!({
+      toolCallId: "started-review-revocation",
+      toolName: "subagent",
+      args: {
+        workflowScript: "return runs.all([{ key: 'standards', task: 'Review standards' }, { key: 'spec', task: 'Review spec' }]);",
+      },
+    }, context);
+    await hostHandlers.get("tool_execution_end")!({
+      toolCallId: "started-review-revocation",
+      toolName: "subagent",
+      isError: false,
+      result: {
+        details: {
+          mode: "workflow",
+          runId: "started-review-run",
+          toolCallId: "started-review-revocation",
+          asyncId: "started-review-run",
+          asyncDir: startedReviewAsyncDir,
+          results: [],
+        },
+      },
+    }, context);
+    await hostHandlers.get("agent_settled")!({}, context);
+    const readableStaleStartedReviewRecords = await nativeEvidenceModule.readProducedNativeEvidence(
+      latestEvidencePath,
+      expectedEvidence,
+    );
+    const startedReviewLifecycle = JSON.parse(await readFile(lifecyclePath, "utf8")) as WorkerLifecycleReceipt;
+    assert.ok(startedReviewLifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("started-review-revocation:revocation-failed")));
+    await assertPublicAcceptanceBlocked(readableStaleStartedReviewRecords);
+
+    await chmod(evidenceDirectory, 0o700);
+    evidencePermissionsRestricted = false;
+    await hostHandlers.get("tool_result")!({
+      toolCallId: "successful-test-revocation-recovery",
+      toolName: "bash",
+      input: { command: "node --import tsx --test test/execution-controller.test.ts" },
+      isError: false,
+    }, context);
+    await hostHandlers.get("agent_settled")!({}, context);
+    const testOnlyRecoveryLifecycle = JSON.parse(await readFile(lifecyclePath, "utf8")) as WorkerLifecycleReceipt;
+    assert.equal(testOnlyRecoveryLifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("failed-test-revocation:revocation-failed")), false);
+    assert.ok(testOnlyRecoveryLifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("failed-review-revocation:revocation-failed")));
+    await assert.rejects(nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence), /ENOENT/);
+
+    await hostHandlers.get("tool_execution_start")!({
+      toolCallId: "successful-review-revocation-recovery",
+      toolName: "subagent",
+      args: { task: "Review the corrected implementation" },
+    }, context);
+    await hostHandlers.get("tool_execution_end")!({
+      toolCallId: "successful-review-revocation-recovery",
+      toolName: "subagent",
+      isError: false,
+      result: { details: { runId: "successful-review-recovery-run", results: [{
+        agent: "reviewer", task: "Review the corrected implementation", exitCode: 0,
+        structuredAcceptanceReport: {
+          criteriaSatisfied: [{ id: "review", status: "satisfied", evidence: "No blocking findings" }],
+          reviewFindings: ["no blockers"], residualRisks: ["none"],
+        },
+      }] } },
+    }, context);
+    await hostHandlers.get("agent_settled")!({}, context);
+    const recoveredLifecycle = JSON.parse(await readFile(lifecyclePath, "utf8")) as WorkerLifecycleReceipt;
+    assert.equal(recoveredLifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("revocation-failed")), false);
+    await nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence);
 
     await hostHandlers.get("tool_result")!({
       toolCallId: "failed-test-rerun",
@@ -1768,6 +1949,7 @@ test("ordinary implementation tool events produce candidate-bound native test an
       await new nativeEvidenceModule.FileNativeEvidenceAdapter().verify({ record, candidate });
     }
   } finally {
+    if (evidencePermissionsRestricted) await chmod(evidenceDirectory, 0o700);
     if (previousEndpoint === undefined) delete process.env.HERDR_WORKER_BRIDGE_ENDPOINT;
     else process.env.HERDR_WORKER_BRIDGE_ENDPOINT = previousEndpoint;
     if (previousNonce === undefined) delete process.env.HERDR_WORKER_BRIDGE_NONCE;
@@ -1776,6 +1958,8 @@ test("ordinary implementation tool events produce candidate-bound native test an
     else process.env.HERDR_WORKER_NATIVE_VERIFICATION_ENDPOINT = previousVerificationEndpoint;
     if (previousReviewNonce === undefined) delete process.env.HERDR_WORKER_REVIEW_NONCE;
     else process.env.HERDR_WORKER_REVIEW_NONCE = previousReviewNonce;
+    if (previousPiSubagentsTempRoot === undefined) delete process.env.PI_SUBAGENTS_TEMP_ROOT;
+    else process.env.PI_SUBAGENTS_TEMP_ROOT = previousPiSubagentsTempRoot;
   }
 });
 
@@ -1842,6 +2026,8 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
   };
   const childSessionRoot = join(bridgeDirectory, "parent-session");
   const artifactRoot = join(bridgeDirectory, "subagent-artifacts");
+  const evidenceDirectory = join(bridgeDirectory, "native-evidence");
+  let evidencePermissionsRestricted = false;
   await mkdir(childSessionRoot, { recursive: true });
   await mkdir(artifactRoot, { recursive: true });
   await writeFile(parentSessionFile, "parent\n");
@@ -2057,6 +2243,39 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
       { sessionId: "native-session", codeStateDigest: candidate.codeStateDigest },
     );
     assert.deepEqual(afterReplay.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+
+    await chmod(evidenceDirectory, 0o500);
+    evidencePermissionsRestricted = true;
+    const reviewStartedDuringRevocationFailure = await launchReview({
+      runId: "started-review-revocation-run",
+      toolCallId: "started-review-revocation-tool",
+      completionOwnerId: "started-review-revocation-owner",
+    });
+    await hostHandlers.get("agent_settled")!({}, context);
+    const readableBeforeStartedReviewCompletion = await nativeEvidenceModule.readProducedNativeEvidence(
+      latestEvidencePath,
+      { sessionId: "native-session", codeStateDigest: candidate.codeStateDigest },
+    );
+    assert.deepEqual(readableBeforeStartedReviewCompletion.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+    const startedReviewBlockedLifecycle = JSON.parse(await readFile(join(bridgeDirectory, "lifecycle.json"), "utf8")) as {
+      outstandingJobs: string[];
+    };
+    assert.ok(startedReviewBlockedLifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("started-review-revocation-tool:revocation-failed")));
+
+    await chmod(evidenceDirectory, 0o700);
+    evidencePermissionsRestricted = false;
+    events.emit("subagent:async-complete", reviewStartedDuringRevocationFailure.completion);
+    await hostHandlers.get("agent_settled")!({}, context);
+    await nativeEvidenceModule.readProducedNativeEvidence(
+      latestEvidencePath,
+      { sessionId: "native-session", codeStateDigest: candidate.codeStateDigest },
+    );
+    const startedReviewRecoveredLifecycle = JSON.parse(await readFile(join(bridgeDirectory, "lifecycle.json"), "utf8")) as {
+      outstandingJobs: string[];
+    };
+    assert.equal(startedReviewRecoveredLifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("started-review-revocation-tool:revocation-failed")), false);
 
     const blockingFixture = await launchReview({
       runId: "blocking-recovery-run",
@@ -2283,6 +2502,7 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
     assert.equal(recoveredLifecycle.outstandingJobs.some((job): boolean =>
       job.startsWith("native-evidence-terminal-failure:")), false);
   } finally {
+    if (evidencePermissionsRestricted) await chmod(evidenceDirectory, 0o700);
     if (previousEndpoint === undefined) delete process.env.HERDR_WORKER_BRIDGE_ENDPOINT;
     else process.env.HERDR_WORKER_BRIDGE_ENDPOINT = previousEndpoint;
     if (previousNonce === undefined) delete process.env.HERDR_WORKER_BRIDGE_NONCE;

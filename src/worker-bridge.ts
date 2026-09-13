@@ -81,6 +81,7 @@ interface AsyncReviewLaunch extends PendingSubagentLaunch {
 type TerminalNativeEvidenceFailureKind = "review-rejected" | "capture-failed" | "revocation-failed";
 interface TerminalNativeEvidenceFailure {
   kind: TerminalNativeEvidenceFailureKind;
+  obligation: "tests" | "reviews";
   reason: string;
   sequence: number;
 }
@@ -100,7 +101,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   const activeAsyncReviewCaptures = new Map<string, Promise<void>>();
   const terminalNativeEvidenceFailures = new Map<string, TerminalNativeEvidenceFailure>();
   const nativeExecutions = new Map<string, NativeExecutionProof>();
-  let subagentLaunchSequence = 0;
+  let nativeEvidenceSequence = 0;
   let latestSuccessfulAsyncReviewSequence = 0;
   let failedBashCommand = false;
   let mutationToolUsed = false;
@@ -119,6 +120,57 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     ...[...terminalNativeEvidenceFailures].sort().map(([id, failure]): string =>
       `native-evidence-terminal-failure:${id}:${failure.kind}:${failure.reason}`),
   ];
+  const recordTerminalEvidenceFailure = (
+    id: string,
+    kind: TerminalNativeEvidenceFailureKind,
+    obligation: "tests" | "reviews",
+    sequence: number,
+    error: unknown,
+  ): void => {
+    terminalNativeEvidenceFailures.set(`${obligation}:${boundedDiagnostic(id)}`, {
+      kind,
+      obligation,
+      reason: boundedDiagnostic(error instanceof Error ? error.message : String(error)),
+      sequence,
+    });
+  };
+  const clearRecoveredEvidenceFailures = (obligation: "tests" | "reviews", sequence: number): void => {
+    for (const [failureId, failure] of terminalNativeEvidenceFailures) {
+      if (failure.obligation === obligation && failure.sequence <= sequence) {
+        terminalNativeEvidenceFailures.delete(failureId);
+      }
+    }
+  };
+  const invalidateObservedEvidence = async (
+    id: string,
+    obligation: "tests" | "reviews",
+    cwd: string,
+    sequence: number,
+  ): Promise<boolean> => {
+    try {
+      await invalidateNativeExecutions(nativeExecutions, obligation, cwd);
+      return true;
+    } catch (error) {
+      recordTerminalEvidenceFailure(id, "revocation-failed", obligation, sequence, error);
+      return false;
+    }
+  };
+  const retainFreshNativeExecution = async (
+    toolCallId: string,
+    obligation: "tests" | "reviews",
+    cwd: string,
+    sessionId: string,
+    detail: string,
+    sequence: number,
+  ): Promise<void> => {
+    if (!await invalidateObservedEvidence(toolCallId, obligation, cwd, sequence)) return;
+    try {
+      await retainNativeExecution(nativeExecutions, toolCallId, obligation, cwd, sessionId, detail);
+      clearRecoveredEvidenceFailures(obligation, sequence);
+    } catch (error) {
+      recordTerminalEvidenceFailure(toolCallId, "capture-failed", obligation, sequence, error);
+    }
+  };
   const consumeAsyncReviewCompletion = (runId: string, payload: unknown): void => {
     const launch = asyncReviewLaunches.get(runId);
     if (!launch || terminalAsyncReviewRuns.has(runId)) return;
@@ -129,9 +181,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
       try {
         await retainAsyncNativeReview(nativeExecutions, consumedReviewerSessions, launch, payload);
         latestSuccessfulAsyncReviewSequence = Math.max(latestSuccessfulAsyncReviewSequence, launch.sequence);
-        for (const [failedRunId, failure] of terminalNativeEvidenceFailures) {
-          if (failure.sequence < launch.sequence) terminalNativeEvidenceFailures.delete(failedRunId);
-        }
+        clearRecoveredEvidenceFailures("reviews", launch.sequence);
       } catch (error) {
         nativeExecutions.delete(launch.toolCallId);
         let kind: TerminalNativeEvidenceFailureKind = isFileSystemError(error) ? "capture-failed" : "review-rejected";
@@ -143,20 +193,12 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
           reason = `${reason}; revocation failed: ${revocationError instanceof Error ? revocationError.message : String(revocationError)}`;
         }
         if (kind !== "revocation-failed" && launch.sequence < latestSuccessfulAsyncReviewSequence) return;
-        terminalNativeEvidenceFailures.set(runId, {
-          kind,
-          reason: boundedDiagnostic(reason),
-          sequence: launch.sequence,
-        });
+        recordTerminalEvidenceFailure(runId, kind, "reviews", launch.sequence, reason);
       }
     })().catch((error: unknown): void => {
       // This terminal guard must never reject: lifecycle remains fail-closed until a newer valid review proves capture recovered.
       nativeExecutions.delete(launch.toolCallId);
-      terminalNativeEvidenceFailures.set(runId, {
-        kind: "capture-failed",
-        reason: boundedDiagnostic(error instanceof Error ? error.message : String(error)),
-        sequence: launch.sequence,
-      });
+      recordTerminalEvidenceFailure(runId, "capture-failed", "reviews", launch.sequence, error);
     });
     activeAsyncReviewCaptures.set(runId, capture);
     void capture.then((): void => { activeAsyncReviewCaptures.delete(runId); });
@@ -188,7 +230,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     consumedReviewerSessions.clear();
     activeAsyncReviewCaptures.clear();
     terminalNativeEvidenceFailures.clear();
-    subagentLaunchSequence = 0;
+    nativeEvidenceSequence = 0;
     latestSuccessfulAsyncReviewSequence = 0;
     observedCommandDigests.length = 0;
     nativeTestDiagnostics.length = 0;
@@ -216,7 +258,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
           codeStateDigest: await captureCodeStateDigest(ctx.cwd),
           args: event.args,
           launchedAt: Date.now(),
-          sequence: ++subagentLaunchSequence,
+          sequence: ++nativeEvidenceSequence,
         });
       }
     }
@@ -234,10 +276,18 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     observedCommandDigests.push(commandDigest);
     const testCommand = classifyNativeTestCommand(command);
     if (testCommand.status === "supported") {
+      const sequence = ++nativeEvidenceSequence;
       if (!event.isError) {
-        await retainNativeExecution(nativeExecutions, event.toolCallId, "tests", ctx.cwd, ctx.sessionManager.getSessionId(), `bash:${commandDigest}`);
+        await retainFreshNativeExecution(
+          event.toolCallId,
+          "tests",
+          ctx.cwd,
+          ctx.sessionManager.getSessionId(),
+          `bash:${commandDigest}`,
+          sequence,
+        );
       } else {
-        await invalidateNativeExecutions(nativeExecutions, "tests", ctx.cwd);
+        await invalidateObservedEvidence(event.toolCallId, "tests", ctx.cwd, sequence);
         nativeTestDiagnostics.push("The directly executed native test command failed according to Pi's tool execution result; rerun it successfully after the final edit");
       }
     } else if (testCommand.status === "unsupported") {
@@ -247,13 +297,15 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   pi.on("tool_execution_end", async (event, ctx): Promise<void> => {
     activeTools.delete(event.toolCallId);
     const pendingLaunch = pendingSubagentLaunches.get(event.toolCallId);
+    const reviewSequence = pendingLaunch?.sequence ??
+      (event.toolName === "subagent" ? ++nativeEvidenceSequence : nativeEvidenceSequence);
     if (event.toolName === "subagent" && event.isError && pendingLaunch && looksLikeAnyReviewRequest(pendingLaunch.args)) {
-      await invalidateNativeExecutions(nativeExecutions, "reviews", ctx.cwd);
+      await invalidateObservedEvidence(event.toolCallId, "reviews", ctx.cwd, reviewSequence);
     }
     if (event.toolName === "subagent" && !event.isError) {
       const asyncResult = parseAsyncLaunchResult(event.result);
       if (pendingLaunch && looksLikeReviewRequest(pendingLaunch.args) && (asyncResult || isAsyncLaunchLike(event.result))) {
-        await invalidateNativeExecutions(nativeExecutions, "reviews", ctx.cwd);
+        await invalidateObservedEvidence(event.toolCallId, "reviews", ctx.cwd, reviewSequence);
         if (asyncResult && await isBoundAsyncReviewLaunch(pendingLaunch, asyncResult)) {
           activeSubagentRuns.add(asyncResult.runId);
           asyncReviewLaunches.set(asyncResult.runId, {
@@ -268,10 +320,16 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
       } else {
         const reviewResult = classifyNativeReviewResult(event.result);
         if (reviewResult === "passed") {
-          await invalidateNativeExecutions(nativeExecutions, "reviews", ctx.cwd);
-          await retainNativeExecution(nativeExecutions, event.toolCallId, "reviews", ctx.cwd, ctx.sessionManager.getSessionId(), "subagent:structured-acceptance:no-blockers");
+          await retainFreshNativeExecution(
+            event.toolCallId,
+            "reviews",
+            ctx.cwd,
+            ctx.sessionManager.getSessionId(),
+            "subagent:structured-acceptance:no-blockers",
+            reviewSequence,
+          );
         } else if (reviewResult === "blocked") {
-          await invalidateNativeExecutions(nativeExecutions, "reviews", ctx.cwd);
+          await invalidateObservedEvidence(event.toolCallId, "reviews", ctx.cwd, reviewSequence);
         }
       }
     }
