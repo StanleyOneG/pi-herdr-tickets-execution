@@ -242,9 +242,10 @@ export class HerdrWorkerRuntime implements WorkerRuntimePort, AcceptanceReviewPo
   }
 
   async close(identity: WorkerIdentity): Promise<void> {
-    const current = parseAgent(await this.command(["agent", "get", identity.agentName], 10_000));
-    assertOwnedAgent(current, identity);
-    if (!["idle", "done"].includes(agentStatus(current))) throw new Error("Owned worker is not settled for cleanup");
+    const observation = await this.inspect(identity);
+    if (!observation.settled || !["idle", "done"].includes(observation.status) ||
+      !Array.isArray(observation.outstandingJobs) || observation.outstandingJobs.length > 0
+    ) throw new Error("Owned worker is not settled with no outstanding Pi work for cleanup");
     await this.command(["tab", "close", identity.tabId], 10_000);
   }
 
@@ -255,6 +256,7 @@ export class HerdrWorkerRuntime implements WorkerRuntimePort, AcceptanceReviewPo
       .digest("hex").slice(0, 20);
     const allocation = await this.allocate({ workspaceId: input.workspaceId, agentName: `review-${digest}`, cwd: input.cwd });
     let identity: WorkerIdentity | undefined;
+    let shouldClose = false;
     try {
       identity = await this.start({ allocation, cwd: input.cwd, model: input.model });
       const channel = this.channels.get(allocationKey(allocation));
@@ -279,6 +281,11 @@ export class HerdrWorkerRuntime implements WorkerRuntimePort, AcceptanceReviewPo
       if (receipt.nonce !== channel.nonce || receipt.sessionId !== identity.sessionId || receipt.kind !== input.kind ||
         receipt.candidateCommit !== input.candidateCommit || receipt.reviewBase !== input.reviewBase
       ) throw new Error("Fresh review receipt is stale or mismatched");
+      const settled = await this.inspect(identity);
+      if (!settled.settled || !["idle", "done"].includes(settled.status) ||
+        !Array.isArray(settled.outstandingJobs) || settled.outstandingJobs.length > 0
+      ) throw new Error("Fresh review Pi session has not settled or still has outstanding work");
+      shouldClose = receipt.verdict === "passed" && receipt.findings.length === 0;
       return {
         kind: receipt.kind,
         verdict: receipt.verdict,
@@ -290,7 +297,7 @@ export class HerdrWorkerRuntime implements WorkerRuntimePort, AcceptanceReviewPo
         completedAt: receipt.completedAt,
       };
     } finally {
-      if (identity) {
+      if (identity && shouldClose) {
         try { await this.close(identity); } catch { /* Preserve the saved review session even if tab cleanup fails. */ }
       }
     }

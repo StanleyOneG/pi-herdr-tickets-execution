@@ -27,6 +27,7 @@ import type {
   RecordWorkerObservationRequest,
 } from "./contracts.js";
 import { PreparationController } from "./controller.js";
+import { mapAcceptCandidateCommand } from "./presentation-mappers.js";
 import { isBatchProposal, isCapturedModel, isSourceEvidence, isWorkerIdentity } from "./state-validation.js";
 import type { WorkerDecisionRequest } from "./worker-bridge-protocol.js";
 
@@ -307,7 +308,7 @@ export class LocalControllerDaemon {
       case "validateApproval": return this.controller.validateApproval(this.actor, params[0] as string, params[1] as ApprovalRequest);
       case "startTicket": return this.controller.startTicket(this.actor, params[0] as import("./contracts.js").StartTicketRequest);
       case "captureCandidate": return this.controller.captureCandidate(this.actor, params[0] as CaptureCandidateRequest);
-      case "acceptCandidate": return this.controller.acceptCandidate(this.actor, params[0] as AcceptCandidateRequest);
+      case "acceptCandidate": return this.controller.acceptCandidate(this.actor, mapAcceptCandidateCommand(params[0]));
       case "attachAttempt": return this.controller.attachAttempt(this.actor, params[0] as AttemptRequest);
       case "pauseAttempt": return this.controller.pauseAttempt(this.actor, params[0] as AttemptRequest);
       case "resumeAttempt": return this.controller.resumeAttempt(this.actor, params[0] as AttemptRequest);
@@ -524,9 +525,9 @@ function isAcceptCandidateRequest(value: unknown): value is AcceptCandidateReque
     !digestText(value.candidateDigest) || !Array.isArray(value.nativeEvidence) || value.nativeEvidence.length > 20
   ) return false;
   return value.nativeEvidence.every((item): boolean => isObjectWithKeys(item, [
-    "kind", "status", "candidateDigest", "evidenceReference", "completedAt",
+    "kind", "status", "codeStateDigest", "evidenceReference", "evidenceDigest", "completedAt",
   ]) && (item.kind === "tests" || item.kind === "reviews") && item.status === "passed" &&
-    digestText(item.candidateDigest) && boundedText(item.evidenceReference) &&
+    digestText(item.codeStateDigest) && boundedText(item.evidenceReference) && digestText(item.evidenceDigest) &&
     typeof item.completedAt === "string" && Number.isFinite(Date.parse(item.completedAt)));
 }
 

@@ -1,10 +1,11 @@
 import { spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 
 import type { GateCheckPort, GateCheckRecord } from "./contracts.js";
 import { atomicWritePrivateFile } from "./atomic-file.js";
+import { safeGateEvidence, type GateTermination } from "./safe-logging.js";
 
 const MAX_CHECK_OUTPUT_BYTES = 2 * 1024 * 1024;
 
@@ -14,7 +15,7 @@ export interface LocalGateCheckOptions {
   timeoutMs?: number;
 }
 
-/** Executes only commands frozen in the approved proposal and retains bounded combined output. */
+/** Executes only commands frozen in the approved proposal and retains safe metadata, never arbitrary output. */
 export class LocalGateCheckAdapter implements GateCheckPort {
   private readonly now: () => Date;
   private readonly generateId: () => string;
@@ -34,13 +35,19 @@ export class LocalGateCheckAdapter implements GateCheckPort {
     }
     await mkdir(this.evidenceDirectory, { recursive: true, mode: 0o700 });
     const result = await executeBoundedShell(input.command, input.cwd, this.timeoutMs);
-    const output = redactCredentials(`command: ${input.command}\nexit: ${result.exitCode}\n\n${result.output}`);
+    const evidence = safeGateEvidence({
+      command: input.command,
+      candidateCommit: input.candidateCommit,
+      exitCode: result.exitCode,
+      output: result.output,
+      termination: result.termination,
+    });
     const reference = join(this.evidenceDirectory, `check-${this.generateId()}.log`);
-    await atomicWritePrivateFile(reference, output);
+    await atomicWritePrivateFile(reference, evidence.serialized);
     return {
       command: input.command,
       exitCode: result.exitCode,
-      outputDigest: createHash("sha256").update(output).digest("hex"),
+      outputDigest: evidence.outputDigest,
       logReference: reference,
       candidateCommit: input.candidateCommit,
       completedAt: this.now().toISOString(),
@@ -48,7 +55,11 @@ export class LocalGateCheckAdapter implements GateCheckPort {
   }
 }
 
-async function executeBoundedShell(command: string, cwd: string, timeoutMs: number): Promise<{ exitCode: number; output: string }> {
+async function executeBoundedShell(command: string, cwd: string, timeoutMs: number): Promise<{
+  exitCode: number;
+  output: string;
+  termination: GateTermination;
+}> {
   return new Promise((resolve, reject): void => {
     const child = spawn(command, { cwd, shell: true, detached: true, env: { ...process.env, CI: "1" }, stdio: ["ignore", "pipe", "pipe"] });
     const chunks: Buffer[] = [];
@@ -82,7 +93,12 @@ async function executeBoundedShell(command: string, cwd: string, timeoutMs: numb
         : timedOut
           ? "\n[controller stopped the check because it exceeded its time limit]\n"
           : signal ? `\n[controller check ended by signal ${signal}]\n` : "";
-      resolve({ exitCode: exceeded || timedOut || signal ? 1 : code ?? 1, output: `${Buffer.concat(chunks).toString("utf8")}${suffix}` });
+      const termination: GateTermination = exceeded ? "output-limit" : timedOut ? "timeout" : signal ? "signal" : "completed";
+      resolve({
+        exitCode: exceeded || timedOut || signal ? 1 : code ?? 1,
+        output: `${Buffer.concat(chunks).toString("utf8")}${suffix}`,
+        termination,
+      });
     });
   });
 }
@@ -90,11 +106,4 @@ async function executeBoundedShell(command: string, cwd: string, timeoutMs: numb
 function terminateProcessGroup(pid: number | undefined, signal: NodeJS.Signals): void {
   if (!pid) return;
   try { process.kill(-pid, signal); } catch { /* Process may already have exited. */ }
-}
-
-function redactCredentials(value: string): string {
-  return value
-    .replace(/\b(?:sk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]+\b/gi, "[REDACTED]")
-    .replace(/((?:token|secret|password|api[_ -]?key)\s*[=:]\s*)\S+/gi, "$1[REDACTED]")
-    .replace(/([?&](?:access_?token|api_?key|token|secret|password)=)[^\s&]+/gi, "$1[REDACTED]");
 }

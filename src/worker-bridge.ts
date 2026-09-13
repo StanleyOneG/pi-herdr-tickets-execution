@@ -47,14 +47,34 @@ let sessionStartReason: WorkerReadinessReceipt["sessionStartReason"] | undefined
 
 export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   sessionStartReason = undefined;
+  const activeTools = new Set<string>();
+  let isAgentRunning = false;
+  const outstandingJobs = (): string[] => [
+    ...(isAgentRunning ? ["pi-agent-run"] : []),
+    ...[...activeTools].sort().map((id): string => `pi-tool:${id}`),
+  ];
   pi.on("session_start", (event, _ctx): void => {
     sessionStartReason = event.reason;
+    activeTools.clear();
+    isAgentRunning = false;
   });
   pi.on("agent_start", async (_event, ctx): Promise<void> => {
-    await writeLifecycle(ctx, "working");
+    isAgentRunning = true;
+    await writeLifecycle(ctx, "working", outstandingJobs());
+  });
+  pi.on("tool_execution_start", async (event, ctx): Promise<void> => {
+    activeTools.add(event.toolCallId);
+    await writeLifecycle(ctx, "working", outstandingJobs());
+  });
+  pi.on("tool_execution_end", async (event, ctx): Promise<void> => {
+    activeTools.delete(event.toolCallId);
+    await writeLifecycle(ctx, "working", outstandingJobs());
   });
   pi.on("agent_settled", async (_event, ctx): Promise<void> => {
-    await writeLifecycle(ctx, "settled");
+    isAgentRunning = false;
+    const jobs = outstandingJobs();
+    if (ctx.hasPendingMessages()) jobs.push("pi-queued-message");
+    await writeLifecycle(ctx, "settled", jobs);
   });
 
   pi.registerCommand("herdr-worker-ready", {
@@ -197,7 +217,11 @@ export async function requestLocalDecision(input: DecisionInput, signal?: AbortS
   }
 }
 
-async function writeLifecycle(ctx: ExtensionContext, state: "working" | "settled"): Promise<void> {
+async function writeLifecycle(
+  ctx: ExtensionContext,
+  state: "working" | "settled",
+  outstandingJobs: string[],
+): Promise<void> {
   const endpoint = process.env[WORKER_BRIDGE_ENDPOINT_ENV];
   const nonce = process.env[WORKER_BRIDGE_NONCE_ENV];
   if (!endpoint || !nonce || !isAbsolute(endpoint)) return;
@@ -208,7 +232,7 @@ async function writeLifecycle(ctx: ExtensionContext, state: "working" | "settled
     sessionId: ctx.sessionManager.getSessionId(),
     state,
     observedAt: new Date().toISOString(),
-    outstandingJobs: [],
+    outstandingJobs,
   })}\n`);
 }
 

@@ -19,6 +19,7 @@ import type {
 const executeFile = promisify(execFile);
 const MAX_GIT_OUTPUT_BYTES = 2 * 1024 * 1024;
 const MAX_UNTRACKED_FILES = 1_000;
+const MAX_CODE_STATE_FILES = 100_000;
 
 export class RealGitWorktreeAdapter implements GitWorktreePort {
   planTicketWorktree(input: {
@@ -157,19 +158,27 @@ export class RealGitWorktreeAdapter implements GitWorktreePort {
   async captureCandidate(input: { path: string; sourceBase: string }): Promise<CandidateGitState> {
     const root = await this.repositoryRoot(input.path);
     const capture = async (): Promise<Omit<CandidateGitState, "candidateDigest">> => {
-      const [head, branch, status, indexDiff, worktreeDiff, untrackedOutput] = await Promise.all([
+      const [head, branch, status, indexDiff, worktreeDiff, untrackedOutput, codePathsOutput] = await Promise.all([
         this.gitText(root, ["rev-parse", "HEAD"]),
         this.gitText(root, ["branch", "--show-current"]),
         this.gitBuffer(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
         this.gitBuffer(root, ["diff", "--binary", "--no-ext-diff", "--cached"]),
         this.gitBuffer(root, ["diff", "--binary", "--no-ext-diff"]),
         this.gitBuffer(root, ["ls-files", "--others", "--exclude-standard", "-z"]),
+        this.gitBuffer(root, ["ls-files", "--cached", "--others", "--exclude-standard", "-z"]),
       ]);
       if (!branch || !await this.isCommitAncestor(root, input.sourceBase, head)) {
         throw new Error("Candidate does not descend from its source base");
       }
       const untrackedPaths = splitNul(untrackedOutput).sort();
-      if (untrackedPaths.length > MAX_UNTRACKED_FILES) throw new Error("Candidate has too many untracked paths");
+      const codePaths = [...new Set(splitNul(codePathsOutput))].sort();
+      if (untrackedPaths.length > MAX_UNTRACKED_FILES || codePaths.length > MAX_CODE_STATE_FILES) {
+        throw new Error("Candidate has too many paths to fingerprint safely");
+      }
+      const [untrackedFiles, codeFiles] = await Promise.all([
+        fingerprintPaths(root, untrackedPaths),
+        fingerprintExistingPaths(root, codePaths),
+      ]);
       return {
         sourceBase: input.sourceBase,
         head,
@@ -177,7 +186,8 @@ export class RealGitWorktreeAdapter implements GitWorktreePort {
         statusDigest: hash(status),
         indexDiffDigest: hash(indexDiff),
         worktreeDiffDigest: hash(worktreeDiff),
-        untrackedFiles: await fingerprintPaths(root, untrackedPaths),
+        untrackedFiles,
+        codeStateDigest: digestFingerprints(codeFiles),
       };
     };
     const first = await capture();
@@ -273,7 +283,9 @@ export class RealGitWorktreeAdapter implements GitWorktreePort {
     if (current.head !== input.staging.baseCommit || current.branch !== input.integration.branch) {
       throw new Error("Accepted batch base moved before integration advance");
     }
-    await this.gitText(input.integration.path, ["merge", "--ff-only", input.staging.candidateCommit]);
+    await this.gitText(input.integration.path, [
+      "-c", "core.hooksPath=/dev/null", "merge", "--ff-only", input.staging.candidateCommit,
+    ]);
     return this.gitText(input.integration.path, ["rev-parse", "HEAD"]);
   }
 
@@ -376,6 +388,12 @@ async function copyCandidatePath(sourceRoot: string, destinationRoot: string, re
   const destination = join(destinationRoot, relativePath);
   const metadata = await lstat(source);
   await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
+  try {
+    await lstat(destination);
+    throw new Error(`Candidate untracked path collides with accepted content: ${relativePath}`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
   if (metadata.isSymbolicLink()) {
     await symlink(await readlink(source), destination);
     return;
@@ -389,6 +407,19 @@ async function fingerprintPaths(root: string, paths: string[]): Promise<GitFileF
     path,
     contentDigest: await hashPath(join(root, path)),
   })));
+}
+
+async function fingerprintExistingPaths(root: string, paths: string[]): Promise<GitFileFingerprint[]> {
+  const files = await Promise.all(paths.map(async (path): Promise<GitFileFingerprint | undefined> => {
+    try {
+      await lstat(join(root, path));
+      return { path, contentDigest: await hashPath(join(root, path)) };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+  }));
+  return files.filter((file): file is GitFileFingerprint => file !== undefined);
 }
 
 function digestFingerprints(files: GitFileFingerprint[]): string {
@@ -406,6 +437,7 @@ async function hashPath(path: string): Promise<string> {
   if (metadata.isSymbolicLink()) return hash(`symlink\0${await readlink(path)}`);
   if (!metadata.isFile()) return hash(`non-file\0${metadata.mode}`);
   const digest = createHash("sha256");
+  digest.update(`file\0${metadata.mode & 0o111}\0`);
   await new Promise<void>((resolvePromise, reject): void => {
     const stream = createReadStream(path);
     stream.on("data", (chunk): void => { digest.update(chunk); });

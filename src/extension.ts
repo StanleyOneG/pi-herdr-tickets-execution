@@ -21,8 +21,10 @@ import {
   type ControllerStatus,
   type ExecutionAttempt,
 } from "./controller.js";
+import { isActiveExecutionLifecycle } from "./contracts.js";
 import { connectOrStartLocalController, type ControllerClient } from "./local-daemon.js";
 import { formatPreparationPreview } from "./presentation.js";
+import { mapAcceptCandidateCommand } from "./presentation-mappers.js";
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 const SOURCE_EVIDENCE_SCHEMA = Type.Object({
   identity: Type.String({ minLength: 1 }),
@@ -122,8 +124,9 @@ const ACCEPT_CANDIDATE_SCHEMA = Type.Object({
   nativeEvidence: Type.Array(Type.Object({
     kind: StringEnum(["tests", "reviews"] as const),
     status: StringEnum(["passed"] as const),
-    candidateDigest: Type.String({ pattern: "^[a-fA-F0-9]{64}$" }),
+    codeStateDigest: Type.String({ pattern: "^[a-fA-F0-9]{64}$" }),
     evidenceReference: Type.String({ minLength: 1, maxLength: 4_096 }),
+    evidenceDigest: Type.String({ pattern: "^[a-fA-F0-9]{64}$" }),
     completedAt: Type.String({ minLength: 1 }),
   }), { minItems: 2, maxItems: 20 }),
 });
@@ -296,7 +299,7 @@ function renderControllerStatus(ctx: ExtensionContext, status: ControllerStatus)
   ];
   if (lines.length === 0) lines.push("No Herdr preparations or attempts in this repository");
   const activeCount = status.executionAttempts.filter(
-    (attempt): boolean => !["completed-unaccepted", "integration-blocked", "accepted", "needs-attention"].includes(attempt.lifecycle),
+    (attempt): boolean => isActiveExecutionLifecycle(attempt.lifecycle),
   ).length;
   const decisionCount = status.executionAttempts.reduce(
     (count, attempt): number => count + attempt.decisions.filter((decision): boolean => decision.state !== "delivered").length,
@@ -392,12 +395,14 @@ function acceptancePrompt(receipt: CandidateReceipt): string {
     "Assess the native implementation-skill evidence for this already captured candidate; do not edit code or mutate the tracker.",
     `Attempt: ${receipt.attemptId}`,
     `Ticket: ${receipt.ticketIdentity}`,
-    `Candidate digest captured from actual Git state: ${receipt.candidate.candidateDigest}`,
+    `Candidate receipt digest captured from actual Git state: ${receipt.candidate.candidateDigest}`,
+    `Git code-state digest (stable across content-equivalent commits): ${receipt.candidate.codeStateDigest}`,
     `Source base: ${receipt.candidate.sourceBase}`,
     `Worker saved session: ${receipt.sessionId} at ${receipt.sessionFile}`,
     `Existing evidence references: ${receipt.evidenceReferences.join(", ") || "none"}`,
     "Inspect the saved worker session and referenced artifacts. Identify explicit successful native implementation-skill test evidence and native review evidence that correspond to this exact candidate, including uncommitted state. Do not turn a completion sentence, successful prompt submission, idle status, or worker-reported hash into evidence.",
-    "Call herdr_accept_candidate exactly once with separate tests and reviews records, each bound to the candidate digest and its retained evidence reference. If either is missing, stale, failed, or ambiguous, report that acceptance is blocked and do not call the tool.",
+    "For each kind, write a private JSON receipt outside the repository with exactly schemaVersion, kind, status, codeStateDigest, completedAt, and a nonempty artifacts array. Each artifacts entry has an absolute retained source-artifact reference and its independently calculated SHA-256 digest. The source artifact must exist and contain the native test or review evidence you inspected.",
+    "Call herdr_accept_candidate exactly once with separate tests and reviews records, each bound to the Git code-state digest and to the SHA-256 digest of its JSON receipt. If a receipt or its retained source artifact is missing, stale, changed, failed, or ambiguous, report that acceptance is blocked and do not call the tool.",
     "The controller will independently execute approved checks and separate fresh Standards and Spec reviews in isolated integration staging before advancing the batch branch. It will not close tracker issues.",
   ].join("\n\n");
 }
@@ -630,9 +635,8 @@ export function registerHerdrExtension(
       _onUpdate: AgentToolUpdateCallback<unknown> | undefined,
       ctx: ExtensionContext,
     ): Promise<AgentToolResult<unknown>> {
-      const accepted = unwrapResult(await (await controllerFor(pi, ctx, dependencies)).acceptCandidate(
-        params as unknown as AcceptCandidateRequest,
-      ));
+      const command: AcceptCandidateRequest = mapAcceptCandidateCommand(params);
+      const accepted = unwrapResult(await (await controllerFor(pi, ctx, dependencies)).acceptCandidate(command));
       const status: ControllerStatus = { preparations: [], executionAttempts: [accepted], nextCursor: null, hasMore: false };
       renderControllerStatus(ctx, status);
       return {

@@ -36,6 +36,7 @@ import type {
   WorkerBridgeChannel,
   WorkerBridgeTransport,
   WorkerDecisionRequest,
+  WorkerLifecycleReceipt,
   WorkerReadinessReceipt,
   WorkerReviewReceipt,
 } from "../src/worker-bridge-protocol.js";
@@ -876,6 +877,7 @@ class ControlledBridge implements WorkerBridgeTransport {
   };
   receiptFactory: (() => WorkerReadinessReceipt) | undefined;
   reviewReceiptFactory: (() => WorkerReviewReceipt) | undefined;
+  lifecycleOutstandingJobs: string[] = [];
 
   async openChannel(): Promise<WorkerBridgeChannel> {
     return this.channel;
@@ -889,6 +891,21 @@ class ControlledBridge implements WorkerBridgeTransport {
   async waitForReview(): Promise<WorkerReviewReceipt> {
     if (!this.reviewReceiptFactory) throw new Error("missing review receipt");
     return this.reviewReceiptFactory();
+  }
+
+  async readLifecycle(): Promise<WorkerLifecycleReceipt> {
+    return {
+      schemaVersion: 1,
+      nonce: this.channel.nonce,
+      sessionId: "session-1",
+      state: "settled",
+      observedAt: "2026-09-12T15:00:01.000Z",
+      outstandingJobs: [...this.lifecycleOutstandingJobs],
+    };
+  }
+
+  async channelForAgent(): Promise<WorkerBridgeChannel> {
+    return this.channel;
   }
 }
 
@@ -1007,6 +1024,12 @@ test("authenticated Unix requests reject malformed method payloads at the daemon
       { method: "getPreparation", params: ["preparation-1", "extra"] },
       { method: "validateApproval", params: ["preparation-1", null] },
       { method: "startTicket", params: [{ preparationId: "preparation-1", ticketIdentity: null, workspaceId: "workspace-1" }] },
+      { method: "captureCandidate", params: [{ attemptId: 4 }] },
+      { method: "acceptCandidate", params: [{
+        attemptId: "attempt-1",
+        candidateDigest: "a".repeat(64),
+        nativeEvidence: [{ kind: "tests", status: "passed", candidateDigest: "a".repeat(64), evidenceReference: "/claim", completedAt: "2026-09-12T15:00:00.000Z" }],
+      }] },
       { method: "attachAttempt", params: [null] },
       { method: "pauseAttempt", params: [null] },
       { method: "resumeAttempt", params: [{ attemptId: 4 }] },
@@ -1587,6 +1610,68 @@ test("production Herdr acceptance review starts a fresh Pi session and retains s
   const reviewPrompt = executor.calls.find((call): boolean => call.args[0] === "agent" && call.args[1] === "prompt" && call.args.includes("--wait"))!;
   assert.match(reviewPrompt.args[3]!, /git diff a{40}\.\.b{40}/);
   assert.equal(executor.calls.some((call): boolean => call.args[0] === "tab" && call.args[1] === "close"), true);
+});
+
+test("production Herdr acceptance review preserves a settled blocked reviewer tab", async (): Promise<void> => {
+  const executor = new ControlledHerdr();
+  const bridge = new ControlledBridge();
+  const runtime = herdrRuntime(executor, bridge);
+  bridge.receiptFactory = (): WorkerReadinessReceipt => receiptFor(executor);
+  bridge.reviewReceiptFactory = (): WorkerReviewReceipt => ({
+    schemaVersion: 1,
+    nonce: bridge.channel.nonce,
+    sessionId: "session-1",
+    kind: "standards",
+    verdict: "blocked",
+    candidateCommit: "b".repeat(40),
+    reviewBase: "a".repeat(40),
+    findings: ["blocking finding"],
+    completedAt: "2026-09-12T15:00:00.000Z",
+  });
+
+  const review = await runtime.review({
+    kind: "standards",
+    workspaceId: "workspace-1",
+    cwd: "/candidate/staging",
+    reviewBase: "a".repeat(40),
+    candidateCommit: "b".repeat(40),
+    model: { provider: "test", id: "reasoner", thinkingLevel: "high", contextWindow: 220_000 },
+    evidenceReferences: ["/evidence/standards.md"],
+  });
+
+  assert.equal(review.verdict, "blocked");
+  assert.equal(executor.calls.some((call): boolean => call.args[0] === "tab" && call.args[1] === "close"), false);
+});
+
+test("production Herdr acceptance review rejects a receipt before the exact Pi session settles", async (): Promise<void> => {
+  const executor = new ControlledHerdr();
+  const bridge = new ControlledBridge();
+  bridge.lifecycleOutstandingJobs = ["pi-queued-message:1"];
+  const runtime = herdrRuntime(executor, bridge);
+  bridge.receiptFactory = (): WorkerReadinessReceipt => receiptFor(executor);
+  bridge.reviewReceiptFactory = (): WorkerReviewReceipt => ({
+    schemaVersion: 1,
+    nonce: bridge.channel.nonce,
+    sessionId: "session-1",
+    kind: "standards",
+    verdict: "passed",
+    candidateCommit: "b".repeat(40),
+    reviewBase: "a".repeat(40),
+    findings: [],
+    completedAt: "2026-09-12T15:00:00.000Z",
+  });
+
+  await assert.rejects(runtime.review({
+    kind: "standards",
+    workspaceId: "workspace-1",
+    cwd: "/candidate/staging",
+    reviewBase: "a".repeat(40),
+    candidateCommit: "b".repeat(40),
+    model: { provider: "test", id: "reasoner", thinkingLevel: "high", contextWindow: 220_000 },
+    evidenceReferences: ["/evidence/standards.md"],
+  }), /has not settled|outstanding work/);
+
+  assert.equal(executor.calls.some((call): boolean => call.args[0] === "tab" && call.args[1] === "close"), false);
 });
 
 test("ambiguous implementation prompt failure is recorded once without duplicate retry", async (): Promise<void> => {

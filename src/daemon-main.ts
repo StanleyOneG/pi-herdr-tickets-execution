@@ -7,6 +7,7 @@ import { LocalGateCheckAdapter } from "./gate-checks.js";
 import { RealGitWorktreeAdapter } from "./git-worktrees.js";
 import { ExecFileHerdrCommandExecutor, HerdrWorkerRuntime } from "./herdr-runtime.js";
 import { LocalControllerDaemon, localDaemonPaths, readOrCreateToken } from "./local-daemon.js";
+import { FileNativeEvidenceAdapter } from "./native-evidence.js";
 import { formatPreparationPreview } from "./presentation.js";
 import { LocalSetupRuntime } from "./setup-runtime.js";
 import { JsonControllerStateStore } from "./state-store.js";
@@ -31,6 +32,7 @@ export async function runDaemon(argv: string[]): Promise<void> {
       acceptance: {
         reviewer: worker,
         checks: new LocalGateCheckAdapter(paths.evidenceDirectory),
+        nativeEvidence: new FileNativeEvidenceAdapter(),
       },
     },
   });

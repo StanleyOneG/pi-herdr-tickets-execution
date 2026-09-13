@@ -41,6 +41,7 @@ import {
   MAX_EXECUTION_ATTEMPTS,
   MAX_PREPARATIONS,
   MAX_STATUS_PAGE_SIZE,
+  isActiveExecutionLifecycle,
 } from "./contracts.js";
 import {
   approvalFailures,
@@ -76,6 +77,7 @@ export type {
   GateCheckRecord,
   GitWorktreePort,
   LocalActorCapability,
+  NativeEvidencePort,
   NativeEvidenceRecord,
   OriginalCheckoutSnapshot,
   PaginationRequest,
@@ -100,9 +102,26 @@ export type {
 
 const AUTHORIZATION_DIAGNOSTIC = "The caller does not hold the local controller capability";
 const REQUIRED_WORKER_SKILLS = ["skill:implement", "skill:tdd", "skill:code-review", "skill:handoff"];
+const EMPTY_GIT_DIGEST = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+interface AcceptanceLease {
+  attemptId: string;
+  receiptId: string;
+  controlGeneration: number;
+}
+
+type AcceptanceContext = {
+  state: ControllerState;
+  attempt: ExecutionAttempt;
+  receipt: CandidateReceipt;
+  preparation: PreparationRecord;
+  execution: NonNullable<ControllerDependencies["execution"]>;
+  acceptance: NonNullable<NonNullable<ControllerDependencies["execution"]>["acceptance"]>;
+};
 
 export class PreparationController {
   private mutationQueue: Promise<void> = Promise.resolve();
+  private acceptanceQueue: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly store: ControllerStateStore,
@@ -275,6 +294,7 @@ export class PreparationController {
       proposalDigest: record.proposalDigest!,
       evidence: structuredClone(request.evidence),
     };
+    record.batchIntegration = { head: record.proposal!.target.baseCommit, sequence: 0 };
     const saved = await this.saveState(loaded.value);
     return saved.ok ? success(structuredClone(record)) : saved;
   }
@@ -292,9 +312,12 @@ export class PreparationController {
   }
 
   async acceptCandidate(actor: LocalActorCapability, request: AcceptCandidateRequest): Promise<ControllerResult<ExecutionAttempt>> {
-    return this.serializeMutation((): Promise<ControllerResult<ExecutionAttempt>> =>
-      this.acceptCandidateOperation(actor, request)
-    );
+    return this.serializeAcceptance(async (): Promise<ControllerResult<ExecutionAttempt>> => {
+      const begun = await this.serializeMutation((): Promise<ControllerResult<AcceptanceLease>> =>
+        this.beginAcceptanceOperation(actor, request)
+      );
+      return begun.ok ? this.continueAcceptanceOperation(begun.value) : begun;
+    });
   }
 
   async attachAttempt(actor: LocalActorCapability, request: AttemptRequest): Promise<ControllerResult<ExecutionAttempt>> {
@@ -414,7 +437,7 @@ export class PreparationController {
       return failure("execution-conflict", [`Ticket is blocked by in-batch prerequisites: ${blockedBy.sort().join(", ")}`]);
     }
     if (loaded.value.executionAttempts.some((attempt): boolean =>
-      attempt.preparationId === request.preparationId && isExecuting(attempt.lifecycle)
+      attempt.preparationId === request.preparationId && isActiveExecutionLifecycle(attempt.lifecycle)
     )) {
       return failure("execution-conflict", ["This preparation already owns an active ticket worker"]);
     }
@@ -621,10 +644,10 @@ export class PreparationController {
     }
   }
 
-  private async acceptCandidateOperation(
+  private async beginAcceptanceOperation(
     actor: LocalActorCapability,
     request: AcceptCandidateRequest,
-  ): Promise<ControllerResult<ExecutionAttempt>> {
+  ): Promise<ControllerResult<AcceptanceLease>> {
     const context = await this.mutableAttempt(actor, request.attemptId);
     if (!context.ok) return context;
     const { state, attempt, execution } = context.value;
@@ -639,34 +662,61 @@ export class PreparationController {
     if (!receipt) return failure("execution-validation", ["A current captured candidate receipt is required"]);
     const evidenceFailure = validateNativeEvidence(request.nativeEvidence, receipt);
     if (evidenceFailure) return failure("execution-validation", [evidenceFailure]);
-    const preparation = state.preparations.find((record): boolean => record.id === attempt.preparationId)!;
-    const proposal = preparation.proposal!;
+    const guarded = await this.verifyOwnedWorkerAndGit(state, attempt);
+    if (!guarded.ok || guarded.value.lifecycle === "needs-attention") return failure(
+      "execution-conflict",
+      guarded.ok ? guarded.value.diagnostics : guarded.error.diagnostics,
+    );
+    try {
+      const observation = await execution.worker.inspect(attempt.worker!);
+      if (!isSettledOwnedWorker(observation, attempt.worker!)) {
+        return failure("execution-conflict", ["Acceptance requires the exact settled implementation worker with no outstanding jobs"]);
+      }
+    } catch {
+      return failure("infrastructure", ["Implementation worker lifecycle verification failed"]);
+    }
+    try {
+      for (const record of request.nativeEvidence) {
+        await acceptance.nativeEvidence.verify({ record, candidate: receipt.candidate });
+      }
+    } catch {
+      return failure("execution-validation", ["Native implementation evidence is missing, changed, or candidate-mismatched"]);
+    }
     receipt.nativeEvidence = structuredClone(request.nativeEvidence);
     receipt.evidenceReferences = uniqueReferences([
       ...receipt.evidenceReferences,
       ...request.nativeEvidence.map((item): string => item.evidenceReference),
     ]);
     attempt.lifecycle = "accepting";
+    advanceControlGeneration(attempt);
     const accepting = await this.persistAttempt(state, attempt);
-    if (!accepting.ok) return accepting;
+    return accepting.ok
+      ? success({ attemptId: attempt.id, receiptId: receipt.id, controlGeneration: currentControlGeneration(attempt) })
+      : accepting;
+  }
 
+  private async continueAcceptanceOperation(lease: AcceptanceLease): Promise<ControllerResult<ExecutionAttempt>> {
+    const initial = await this.acceptanceContext(lease);
+    if (!initial.ok) return initial;
+    const { attempt, receipt, preparation, execution, acceptance } = initial.value;
+    const proposal = preparation.proposal!;
     try {
-      const current = await execution.git.captureCandidate({ path: attempt.worktree!.path, sourceBase: receipt.candidate.sourceBase });
+      const current = await execution.git.captureCandidate({
+        path: attempt.worktree!.path,
+        sourceBase: receipt.candidate.sourceBase,
+      });
       if (current.candidateDigest !== receipt.candidate.candidateDigest) {
-        return this.blockAcceptance(state, attempt, receipt, "Candidate changed after evidence capture");
+        return this.blockAcceptanceLease(lease, "Candidate changed after evidence capture");
       }
       const integration = await execution.git.prepareIntegrationWorktree({
         originalRoot: preparation.project.root,
         preparationId: preparation.id,
         targetBase: proposal.target.baseCommit,
       });
-      const latestAcceptedBase = state.executionAttempts
-        .filter((item): boolean => item.preparationId === preparation.id)
-        .flatMap((item): CandidateReceipt[] => item.candidateReceipts ?? [])
-        .filter((item): boolean => item.state === "accepted" && item.integration?.integratedCommit !== undefined)
-        .at(-1)?.integration?.integratedCommit ?? proposal.target.baseCommit;
-      if (integration.head !== latestAcceptedBase) {
-        return this.blockAcceptance(state, attempt, receipt, "Batch integration worktree moved outside recorded acceptance");
+      const currentBase = await this.acceptanceContext(lease);
+      if (!currentBase.ok) return currentBase;
+      if (integration.head !== (currentBase.value.preparation.batchIntegration?.head ?? proposal.target.baseCommit)) {
+        return this.blockAcceptanceLease(lease, "Batch integration worktree moved outside recorded acceptance");
       }
       const staging = await execution.git.stageCandidate({
         originalRoot: preparation.project.root,
@@ -679,22 +729,30 @@ export class PreparationController {
       });
       const stagedCandidate = await execution.git.captureCandidate({ path: staging.path, sourceBase: staging.baseCommit });
       if (stagedCandidate.head !== staging.candidateCommit) {
-        return this.blockAcceptance(state, attempt, receipt, "Staged candidate HEAD does not match its integration plan");
+        return this.blockAcceptanceLease(lease, "Staged candidate HEAD does not match its integration plan");
       }
-      receipt.integration = { worktree: structuredClone(integration), staging: structuredClone(staging) };
-      const staged = await this.persistAttempt(state, attempt);
+      const staged = await this.updateAcceptance(lease, (context): void => {
+        context.receipt.integration = { worktree: structuredClone(integration), staging: structuredClone(staging) };
+      });
       if (!staged.ok) return staged;
 
       for (const check of proposal.policy.checks) {
-        const result = await acceptance.checks.execute({ cwd: staging.path, command: check.command, candidateCommit: staging.candidateCommit });
-        if (!validCheckResult(result, check.command, staging.candidateCommit)) {
-          return this.blockAcceptance(state, attempt, receipt, "Approved check returned malformed or stale evidence");
+        const result = await acceptance.checks.execute({
+          cwd: staging.path,
+          command: check.command,
+          candidateCommit: staging.candidateCommit,
+        });
+        if (!isValidCheckResult(result, check.command, staging.candidateCommit)) {
+          return this.blockAcceptanceLease(lease, "Approved check returned malformed or stale evidence");
         }
-        receipt.checks.push(structuredClone(result));
-        receipt.evidenceReferences = uniqueReferences([...receipt.evidenceReferences, result.logReference]);
-        const checked = await this.persistAttempt(state, attempt);
+        const checked = await this.updateAcceptance(lease, (context): void => {
+          context.receipt.checks.push(structuredClone(result));
+          context.receipt.evidenceReferences = uniqueReferences([...context.receipt.evidenceReferences, result.logReference]);
+        });
         if (!checked.ok) return checked;
-        if (result.exitCode !== 0) return this.blockAcceptance(state, attempt, receipt, `Approved check failed: ${check.command}`);
+        if (result.exitCode !== 0) {
+          return this.blockAcceptanceLease(lease, `Approved check failed: ${check.command}`);
+        }
       }
 
       for (const kind of proposal.policy.requiredReviews) {
@@ -707,56 +765,140 @@ export class PreparationController {
           model: proposal.model,
           evidenceReferences: proposal.sourceEvidence.flatMap((source): string[] => source.references),
         });
-        if (!validReview(review, kind, staging.baseCommit, staging.candidateCommit) ||
-          review.freshSessionId === attempt.worker?.sessionId ||
-          receipt.reviews.some((existing): boolean => existing.freshSessionId === review.freshSessionId)
-        ) {
-          return this.blockAcceptance(state, attempt, receipt, `${kind} review returned malformed, stale, or non-fresh evidence`);
-        }
-        receipt.reviews.push(structuredClone(review));
-        receipt.evidenceReferences = uniqueReferences([...receipt.evidenceReferences, review.evidenceReference]);
-        receipt.findings.push(...review.findings);
-        const reviewed = await this.persistAttempt(state, attempt);
+        const beforeReviewSave = await this.acceptanceContext(lease);
+        if (!beforeReviewSave.ok) return beforeReviewSave;
+        if (!isValidReview(review, kind, staging.baseCommit, staging.candidateCommit) ||
+          review.freshSessionId === beforeReviewSave.value.attempt.worker?.sessionId ||
+          beforeReviewSave.value.receipt.reviews.some(
+            (existing): boolean => existing.freshSessionId === review.freshSessionId,
+          )
+        ) return this.blockAcceptanceLease(lease, `${kind} review returned malformed, stale, or non-fresh evidence`);
+        const reviewed = await this.updateAcceptance(lease, (context): void => {
+          context.receipt.reviews.push(structuredClone(review));
+          context.receipt.evidenceReferences = uniqueReferences([
+            ...context.receipt.evidenceReferences,
+            review.evidenceReference,
+          ]);
+          context.receipt.findings.push(...review.findings);
+        });
         if (!reviewed.ok) return reviewed;
         if (review.verdict !== "passed" || review.findings.length > 0) {
-          return this.blockAcceptance(state, attempt, receipt, `${kind} review has unresolved blocking findings`);
+          return this.blockAcceptanceLease(lease, `${kind} review has unresolved blocking findings`);
         }
       }
-      if (!proposal.policy.requiredReviews.every((kind): boolean => receipt.reviews.some((review): boolean => review.kind === kind && review.verdict === "passed"))) {
-        return this.blockAcceptance(state, attempt, receipt, "Required reviews are incomplete");
-      }
-      const [afterReview, stagedAfterReview] = await Promise.all([
-        execution.git.captureCandidate({ path: attempt.worktree!.path, sourceBase: receipt.candidate.sourceBase }),
-        execution.git.captureCandidate({ path: staging.path, sourceBase: staging.baseCommit }),
-      ]);
-      if (afterReview.candidateDigest !== receipt.candidate.candidateDigest) {
-        return this.blockAcceptance(state, attempt, receipt, "Candidate changed while acceptance evidence was collected");
-      }
-      if (stagedAfterReview.candidateDigest !== stagedCandidate.candidateDigest) {
-        return this.blockAcceptance(state, attempt, receipt, "Staged candidate changed while checks or reviews were running");
-      }
-      const integratedCommit = await execution.git.advanceIntegration({ integration, staging });
-      if (integratedCommit !== staging.candidateCommit) {
-        return this.blockAcceptance(state, attempt, receipt, "Integration returned a mismatched accepted commit");
-      }
-      receipt.integration.integratedCommit = integratedCommit;
-      receipt.state = "accepted";
-      receipt.acceptedAt = this.dependencies.now().toISOString();
-      attempt.acceptedCommit = integratedCommit;
-      attempt.lifecycle = "accepted";
-      const integrated = await this.persistAttempt(state, attempt);
-      if (!integrated.ok) return integrated;
-      if (!execution.worker.close || !attempt.worker || hasPendingDecision(attempt)) return integrated;
-      try {
-        await execution.worker.close(attempt.worker);
-        receipt.cleanup = "closed";
-      } catch {
-        receipt.cleanup = "failed";
-      }
-      return this.persistAttempt(state, attempt);
+      return this.serializeMutation((): Promise<ControllerResult<ExecutionAttempt>> =>
+        this.finalizeAcceptanceOperation(lease, stagedCandidate)
+      );
     } catch {
-      return this.blockAcceptance(state, attempt, receipt, "Integration, independent check, or review infrastructure failed");
+      return this.blockAcceptanceLease(lease, "Integration, independent check, or review infrastructure failed");
     }
+  }
+
+  private async finalizeAcceptanceOperation(
+    lease: AcceptanceLease,
+    stagedCandidate: import("./contracts.js").CandidateGitState,
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    const current = await this.acceptanceContext(lease);
+    if (!current.ok) return current;
+    const { state, attempt, receipt, preparation, execution } = current.value;
+    const integration = receipt.integration;
+    if (!integration) return this.blockAcceptance(state, attempt, receipt, "Integration staging evidence is incomplete");
+    if (!preparation.proposal!.policy.requiredReviews.every((kind): boolean => receipt.reviews.some(
+      (review): boolean => review.kind === kind && review.verdict === "passed" && review.findings.length === 0,
+    ))) return this.blockAcceptance(state, attempt, receipt, "Required reviews are incomplete");
+    const guarded = await this.verifyOwnedWorkerAndGit(state, attempt);
+    if (!guarded.ok || guarded.value.lifecycle === "needs-attention") return guarded;
+    const observation = await execution.worker.inspect(attempt.worker!);
+    if (!isSettledOwnedWorker(observation, attempt.worker!)) {
+      return this.blockAcceptance(state, attempt, receipt, "Implementation worker is no longer settled or has outstanding jobs");
+    }
+    const [afterReview, stagedAfterReview, currentIntegration] = await Promise.all([
+      execution.git.captureCandidate({ path: attempt.worktree!.path, sourceBase: receipt.candidate.sourceBase }),
+      execution.git.captureCandidate({ path: integration.staging.path, sourceBase: integration.staging.baseCommit }),
+      execution.git.inspectWorktree(integration.worktree.path),
+    ]);
+    if (afterReview.candidateDigest !== receipt.candidate.candidateDigest) {
+      return this.blockAcceptance(state, attempt, receipt, "Candidate changed while acceptance evidence was collected");
+    }
+    if (stagedAfterReview.candidateDigest !== stagedCandidate.candidateDigest) {
+      return this.blockAcceptance(state, attempt, receipt, "Staged candidate changed while checks or reviews were running");
+    }
+    if (currentIntegration.head !== preparation.batchIntegration?.head) {
+      return this.blockAcceptance(state, attempt, receipt, "Batch integration worktree moved outside recorded acceptance");
+    }
+    const integratedCommit = await execution.git.advanceIntegration({
+      integration: integration.worktree,
+      staging: integration.staging,
+    });
+    if (integratedCommit !== integration.staging.candidateCommit) {
+      return this.blockAcceptance(state, attempt, receipt, "Integration returned a mismatched accepted commit");
+    }
+    receipt.integration!.integratedCommit = integratedCommit;
+    receipt.integration!.sequence = (preparation.batchIntegration?.sequence ?? 0) + 1;
+    preparation.batchIntegration = { head: integratedCommit, sequence: receipt.integration!.sequence };
+    receipt.state = "accepted";
+    receipt.acceptedAt = this.dependencies.now().toISOString();
+    attempt.acceptedCommit = integratedCommit;
+    attempt.lifecycle = "accepted";
+    const integrated = await this.persistAttempt(state, attempt);
+    if (!integrated.ok || !execution.worker.close || hasPendingDecision(attempt)) return integrated;
+
+    const cleanupCandidate = await execution.git.captureCandidate({
+      path: attempt.worktree!.path,
+      sourceBase: receipt.candidate.sourceBase,
+    });
+    const cleanupObservation = await execution.worker.inspect(attempt.worker!);
+    if (!isCleanCandidate(cleanupCandidate) || cleanupCandidate.codeStateDigest !== receipt.candidate.codeStateDigest ||
+      !isSettledOwnedWorker(cleanupObservation, attempt.worker!) || hasPendingDecision(attempt)
+    ) return success(structuredClone(attempt));
+    try {
+      await execution.worker.close(attempt.worker!);
+      receipt.cleanup = "closed";
+    } catch {
+      receipt.cleanup = "failed";
+    }
+    return this.persistAttempt(state, attempt);
+  }
+
+  private async acceptanceContext(lease: AcceptanceLease): Promise<ControllerResult<AcceptanceContext>> {
+    const loaded = await this.loadState();
+    if (!loaded.ok) return loaded;
+    const execution = this.dependencies.execution;
+    if (!execution?.acceptance) return failure("infrastructure", ["Acceptance adapters are not configured"]);
+    const attempt = loaded.value.executionAttempts.find((item): boolean => item.id === lease.attemptId);
+    const receipt = attempt?.candidateReceipts?.find((item): boolean => item.id === lease.receiptId);
+    const preparation = attempt
+      ? loaded.value.preparations.find((item): boolean => item.id === attempt.preparationId)
+      : undefined;
+    if (!attempt || !receipt || !preparation) return failure("execution-validation", ["Acceptance identity is no longer resolvable"]);
+    if (attempt.owner.instanceId !== execution.owner.instanceId || attempt.owner.pid !== execution.owner.pid ||
+      attempt.lifecycle !== "accepting" || currentControlGeneration(attempt) !== lease.controlGeneration ||
+      receipt.state !== "captured"
+    ) return failure("execution-conflict", ["Acceptance was interrupted by a control or ownership change"]);
+    return success({ state: loaded.value, attempt, receipt, preparation, execution, acceptance: execution.acceptance });
+  }
+
+  private async updateAcceptance(
+    lease: AcceptanceLease,
+    update: (context: AcceptanceContext) => void,
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    return this.serializeMutation(async (): Promise<ControllerResult<ExecutionAttempt>> => {
+      const context = await this.acceptanceContext(lease);
+      if (!context.ok) return context;
+      update(context.value);
+      return this.persistAttempt(context.value.state, context.value.attempt);
+    });
+  }
+
+  private async blockAcceptanceLease(
+    lease: AcceptanceLease,
+    finding: string,
+  ): Promise<ControllerResult<ExecutionAttempt>> {
+    return this.serializeMutation(async (): Promise<ControllerResult<ExecutionAttempt>> => {
+      const context = await this.acceptanceContext(lease);
+      if (!context.ok) return context;
+      return this.blockAcceptance(context.value.state, context.value.attempt, context.value.receipt, finding);
+    });
   }
 
   private async blockAcceptance(
@@ -795,7 +937,7 @@ export class PreparationController {
     const context = await this.mutableAttempt(actor, request.attemptId);
     if (!context.ok) return context;
     const { state, attempt } = context.value;
-    if (attempt.lifecycle !== "running" && attempt.lifecycle !== "pending-decision") {
+    if (attempt.lifecycle !== "running" && attempt.lifecycle !== "pending-decision" && attempt.lifecycle !== "accepting") {
       return failure("execution-conflict", [`Attempt cannot be paused from ${attempt.lifecycle}`]);
     }
     attempt.suspendedFrom = attempt.lifecycle;
@@ -820,7 +962,9 @@ export class PreparationController {
     }
     const guarded = await this.verifyOwnedWorkerAndGit(state, attempt);
     if (!guarded.ok || guarded.value.lifecycle === "needs-attention") return guarded;
-    attempt.lifecycle = hasPendingDecision(attempt) ? "pending-decision" : "running";
+    attempt.lifecycle = attempt.suspendedFrom === "accepting" || attempt.suspendedFrom === "integration-blocked"
+      ? "completed-unaccepted"
+      : hasPendingDecision(attempt) ? "pending-decision" : "running";
     delete attempt.suspendedFrom;
     advanceControlGeneration(attempt);
     const resumed = await this.persistAttempt(state, attempt);
@@ -835,12 +979,10 @@ export class PreparationController {
     const context = await this.mutableAttempt(actor, request.attemptId);
     if (!context.ok) return context;
     const { state, attempt, execution } = context.value;
-    if (attempt.lifecycle !== "running" && attempt.lifecycle !== "pending-decision" && attempt.lifecycle !== "paused") {
-      return failure("execution-conflict", [`Attempt cannot enter takeover from ${attempt.lifecycle}`]);
-    }
-    if (!attempt.suspendedFrom) {
-      attempt.suspendedFrom = attempt.lifecycle === "pending-decision" ? "pending-decision" : "running";
-    }
+    if (attempt.lifecycle !== "running" && attempt.lifecycle !== "pending-decision" &&
+      attempt.lifecycle !== "paused" && attempt.lifecycle !== "accepting"
+    ) return failure("execution-conflict", [`Attempt cannot enter takeover from ${attempt.lifecycle}`]);
+    if (!attempt.suspendedFrom) attempt.suspendedFrom = attempt.lifecycle === "paused" ? "running" : attempt.lifecycle;
     attempt.lifecycle = "takeover";
     advanceControlGeneration(attempt);
     const stopped = await this.persistAttempt(state, attempt);
@@ -867,7 +1009,9 @@ export class PreparationController {
     }
     const guarded = await this.verifyOwnedWorkerAndGit(state, attempt);
     if (!guarded.ok || guarded.value.lifecycle === "needs-attention") return guarded;
-    attempt.lifecycle = hasPendingDecision(attempt) ? "pending-decision" : "running";
+    attempt.lifecycle = attempt.suspendedFrom === "accepting"
+      ? "completed-unaccepted"
+      : hasPendingDecision(attempt) ? "pending-decision" : "running";
     delete attempt.suspendedFrom;
     advanceControlGeneration(attempt);
     const returned = await this.persistAttempt(state, attempt);
@@ -953,11 +1097,14 @@ export class PreparationController {
     if (!loaded.ok) return loaded;
     const changed: ExecutionAttempt[] = [];
     for (const attempt of loaded.value.executionAttempts) {
-      if (!isExecuting(attempt.lifecycle)) continue;
+      if (!isActiveExecutionLifecycle(attempt.lifecycle) && attempt.lifecycle !== "integration-blocked") continue;
       attempt.owner = structuredClone(execution.owner);
       advanceControlGeneration(attempt);
-      if (attempt.lifecycle !== "paused" && attempt.lifecycle !== "takeover") {
-        if (attempt.lifecycle === "running" || attempt.lifecycle === "pending-decision") {
+      if (attempt.lifecycle === "integration-blocked") {
+        attempt.suspendedFrom = "integration-blocked";
+        attempt.lifecycle = "restart-required";
+      } else if (attempt.lifecycle !== "paused" && attempt.lifecycle !== "takeover") {
+        if (attempt.lifecycle === "running" || attempt.lifecycle === "pending-decision" || attempt.lifecycle === "accepting") {
           attempt.suspendedFrom = attempt.lifecycle;
         }
         attempt.lifecycle = "restart-required";
@@ -999,6 +1146,12 @@ export class PreparationController {
   private serializeMutation<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.mutationQueue.then(operation, operation);
     this.mutationQueue = result.then((): void => {}, (): void => {});
+    return result;
+  }
+
+  private serializeAcceptance<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.acceptanceQueue.then(operation, operation);
+    this.acceptanceQueue = result.then((): void => {}, (): void => {});
     return result;
   }
 
@@ -1284,10 +1437,6 @@ function advanceControlGeneration(attempt: ExecutionAttempt): void {
   attempt.controlGeneration = currentControlGeneration(attempt) + 1;
 }
 
-function isExecuting(lifecycle: ExecutionAttempt["lifecycle"]): boolean {
-  return !["completed-unaccepted", "integration-blocked", "accepted", "needs-attention"].includes(lifecycle);
-}
-
 function hasPendingDecision(attempt: ExecutionAttempt): boolean {
   return attempt.decisions.some((decision): boolean => decision.state !== "delivered");
 }
@@ -1349,6 +1498,17 @@ function sameWorker(left: WorkerIdentity, right: WorkerIdentity): boolean {
   return digest(left) === digest(right);
 }
 
+function isSettledOwnedWorker(observation: WorkerObservation, worker: WorkerIdentity): boolean {
+  return sameWorker(observation.identity, worker) && observation.settled === true &&
+    (observation.status === "idle" || observation.status === "done") &&
+    Array.isArray(observation.outstandingJobs) && observation.outstandingJobs.length === 0;
+}
+
+function isCleanCandidate(candidate: import("./contracts.js").CandidateGitState): boolean {
+  return candidate.statusDigest === EMPTY_GIT_DIGEST && candidate.indexDiffDigest === EMPTY_GIT_DIGEST &&
+    candidate.worktreeDiffDigest === EMPTY_GIT_DIGEST && candidate.untrackedFiles.length === 0;
+}
+
 function isWorkerStatus(value: unknown): value is WorkerObservation["status"] {
   return value === "ready" || value === "working" || value === "idle" || value === "done" ||
     value === "blocked" || value === "missing" || value === "unknown";
@@ -1366,15 +1526,15 @@ function validateNativeEvidence(evidence: NativeEvidenceRecord[], receipt: Candi
     return "Native implementation tests and reviews must both be preserved";
   }
   for (const item of evidence) {
-    if (item.status !== "passed" || item.candidateDigest !== receipt.candidate.candidateDigest ||
+    if (item.status !== "passed" || item.codeStateDigest !== receipt.candidate.codeStateDigest ||
       !validBoundedText(item.evidenceReference, 4_096) || containsCredential(item.evidenceReference) ||
-      !Number.isFinite(Date.parse(item.completedAt))
+      !/^[a-f0-9]{64}$/i.test(item.evidenceDigest) || !Number.isFinite(Date.parse(item.completedAt))
     ) return "Native implementation evidence is malformed, failed, or stale";
   }
   return undefined;
 }
 
-function validCheckResult(
+function isValidCheckResult(
   result: GateCheckRecord,
   command: string,
   candidateCommit: string,
@@ -1384,7 +1544,7 @@ function validCheckResult(
     !containsCredential(result.logReference) && Number.isFinite(Date.parse(result.completedAt));
 }
 
-function validReview(
+function isValidReview(
   review: AcceptanceReviewRecord,
   kind: "standards" | "spec",
   reviewBase: string,

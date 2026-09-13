@@ -126,6 +126,7 @@ export interface PreparationRecord {
   proposalDigest?: string;
   effectiveContextLimit?: { handoffTokens: number; reserveTokens: number };
   approved?: ApprovalRecord;
+  batchIntegration?: { head: string; sequence: number };
 }
 
 export const MAX_PREPARATIONS = 100;
@@ -150,6 +151,14 @@ export type ExecutionLifecycle =
   | "accepted"
   | "needs-attention"
   | "restart-required";
+
+const INACTIVE_EXECUTION_LIFECYCLES: ReadonlySet<ExecutionLifecycle> = new Set([
+  "completed-unaccepted", "integration-blocked", "accepted", "needs-attention",
+]);
+
+export function isActiveExecutionLifecycle(lifecycle: ExecutionLifecycle): boolean {
+  return !INACTIVE_EXECUTION_LIFECYCLES.has(lifecycle);
+}
 
 export interface ControllerOwner {
   instanceId: string;
@@ -236,14 +245,17 @@ export interface CandidateGitState {
   indexDiffDigest: string;
   worktreeDiffDigest: string;
   untrackedFiles: GitFileFingerprint[];
+  /** Final tracked and untracked filesystem content, independent of HEAD and staging placement. */
+  codeStateDigest: string;
   candidateDigest: string;
 }
 
 export interface NativeEvidenceRecord {
   kind: "tests" | "reviews";
   status: "passed";
-  candidateDigest: string;
+  codeStateDigest: string;
   evidenceReference: string;
+  evidenceDigest: string;
   completedAt: string;
 }
 
@@ -301,6 +313,7 @@ export interface CandidateReceipt {
     worktree: IntegrationWorktreeIdentity;
     staging: StagedIntegrationCandidate;
     integratedCommit?: string;
+    sequence?: number;
   };
   cleanup?: "closed" | "failed";
 }
@@ -344,7 +357,7 @@ export interface ExecutionAttempt {
   /** Omitted schema-1 attempts are generation zero until their next control mutation. */
   controlGeneration?: number;
   setupOperations?: SetupOperationRecord[];
-  suspendedFrom?: "running" | "pending-decision";
+  suspendedFrom?: "running" | "pending-decision" | "accepting" | "integration-blocked";
   decisions: DecisionRecord[];
   artifactReferences: string[];
   diagnostics: string[];
@@ -431,6 +444,10 @@ export interface GateCheckPort {
   execute(input: { cwd: string; command: string; candidateCommit: string }): Promise<GateCheckRecord>;
 }
 
+export interface NativeEvidencePort {
+  verify(input: { record: NativeEvidenceRecord; candidate: CandidateGitState }): Promise<void>;
+}
+
 export interface WorkerRuntimePort {
   allocate(input: {
     workspaceId: string;
@@ -461,6 +478,7 @@ export interface ExecutionControllerDependencies {
   acceptance?: {
     reviewer: AcceptanceReviewPort;
     checks: GateCheckPort;
+    nativeEvidence: NativeEvidencePort;
   };
 }
 
