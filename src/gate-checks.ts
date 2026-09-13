@@ -13,6 +13,7 @@ export interface LocalGateCheckOptions {
   now?: () => Date;
   generateId?: () => string;
   timeoutMs?: number;
+  waitForProcessGroupExit?: (pid: number | undefined) => Promise<void>;
 }
 
 /** Executes only commands frozen in the approved proposal and retains safe metadata, never arbitrary output. */
@@ -20,12 +21,14 @@ export class LocalGateCheckAdapter implements GateCheckPort {
   private readonly now: () => Date;
   private readonly generateId: () => string;
   private readonly timeoutMs: number;
+  private readonly verifyProcessGroupExit: (pid: number | undefined) => Promise<void>;
 
   constructor(private readonly evidenceDirectory: string, options: LocalGateCheckOptions = {}) {
     if (!isAbsolute(evidenceDirectory)) throw new Error("Gate evidence directory must be absolute");
     this.now = options.now ?? (() => new Date());
     this.generateId = options.generateId ?? randomUUID;
     this.timeoutMs = options.timeoutMs ?? 15 * 60_000;
+    this.verifyProcessGroupExit = options.waitForProcessGroupExit ?? waitForProcessGroupExit;
     if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs <= 0) throw new Error("Gate timeout must be positive");
   }
 
@@ -34,7 +37,7 @@ export class LocalGateCheckAdapter implements GateCheckPort {
       throw new Error("Approved gate command is incomplete or unsafe");
     }
     await mkdir(this.evidenceDirectory, { recursive: true, mode: 0o700 });
-    const result = await executeBoundedShell(input.command, input.cwd, this.timeoutMs);
+    const result = await executeBoundedShell(input.command, input.cwd, this.timeoutMs, this.verifyProcessGroupExit);
     const evidence = safeGateEvidence({
       command: input.command,
       candidateCommit: input.candidateCommit,
@@ -55,7 +58,12 @@ export class LocalGateCheckAdapter implements GateCheckPort {
   }
 }
 
-async function executeBoundedShell(command: string, cwd: string, timeoutMs: number): Promise<{
+async function executeBoundedShell(
+  command: string,
+  cwd: string,
+  timeoutMs: number,
+  verifyProcessGroupExit: (pid: number | undefined) => Promise<void>,
+): Promise<{
   exitCode: number;
   output: string;
   termination: GateTermination;
@@ -71,10 +79,10 @@ async function executeBoundedShell(command: string, cwd: string, timeoutMs: numb
       if (termination) return;
       terminateProcessGroup(child.pid, "SIGTERM");
       termination = new Promise((terminationResolved): void => {
-        setTimeout((): void => {
-          terminateProcessGroup(child.pid, "SIGKILL");
-          void waitForProcessGroupExit(child.pid).then(terminationResolved);
-        }, 2_000);
+        setTimeout(terminationResolved, 2_000);
+      }).then(async (): Promise<void> => {
+        terminateProcessGroup(child.pid, "SIGKILL");
+        await verifyProcessGroupExit(child.pid);
       });
     };
     const capture = (chunk: Buffer): void => {

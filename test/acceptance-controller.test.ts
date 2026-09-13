@@ -1212,6 +1212,22 @@ test("gate timeouts kill the complete process group before reporting the result"
   assert.equal(metadata.outputOmitted, true);
 });
 
+test("gate termination verification failures reject instead of detaching cleanup", async (): Promise<void> => {
+  const repo = await repository();
+  const checks = new LocalGateCheckAdapter(join(repo.root, ".gate-verification-evidence"), {
+    timeoutMs: 25,
+    waitForProcessGroupExit: async (): Promise<void> => {
+      throw new Error("controlled process group verification failure");
+    },
+  });
+
+  await assert.rejects(checks.execute({
+    cwd: repo.root,
+    command: "exec >/dev/null 2>&1; while :; do sleep 1; done",
+    candidateCommit: repo.head,
+  }), /controlled process group verification failure/);
+});
+
 test("acceptance integration does not consume implementation concurrency while another ticket runs", async (): Promise<void> => {
   const repo = await repository();
   const batch = proposal(repo);

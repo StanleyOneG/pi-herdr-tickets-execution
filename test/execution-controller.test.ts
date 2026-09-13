@@ -31,6 +31,7 @@ import {
   type HerdrCommandExecutor,
   type HerdrCommandResult,
 } from "../src/herdr-runtime.js";
+import { registerHerdrExtension } from "../src/extension.js";
 import { FileWorkerBridgeTransport } from "../src/file-worker-bridge.js";
 import { LocalControllerDaemon, UnixControllerClient } from "../src/local-daemon.js";
 import { digest } from "../src/policy.js";
@@ -1562,67 +1563,14 @@ test("ordinary implementation tool events produce candidate-bound native test an
   await mkdir(bridgeDirectory, { recursive: true });
   const previousEndpoint = process.env.HERDR_WORKER_BRIDGE_ENDPOINT;
   const previousNonce = process.env.HERDR_WORKER_BRIDGE_NONCE;
+  const previousVerificationEndpoint = process.env.HERDR_WORKER_NATIVE_VERIFICATION_ENDPOINT;
+  const previousReviewNonce = process.env.HERDR_WORKER_REVIEW_NONCE;
   process.env.HERDR_WORKER_BRIDGE_ENDPOINT = join(bridgeDirectory, "readiness.json");
   process.env.HERDR_WORKER_BRIDGE_NONCE = "native-producer-nonce";
+  process.env.HERDR_WORKER_NATIVE_VERIFICATION_ENDPOINT = join(bridgeDirectory, "native-verification.json");
+  process.env.HERDR_WORKER_REVIEW_NONCE = "native-verification-nonce";
   const hostHandlers = new Map<string, (event: any, ctx: any) => unknown>();
   const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
-  const fakePi = {
-    events: { on: (): (() => void) => (): void => {}, emit: (): void => {} },
-    on(name: string, handler: (event: any, ctx: any) => unknown): void { hostHandlers.set(name, handler); },
-    registerCommand(): void {},
-    registerTool(tool: { name: string; execute: (...args: any[]) => Promise<any> }): void { tools.set(tool.name, tool); },
-    getAllTools: (): Array<{ name: string }> => [{ name: "subagent" }],
-  } as unknown as ExtensionAPI;
-  const context = { cwd: repo.root, sessionManager: { getSessionId: (): string => "native-session" } };
-  try {
-    herdrWorkerBridge(fakePi);
-    assert.ok(tools.has("herdr_capture_native_evidence"));
-    await hostHandlers.get("tool_execution_start")!({ toolCallId: "test-call", toolName: "bash", args: { command: "npm test" } }, context);
-    await hostHandlers.get("tool_execution_end")!({ toolCallId: "test-call", toolName: "bash", isError: false, result: {} }, context);
-    await hostHandlers.get("tool_execution_start")!({ toolCallId: "review-call", toolName: "subagent", args: { task: "Review the implementation" } }, context);
-    await hostHandlers.get("tool_execution_end")!({
-      toolCallId: "review-call",
-      toolName: "subagent",
-      isError: false,
-      result: { details: { runId: "review-run", results: [{
-        agent: "reviewer", task: "Review the implementation", exitCode: 0,
-        structuredAcceptanceReport: {
-          criteriaSatisfied: [{ id: "review", status: "satisfied", evidence: "No blocking findings" }],
-          reviewFindings: ["no blockers"], residualRisks: ["none"],
-        },
-      }] } },
-    }, context);
-    const exported = await tools.get("herdr_capture_native_evidence")!.execute("capture-call", {}, undefined, undefined, context);
-    const records = exported.details.nativeEvidence as import("../src/contracts.js").NativeEvidenceRecord[];
-    assert.deepEqual(records.map((record): string => record.kind).sort(), ["reviews", "tests"]);
-    const candidate = await new RealGitWorktreeAdapter().captureCandidate({ path: repo.root, sourceBase: repo.head });
-    const nativeEvidenceModule = await import("../src/native-evidence.js");
-    const indexed = await nativeEvidenceModule.readProducedNativeEvidence(
-      join(bridgeDirectory, "native-evidence", "latest.json"),
-      { sessionId: "native-session", codeStateDigest: candidate.codeStateDigest },
-    );
-    assert.deepEqual(indexed, records);
-    for (const record of records) {
-      await new nativeEvidenceModule.FileNativeEvidenceAdapter().verify({ record, candidate });
-    }
-  } finally {
-    if (previousEndpoint === undefined) delete process.env.HERDR_WORKER_BRIDGE_ENDPOINT;
-    else process.env.HERDR_WORKER_BRIDGE_ENDPOINT = previousEndpoint;
-    if (previousNonce === undefined) delete process.env.HERDR_WORKER_BRIDGE_NONCE;
-    else process.env.HERDR_WORKER_BRIDGE_NONCE = previousNonce;
-  }
-});
-
-test("worker bridge reports ordinary asynchronous subagent and provider work from the supported status protocol", async (): Promise<void> => {
-  const repo = await repository();
-  const bridgeDirectory = join(repo.root, ".git", "herdr", "worker-observation");
-  await mkdir(bridgeDirectory, { recursive: true });
-  const endpoint = join(bridgeDirectory, "readiness.json");
-  const previousEndpoint = process.env.HERDR_WORKER_BRIDGE_ENDPOINT;
-  const previousNonce = process.env.HERDR_WORKER_BRIDGE_NONCE;
-  process.env.HERDR_WORKER_BRIDGE_ENDPOINT = endpoint;
-  process.env.HERDR_WORKER_BRIDGE_NONCE = "observation-nonce";
-  const hostHandlers = new Map<string, (event: any, ctx: any) => unknown>();
   const eventHandlers = new Map<string, Array<(payload: unknown) => void>>();
   const events = {
     on(name: string, handler: (payload: unknown) => void): () => void {
@@ -1643,7 +1591,221 @@ test("worker bridge reports ordinary asynchronous subagent and provider work fro
               kind: "pi-subagents.async-status-snapshot",
               version: 1,
               omitted: { runs: 0, children: 0, byteLimitExceeded: false },
-              runs: [{ id: "provider-review-1", kind: "external-job", label: "provider review", state: "running" }],
+              runs: [],
+            },
+          },
+        });
+        return;
+      }
+      for (const handler of eventHandlers.get(name) ?? []) handler(payload);
+    },
+  };
+  const fakePi = {
+    events,
+    on(name: string, handler: (event: any, ctx: any) => unknown): void { hostHandlers.set(name, handler); },
+    registerCommand(): void {},
+    registerTool(tool: { name: string; execute: (...args: any[]) => Promise<any> }): void { tools.set(tool.name, tool); },
+    getAllTools: (): Array<{ name: string }> => [{ name: "subagent" }],
+  } as unknown as ExtensionAPI;
+  const context = {
+    cwd: repo.root,
+    sessionManager: { getSessionId: (): string => "native-session" },
+    hasPendingMessages: (): boolean => false,
+  };
+  try {
+    herdrWorkerBridge(fakePi);
+    assert.ok(tools.has("herdr_capture_native_evidence"));
+    await hostHandlers.get("tool_execution_start")!({ toolCallId: "review-call", toolName: "subagent", args: { task: "Review the implementation" } }, context);
+    await hostHandlers.get("tool_execution_end")!({
+      toolCallId: "review-call",
+      toolName: "subagent",
+      isError: false,
+      result: { details: { runId: "review-run", results: [{
+        agent: "reviewer", task: "Review the implementation", exitCode: 0,
+        structuredAcceptanceReport: {
+          criteriaSatisfied: [{ id: "review", status: "satisfied", evidence: "No blocking findings" }],
+          reviewFindings: ["no blockers"], residualRisks: ["none"],
+        },
+      }] } },
+    }, context);
+    const candidate = await new RealGitWorktreeAdapter().captureCandidate({ path: repo.root, sourceBase: repo.head });
+    for (const [toolCallId, command] of [
+      ["echo-call", "echo 'npm test'"],
+      ["masked-call", "npm test || true"],
+      ["node-script-call", "node helper.js --test"],
+      ["npx-wrapper-call", "npx echo vitest"],
+      ["typecheck-call", "npm run typecheck"],
+    ]) {
+      const announcedCommand = toolCallId === "echo-call" ? "npm test" : command;
+      await hostHandlers.get("tool_execution_start")!({ toolCallId, toolName: "bash", args: { command: announcedCommand } }, context);
+      await hostHandlers.get("tool_result")!({ toolCallId, toolName: "bash", input: { command }, isError: false }, context);
+      await hostHandlers.get("tool_execution_end")!({ toolCallId, toolName: "bash", isError: false, result: {} }, context);
+      await assert.rejects(
+        tools.get("herdr_capture_native_evidence")!.execute("rejected-capture", {}, undefined, undefined, context),
+        /directly executed test command|typecheck and lint do not satisfy native tests/i,
+      );
+    }
+    await assert.rejects(tools.get("herdr_submit_native_verification")!.execute("rejected-verification", {
+      status: "passed",
+      candidateCommit: repo.head,
+      codeStateDigest: candidate.codeStateDigest,
+      findings: [],
+    }, undefined, undefined, context), /actual successful native test command/i);
+    await hostHandlers.get("tool_execution_start")!({
+      toolCallId: "test-call",
+      toolName: "bash",
+      args: { command: "node --import tsx --test test/execution-controller.test.ts" },
+    }, context);
+    await hostHandlers.get("tool_result")!({
+      toolCallId: "test-call",
+      toolName: "bash",
+      input: { command: "node --import tsx --test test/execution-controller.test.ts" },
+      isError: false,
+    }, context);
+    await hostHandlers.get("tool_execution_end")!({ toolCallId: "test-call", toolName: "bash", isError: false, result: {} }, context);
+    await tools.get("herdr_submit_native_verification")!.execute("accepted-verification", {
+      status: "passed",
+      candidateCommit: repo.head,
+      codeStateDigest: candidate.codeStateDigest,
+      findings: [],
+    }, undefined, undefined, context);
+    await hostHandlers.get("agent_settled")!({}, context);
+    const nativeEvidenceModule = await import("../src/native-evidence.js");
+    const records = await nativeEvidenceModule.readProducedNativeEvidence(
+      join(bridgeDirectory, "native-evidence", "latest.json"),
+      { sessionId: "native-session", codeStateDigest: candidate.codeStateDigest },
+    );
+    assert.deepEqual(records.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+    for (const record of records) {
+      await new nativeEvidenceModule.FileNativeEvidenceAdapter().verify({ record, candidate });
+    }
+  } finally {
+    if (previousEndpoint === undefined) delete process.env.HERDR_WORKER_BRIDGE_ENDPOINT;
+    else process.env.HERDR_WORKER_BRIDGE_ENDPOINT = previousEndpoint;
+    if (previousNonce === undefined) delete process.env.HERDR_WORKER_BRIDGE_NONCE;
+    else process.env.HERDR_WORKER_BRIDGE_NONCE = previousNonce;
+    if (previousVerificationEndpoint === undefined) delete process.env.HERDR_WORKER_NATIVE_VERIFICATION_ENDPOINT;
+    else process.env.HERDR_WORKER_NATIVE_VERIFICATION_ENDPOINT = previousVerificationEndpoint;
+    if (previousReviewNonce === undefined) delete process.env.HERDR_WORKER_REVIEW_NONCE;
+    else process.env.HERDR_WORKER_REVIEW_NONCE = previousReviewNonce;
+  }
+});
+
+test("dashboard acceptance consumes the worker-owned evidence index without requesting a worker-only tool", async (): Promise<void> => {
+  const repo = await repository();
+  const commands = new Map<string, (args: string, ctx: any) => Promise<void>>();
+  const prompts: string[] = [];
+  const receipt = {
+    id: "receipt-1",
+    state: "captured" as const,
+    capturedAt: "2026-10-01T00:00:00.000Z",
+    proposalDigest: "a".repeat(64),
+    specIdentity: "spec-2",
+    specRevision: "rev-1",
+    preparationId: "preparation-1",
+    ticketIdentity: "ticket-5",
+    attemptId: "attempt-1",
+    sessionId: "worker-session-1",
+    sessionFile: "/saved/worker-session-1.jsonl",
+    candidate: {
+      sourceBase: repo.head,
+      head: repo.head,
+      branch: "ticket-5",
+      statusDigest: "b".repeat(64),
+      indexDiffDigest: "c".repeat(64),
+      worktreeDiffDigest: "d".repeat(64),
+      untrackedFiles: [],
+      codeStateDigest: "e".repeat(64),
+      candidateDigest: "f".repeat(64),
+    },
+    nativeEvidence: [],
+    checks: [],
+    reviews: [],
+    findings: [],
+    evidenceReferences: [],
+  };
+  const fakePi = {
+    registerCommand(name: string, command: { handler: (args: string, ctx: any) => Promise<void> }): void {
+      commands.set(name, command.handler);
+    },
+    registerTool(): void {},
+    async exec(command: string, args: string[], options: { cwd?: string }): Promise<{ code: number; stdout: string; stderr: string }> {
+      try {
+        return {
+          code: 0,
+          stdout: execFileSync(command, args, { cwd: options.cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }),
+          stderr: "",
+        };
+      } catch {
+        return { code: 1, stdout: "", stderr: "unavailable" };
+      }
+    },
+    async sendUserMessage(prompt: string): Promise<void> { prompts.push(prompt); },
+  } as unknown as ExtensionAPI;
+  registerHerdrExtension(fakePi, {
+    workspaceId: (): string => "workspace-1",
+    connectController: async () => ({
+      captureCandidate: async (): Promise<ControllerResult<typeof receipt>> => ({ ok: true, value: receipt }),
+    }) as any,
+  });
+
+  await commands.get("herdr-accept")!("attempt-1", {
+    cwd: repo.root,
+    ui: { notify(): void {} },
+  });
+
+  assert.equal(prompts.length, 1);
+  assert.doesNotMatch(prompts[0]!, /herdr_capture_native_evidence/);
+  assert.match(prompts[0]!, /worker-owned evidence index/);
+  assert.match(prompts[0]!, /herdr_accept_candidate/);
+});
+
+test("worker bridge reports ordinary asynchronous subagent and provider work from the supported status protocol", async (): Promise<void> => {
+  const repo = await repository();
+  const bridgeDirectory = join(repo.root, ".git", "herdr", "worker-observation");
+  await mkdir(bridgeDirectory, { recursive: true });
+  const endpoint = join(bridgeDirectory, "readiness.json");
+  const previousEndpoint = process.env.HERDR_WORKER_BRIDGE_ENDPOINT;
+  const previousNonce = process.env.HERDR_WORKER_BRIDGE_NONCE;
+  process.env.HERDR_WORKER_BRIDGE_ENDPOINT = endpoint;
+  process.env.HERDR_WORKER_BRIDGE_NONCE = "observation-nonce";
+  const hostHandlers = new Map<string, (event: any, ctx: any) => unknown>();
+  const eventHandlers = new Map<string, Array<(payload: unknown) => void>>();
+  let omittedChildren = 0;
+  const events = {
+    on(name: string, handler: (payload: unknown) => void): () => void {
+      const handlers = eventHandlers.get(name) ?? [];
+      handlers.push(handler);
+      eventHandlers.set(name, handlers);
+      return (): void => { eventHandlers.set(name, (eventHandlers.get(name) ?? []).filter((item): boolean => item !== handler)); };
+    },
+    emit(name: string, payload: unknown): void {
+      if (name === "subagents:rpc:v1:request") {
+        const request = payload as { requestId: string };
+        this.emit(`subagents:rpc:v1:reply:${request.requestId}`, {
+          version: 1,
+          requestId: request.requestId,
+          success: true,
+          data: {
+            asyncSnapshot: {
+              kind: "pi-subagents.async-status-snapshot",
+              version: 1,
+              generatedAt: Date.now(),
+              caps: { maxRuns: 20, maxChildrenPerNode: 8, maxDepth: 3, maxStringLength: 160, maxSerializedBytes: 32 * 1024 },
+              omitted: { runs: 0, children: omittedChildren, byteLimitExceeded: false },
+              runs: [{
+                id: "review-run-1",
+                kind: "subagent",
+                label: "reviewer",
+                state: "complete",
+                children: [{
+                  id: "provider-review-1",
+                  kind: "host-step",
+                  label: "provider review",
+                  state: "running",
+                  hostStep: { kind: "provider", state: "running" },
+                }],
+              }],
             },
           },
         });
@@ -1669,6 +1831,13 @@ test("worker bridge reports ordinary asynchronous subagent and provider work fro
     const lifecycle = JSON.parse(await readFile(join(bridgeDirectory, "lifecycle.json"), "utf8")) as WorkerLifecycleReceipt;
     assert.equal(lifecycle.piPid, process.pid);
     assert.deepEqual(lifecycle.outstandingJobs, ["pi-subagent:provider-review-1"]);
+
+    omittedChildren = 1;
+    await hostHandlers.get("agent_settled")!({}, context);
+    const incompleteLifecycle = JSON.parse(await readFile(join(bridgeDirectory, "lifecycle.json"), "utf8")) as WorkerLifecycleReceipt;
+    assert.deepEqual(incompleteLifecycle.outstandingJobs, [
+      "subagent-status-unknown: async status snapshot was incomplete; inspect active subagent/provider work",
+    ]);
   } finally {
     if (previousEndpoint === undefined) delete process.env.HERDR_WORKER_BRIDGE_ENDPOINT;
     else process.env.HERDR_WORKER_BRIDGE_ENDPOINT = previousEndpoint;

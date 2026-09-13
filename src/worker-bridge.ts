@@ -54,20 +54,21 @@ const DECISION_SCHEMA = Type.Object({
   recommendation: Type.String({ minLength: 1, maxLength: 4_000 }),
 });
 type DecisionInput = Static<typeof DECISION_SCHEMA>;
+interface NativeExecutionProof {
+  kind: "tests" | "reviews";
+  codeStateDigest: string;
+  completedAt: string;
+  executionReference: string;
+}
 let sessionStartReason: WorkerReadinessReceipt["sessionStartReason"] | undefined;
 
 export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   sessionStartReason = undefined;
   const activeTools = new Set<string>();
-  const bashCommands = new Map<string, string>();
   const observedCommandDigests: string[] = [];
+  const nativeTestDiagnostics: string[] = [];
   const activeSubagentRuns = new Set<string>();
-  const nativeExecutions = new Map<string, {
-    kind: "tests" | "reviews";
-    codeStateDigest: string;
-    completedAt: string;
-    executionReference: string;
-  }>();
+  const nativeExecutions = new Map<string, NativeExecutionProof>();
   let failedBashCommand = false;
   let mutationToolUsed = false;
   let isAgentRunning = false;
@@ -94,8 +95,8 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     sessionStartReason = event.reason;
     activeTools.clear();
     activeSubagentRuns.clear();
-    bashCommands.clear();
     observedCommandDigests.length = 0;
+    nativeTestDiagnostics.length = 0;
     failedBashCommand = false;
     mutationToolUsed = false;
     isAgentRunning = false;
@@ -106,23 +107,33 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   });
   pi.on("tool_execution_start", async (event, ctx): Promise<void> => {
     activeTools.add(event.toolCallId);
-    if (event.toolName === "bash" && typeof event.args?.command === "string" && event.args.command.length <= 4_096) {
-      bashCommands.set(event.toolCallId, event.args.command);
-    }
     if (event.toolName === "edit" || event.toolName === "write") mutationToolUsed = true;
     await writeLifecycle(ctx, "working", outstandingJobs());
   });
+  pi.on("tool_result", async (event, ctx): Promise<void> => {
+    if (event.toolName !== "bash") return;
+    failedBashCommand ||= event.isError;
+    const command = event.input.command;
+    if (typeof command !== "string" || command.length > 4_096) {
+      nativeTestDiagnostics.push("The executed shell command exceeded the native-test provenance bound and was not accepted");
+      return;
+    }
+    const commandDigest = createHash("sha256").update(command).digest("hex");
+    observedCommandDigests.push(commandDigest);
+    const testCommand = classifyNativeTestCommand(command);
+    if (testCommand.status === "supported") {
+      if (!event.isError) {
+        await retainNativeExecution(nativeExecutions, event.toolCallId, "tests", ctx.cwd, ctx.sessionManager.getSessionId(), `bash:${commandDigest}`);
+      } else {
+        nativeTestDiagnostics.push("The directly executed native test command failed according to Pi's tool execution result; rerun it successfully after the final edit");
+      }
+    } else if (testCommand.status === "unsupported") {
+      nativeTestDiagnostics.push(testCommand.diagnostic);
+    }
+  });
   pi.on("tool_execution_end", async (event, ctx): Promise<void> => {
     activeTools.delete(event.toolCallId);
-    const command = bashCommands.get(event.toolCallId);
-    if (command !== undefined) {
-      observedCommandDigests.push(createHash("sha256").update(command).digest("hex"));
-      failedBashCommand ||= event.isError;
-      if (!event.isError && isTestCommand(command)) {
-        await retainNativeExecution(nativeExecutions, event.toolCallId, "tests", ctx.cwd, ctx.sessionManager.getSessionId(), `bash:${createHash("sha256").update(command).digest("hex")}`);
-      }
-      bashCommands.delete(event.toolCallId);
-    } else if (event.toolName === "subagent" && !event.isError && isPassingReviewResult(event.result)) {
+    if (event.toolName === "subagent" && !event.isError && isPassingReviewResult(event.result)) {
       await retainNativeExecution(nativeExecutions, event.toolCallId, "reviews", ctx.cwd, ctx.sessionManager.getSessionId(), "subagent:structured-acceptance:no-blockers");
     }
     await writeLifecycle(ctx, "working", outstandingJobs());
@@ -132,6 +143,13 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     const jobs = outstandingJobs();
     if (ctx.hasPendingMessages()) jobs.push("pi-queued-message");
     jobs.push(...await reconcileSubagentWork(pi, activeSubagentRuns));
+    if (jobs.length === 0) {
+      try {
+        await produceNativeEvidence(nativeExecutions, nativeTestDiagnostics, ctx, false);
+      } catch {
+        jobs.push("native-evidence-capture-failed: the worker could not persist its execution-backed evidence index");
+      }
+    }
     await writeLifecycle(ctx, "settled", jobs);
   });
 
@@ -144,7 +162,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   });
 
   pi.on("before_agent_start", (event): { systemPrompt: string } => ({
-    systemPrompt: `${event.systemPrompt}\n\nHerdr native evidence requirements: run project-native tests through bash after the final edit. Perform the implementation skill's final review with the installed subagent tool in foreground mode and require a structured acceptance report whose reviewFindings explicitly says no blockers. After both succeed on the unchanged final code state, call herdr_capture_native_evidence. Do not manufacture receipt files or substitute a prose completion claim.`,
+    systemPrompt: `${event.systemPrompt}\n\nHerdr native evidence requirements: run project-native tests through one directly executed bash test command after the final edit; shell wrappers, chaining, output claims, status masking, typecheck, and lint do not count as tests. Perform the implementation skill's final review with the installed subagent tool in foreground mode and require a structured acceptance report whose reviewFindings explicitly says no blockers. The live worker bridge automatically captures both execution-backed results when Pi settles on the unchanged final code state. Do not manufacture receipt files or substitute a prose completion claim.`,
   }));
 
   pi.registerTool({
@@ -159,65 +177,11 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
       _onUpdate: AgentToolUpdateCallback<unknown> | undefined,
       ctx: ExtensionContext,
     ): Promise<AgentToolResult<unknown>> {
-      const candidate = await new RealGitWorktreeAdapter().captureCandidate({
-        path: ctx.cwd,
-        sourceBase: (await new RealGitWorktreeAdapter().inspectWorktree(ctx.cwd)).head,
-      });
-      const selected = (["tests", "reviews"] as const).map((kind) =>
-        [...nativeExecutions.entries()].reverse().find(([, proof]): boolean =>
-          proof.kind === kind && proof.codeStateDigest === candidate.codeStateDigest));
-      if (selected.some((proof): boolean => proof === undefined)) {
-        throw new Error("Current Git code state lacks observed successful native tests or a structured no-blocker review; rerun the missing obligation before acceptance");
-      }
-      const endpoint = process.env[WORKER_BRIDGE_ENDPOINT_ENV];
-      if (!endpoint || !isAbsolute(endpoint)) throw new Error("Attempt-bound worker bridge endpoint is unavailable");
-      const evidenceDirectory = join(dirname(endpoint), "native-evidence");
-      await mkdir(evidenceDirectory, { recursive: true, mode: 0o700 });
-      const nativeEvidence: NativeEvidenceRecord[] = [];
-      for (const selectedProof of selected) {
-        const [, proof] = selectedProof!;
-        const completedAt = new Date().toISOString();
-        const id = randomUUID();
-        const sourcePath = join(evidenceDirectory, `${proof.kind}-${id}-execution.json`);
-        const source = `${JSON.stringify({
-          schemaVersion: 1,
-          producer: "pi-native-skill",
-          kind: proof.kind,
-          status: "passed",
-          codeStateDigest: candidate.codeStateDigest,
-          completedAt,
-          executionReferences: [proof.executionReference],
-        })}\n`;
-        await atomicWritePrivateFile(sourcePath, source);
-        const manifestPath = join(evidenceDirectory, `${proof.kind}-${id}-receipt.json`);
-        const manifest = `${JSON.stringify({
-          schemaVersion: 1,
-          kind: proof.kind,
-          status: "passed",
-          codeStateDigest: candidate.codeStateDigest,
-          completedAt,
-          artifacts: [{ reference: sourcePath, digest: createHash("sha256").update(source).digest("hex") }],
-        })}\n`;
-        await atomicWritePrivateFile(manifestPath, manifest);
-        nativeEvidence.push({
-          kind: proof.kind,
-          status: "passed",
-          codeStateDigest: candidate.codeStateDigest,
-          evidenceReference: manifestPath,
-          evidenceDigest: createHash("sha256").update(manifest).digest("hex"),
-          completedAt,
-        });
-      }
-      await atomicWritePrivateFile(join(evidenceDirectory, "latest.json"), `${JSON.stringify({
-        schemaVersion: 1,
-        producer: "herdr-worker-bridge",
-        sessionId: ctx.sessionManager.getSessionId(),
-        codeStateDigest: candidate.codeStateDigest,
-        nativeEvidence,
-      })}\n`);
+      const produced = await produceNativeEvidence(nativeExecutions, nativeTestDiagnostics, ctx, true);
+      const nativeEvidence = produced!.nativeEvidence;
       return {
         content: [{ type: "text", text: `Captured immutable native evidence from observed executions:\n${JSON.stringify(nativeEvidence, null, 2)}` }],
-        details: { codeStateDigest: candidate.codeStateDigest, nativeEvidence },
+        details: { codeStateDigest: produced!.codeStateDigest, nativeEvidence },
       };
     },
   });
@@ -263,9 +227,11 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
       const endpoint = process.env[WORKER_NATIVE_VERIFICATION_ENDPOINT_ENV];
       const nonce = process.env[WORKER_REVIEW_NONCE_ENV];
       if (!endpoint || !isAbsolute(endpoint) || !nonce) throw new Error("Native verification channel is incomplete");
+      const matchingNativeTest = [...nativeExecutions.values()].some((proof): boolean =>
+        proof.kind === "tests" && proof.codeStateDigest === params.codeStateDigest);
       if (observedCommandDigests.length === 0 || (params.status === "blocked" && params.findings.length === 0) ||
-        (params.status === "passed" && (params.findings.length > 0 || failedBashCommand || mutationToolUsed))
-      ) throw new Error("Native verification result does not match observed test execution");
+        (params.status === "passed" && (!matchingNativeTest || params.findings.length > 0 || failedBashCommand || mutationToolUsed))
+      ) throw new Error("Native verification requires an actual successful native test command on the submitted code state and no failed commands or mutations");
       await atomicWritePrivateFile(endpoint, `${JSON.stringify({
         schemaVersion: 1,
         nonce,
@@ -408,12 +374,132 @@ async function writeLifecycle(
   })}\n`);
 }
 
-function isTestCommand(command: string): boolean {
-  return /(?:^|[;&|]\s*|\b)(?:npm\s+(?:test|run\s+(?:test|check|lint|typecheck))|pnpm\s+(?:test|run\s+(?:test|check|lint|typecheck))|yarn\s+(?:test|run\s+(?:test|check|lint|typecheck))|bun\s+(?:test|run\s+(?:test|check|lint|typecheck))|npx\s+(?:tsc|vitest|jest)|node\s+--test|pytest\b|go\s+test\b|cargo\s+test\b)/i.test(command);
+type NativeTestCommandClassification =
+  | { status: "supported" }
+  | { status: "unsupported"; diagnostic: string }
+  | { status: "unrelated" };
+
+function classifyNativeTestCommand(command: string): NativeTestCommandClassification {
+  const trimmed = command.trim();
+  const mentionsTestObligation = /\b(?:test|tests|pytest|jest|vitest|typecheck|lint)\b/i.test(trimmed);
+  if (!mentionsTestObligation) return { status: "unrelated" };
+  if (!trimmed || /[\r\n;&|`$()<>\\"']/.test(trimmed)) {
+    return {
+      status: "unsupported",
+      diagnostic: "Native evidence requires one directly executed test command without echo/printf, shell wrappers, substitutions, redirections, chaining, or status masking",
+    };
+  }
+  const tokens = trimmed.split(/\s+/);
+  const executable = tokens[0]?.toLowerCase();
+  const directPackageTest = (runner: string): boolean => {
+    if (executable !== runner) return false;
+    if (tokens[1] === "test") return true;
+    return tokens[1] === "run" && (tokens[2] === "test" || tokens[2]?.startsWith("test:") === true);
+  };
+  const directNodeTest = (): boolean => {
+    if (executable !== "node") return false;
+    for (let index = 1; index < tokens.length; index += 1) {
+      const token = tokens[index]!;
+      if (token === "--test" || token.startsWith("--test=")) return true;
+      if (["-e", "--eval", "-p", "--print"].includes(token)) return false;
+      if (token === "--import" || token === "--require" || token === "-r") {
+        index += 1;
+        if (index >= tokens.length) return false;
+      } else if (!token.startsWith("-")) {
+        return false;
+      }
+    }
+    return false;
+  };
+  const directNpxTest = executable === "npx" &&
+    (["jest", "vitest"].includes(tokens[1] ?? "") ||
+      (tokens[1] === "--yes" && ["jest", "vitest"].includes(tokens[2] ?? "")));
+  const supported = directPackageTest("npm") || directPackageTest("pnpm") || directPackageTest("yarn") ||
+    directPackageTest("bun") || directNodeTest() || directNpxTest || executable === "pytest" ||
+    ((executable === "python" || executable === "python3") && tokens[1] === "-m" && tokens[2] === "pytest") ||
+    (executable === "go" && tokens[1] === "test") ||
+    (executable === "cargo" && tokens[1] === "test");
+  if (supported) return { status: "supported" };
+  return {
+    status: "unsupported",
+    diagnostic: /\b(?:typecheck|lint)\b/i.test(trimmed)
+      ? "Typecheck and lint do not satisfy native tests; execute the project's actual required test command directly"
+      : "Native evidence requires a supported directly executed test command; the observed invocation was not recognized and was not guessed",
+  };
+}
+
+async function produceNativeEvidence(
+  executions: Map<string, NativeExecutionProof>,
+  testDiagnostics: string[],
+  ctx: ExtensionContext,
+  required: boolean,
+): Promise<{ codeStateDigest: string; nativeEvidence: NativeEvidenceRecord[] } | undefined> {
+  if (!required && (![...executions.values()].some((proof): boolean => proof.kind === "tests") ||
+    ![...executions.values()].some((proof): boolean => proof.kind === "reviews"))) return undefined;
+  const git = new RealGitWorktreeAdapter();
+  const candidate = await git.captureCandidate({
+    path: ctx.cwd,
+    sourceBase: (await git.inspectWorktree(ctx.cwd)).head,
+  });
+  const selected = (["tests", "reviews"] as const).map((kind) =>
+    [...executions.entries()].reverse().find(([, proof]): boolean =>
+      proof.kind === kind && proof.codeStateDigest === candidate.codeStateDigest));
+  if (selected.some((proof): boolean => proof === undefined)) {
+    if (!required) return undefined;
+    const testDiagnostic = selected[0] === undefined ? testDiagnostics.at(-1) : undefined;
+    throw new Error(`Current Git code state lacks observed successful native tests or a structured no-blocker review; rerun the missing obligation before acceptance${testDiagnostic ? `. ${testDiagnostic}` : ""}`);
+  }
+  const endpoint = process.env[WORKER_BRIDGE_ENDPOINT_ENV];
+  if (!endpoint || !isAbsolute(endpoint)) throw new Error("Attempt-bound worker bridge endpoint is unavailable");
+  const evidenceDirectory = join(dirname(endpoint), "native-evidence");
+  await mkdir(evidenceDirectory, { recursive: true, mode: 0o700 });
+  const nativeEvidence: NativeEvidenceRecord[] = [];
+  for (const selectedProof of selected) {
+    const [, proof] = selectedProof!;
+    const completedAt = new Date().toISOString();
+    const id = randomUUID();
+    const sourcePath = join(evidenceDirectory, `${proof.kind}-${id}-execution.json`);
+    const source = `${JSON.stringify({
+      schemaVersion: 1,
+      producer: "pi-native-skill",
+      kind: proof.kind,
+      status: "passed",
+      codeStateDigest: candidate.codeStateDigest,
+      completedAt,
+      executionReferences: [proof.executionReference],
+    })}\n`;
+    await atomicWritePrivateFile(sourcePath, source);
+    const manifestPath = join(evidenceDirectory, `${proof.kind}-${id}-receipt.json`);
+    const manifest = `${JSON.stringify({
+      schemaVersion: 1,
+      kind: proof.kind,
+      status: "passed",
+      codeStateDigest: candidate.codeStateDigest,
+      completedAt,
+      artifacts: [{ reference: sourcePath, digest: createHash("sha256").update(source).digest("hex") }],
+    })}\n`;
+    await atomicWritePrivateFile(manifestPath, manifest);
+    nativeEvidence.push({
+      kind: proof.kind,
+      status: "passed",
+      codeStateDigest: candidate.codeStateDigest,
+      evidenceReference: manifestPath,
+      evidenceDigest: createHash("sha256").update(manifest).digest("hex"),
+      completedAt,
+    });
+  }
+  await atomicWritePrivateFile(join(evidenceDirectory, "latest.json"), `${JSON.stringify({
+    schemaVersion: 1,
+    producer: "herdr-worker-bridge",
+    sessionId: ctx.sessionManager.getSessionId(),
+    codeStateDigest: candidate.codeStateDigest,
+    nativeEvidence,
+  })}\n`);
+  return { codeStateDigest: candidate.codeStateDigest, nativeEvidence };
 }
 
 async function retainNativeExecution(
-  executions: Map<string, { kind: "tests" | "reviews"; codeStateDigest: string; completedAt: string; executionReference: string }>,
+  executions: Map<string, NativeExecutionProof>,
   toolCallId: string,
   kind: "tests" | "reviews",
   cwd: string,
@@ -505,17 +591,38 @@ async function reconcileSubagentWork(pi: ExtensionAPI, observed: Set<string>): P
     return ["subagent-observer-unavailable: status RPC omitted its async snapshot"];
   }
   const projected = snapshot as Record<string, unknown>;
-  const omitted = projected.omitted as Record<string, unknown> | undefined;
-  if (!Array.isArray(projected.runs) || (typeof omitted?.runs === "number" && omitted.runs > 0) || omitted?.byteLimitExceeded === true) {
-    return ["subagent-status-unknown: async status snapshot was incomplete; inspect active subagent/provider work"];
-  }
+  const omitted = projected.omitted;
+  if (projected.kind !== "pi-subagents.async-status-snapshot" || projected.version !== 1 ||
+    !omitted || typeof omitted !== "object" || Array.isArray(omitted) || !Array.isArray(projected.runs)
+  ) return ["subagent-status-unknown: async status snapshot was malformed; inspect active subagent/provider work"];
+  const omission = omitted as Record<string, unknown>;
+  if (!Number.isSafeInteger(omission.runs) || Number(omission.runs) < 0 ||
+    !Number.isSafeInteger(omission.children) || Number(omission.children) < 0 ||
+    typeof omission.byteLimitExceeded !== "boolean" || Number(omission.runs) > 0 ||
+    Number(omission.children) > 0 || omission.byteLimitExceeded
+  ) return ["subagent-status-unknown: async status snapshot was incomplete; inspect active subagent/provider work"];
   const active = new Set<string>();
-  for (const value of projected.runs) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
-    const run = value as Record<string, unknown>;
-    if (typeof run.id === "string" && typeof run.state === "string" &&
-      ["queued", "running", "partial", "paused"].includes(run.state)
-    ) active.add(run.id);
+  const pending = projected.runs.map((node): { node: unknown; depth: number } => ({ node, depth: 0 }));
+  const visited = new Set<object>();
+  const knownKinds = new Set(["subagent", "workflow", "step", "host-step"]);
+  const knownStates = new Set(["queued", "running", "complete", "failed", "partial", "paused", "stopped", "rejected"]);
+  let nodes = 0;
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    if (!current.node || typeof current.node !== "object" || Array.isArray(current.node) ||
+      visited.has(current.node) || current.depth > 8 || ++nodes > 20_000
+    ) return ["subagent-status-unknown: async status descendants were malformed or exceeded their bound"];
+    visited.add(current.node);
+    const node = current.node as Record<string, unknown>;
+    if (typeof node.id !== "string" || !node.id || node.id.length > 500 ||
+      typeof node.kind !== "string" || !knownKinds.has(node.kind) ||
+      typeof node.state !== "string" || !knownStates.has(node.state) ||
+      (node.children !== undefined && !Array.isArray(node.children))
+    ) return ["subagent-status-unknown: async status descendants were malformed or unknown"];
+    if (["queued", "running", "partial", "paused"].includes(node.state)) active.add(node.id);
+    for (const child of (node.children as unknown[] | undefined) ?? []) {
+      pending.push({ node: child, depth: current.depth + 1 });
+    }
   }
   observed.clear();
   for (const id of active) observed.add(id);
