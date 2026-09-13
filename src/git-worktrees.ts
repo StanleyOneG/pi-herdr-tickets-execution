@@ -242,7 +242,9 @@ export class RealGitWorktreeAdapter implements GitWorktreePort {
     await this.gitText(input.originalRoot, ["worktree", "add", "-b", branch, "--", path, input.integration.head]);
     const commits = (await this.gitText(input.sourcePath, ["rev-list", "--reverse", `${input.candidate.sourceBase}..${input.candidate.head}`]))
       .split("\n").filter(Boolean);
-    for (const commit of commits) await this.gitText(path, ["cherry-pick", commit]);
+    for (const commit of commits) {
+      await this.gitText(path, ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", "cherry-pick", commit]);
+    }
     await this.applyCandidatePatch(input.sourcePath, path, ["diff", "--binary", "--no-ext-diff", "--cached"]);
     await this.applyCandidatePatch(input.sourcePath, path, ["diff", "--binary", "--no-ext-diff"]);
     for (const file of input.candidate.untrackedFiles) await copyCandidatePath(input.sourcePath, path, file.path);
@@ -252,7 +254,11 @@ export class RealGitWorktreeAdapter implements GitWorktreePort {
       throw error;
     })).length > 0;
     if (hasStaged) {
-      await this.gitText(path, ["-c", "user.name=Pi Herdr Controller", "-c", "user.email=pi-herdr@localhost", "commit", "-m", `Integrate candidate ${input.attemptId}`]);
+      await this.gitText(path, [
+        "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false",
+        "-c", "user.name=Pi Herdr Controller", "-c", "user.email=pi-herdr@localhost",
+        "commit", "-m", `Integrate candidate ${input.attemptId}`,
+      ]);
     }
     const candidateCommit = await this.gitText(path, ["rev-parse", "HEAD"]);
     if (candidateCommit === input.integration.head) throw new Error("Candidate contains no changes to integrate");
