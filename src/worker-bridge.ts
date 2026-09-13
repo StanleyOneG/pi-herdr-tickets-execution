@@ -71,11 +71,18 @@ interface PendingSubagentLaunch {
   codeStateDigest: string;
   args: unknown;
   launchedAt: number;
+  sequence: number;
 }
 interface AsyncReviewLaunch extends PendingSubagentLaunch {
   runId: string;
   mode: "workflow";
   asyncDir: string;
+}
+type TerminalNativeEvidenceFailureKind = "review-rejected" | "capture-failed" | "revocation-failed";
+interface TerminalNativeEvidenceFailure {
+  kind: TerminalNativeEvidenceFailureKind;
+  reason: string;
+  sequence: number;
 }
 let sessionStartReason: WorkerReadinessReceipt["sessionStartReason"] | undefined;
 
@@ -91,8 +98,10 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   const terminalAsyncReviewRuns = new Set<string>();
   const consumedReviewerSessions = new Set<string>();
   const activeAsyncReviewCaptures = new Map<string, Promise<void>>();
-  const terminalNativeEvidenceFailures = new Map<string, string>();
+  const terminalNativeEvidenceFailures = new Map<string, TerminalNativeEvidenceFailure>();
   const nativeExecutions = new Map<string, NativeExecutionProof>();
+  let subagentLaunchSequence = 0;
+  let latestSuccessfulAsyncReviewSequence = 0;
   let failedBashCommand = false;
   let mutationToolUsed = false;
   let isAgentRunning = false;
@@ -107,8 +116,8 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     ...(isAgentRunning ? ["pi-agent-run"] : []),
     ...[...activeTools].sort().map((id): string => `pi-tool:${id}`),
     ...[...activeAsyncReviewCaptures.keys()].sort().map((id): string => `native-async-review-capture:${id}`),
-    ...[...terminalNativeEvidenceFailures].sort().map(([id, reason]): string =>
-      `native-evidence-terminal-failure:${id}:${reason}`),
+    ...[...terminalNativeEvidenceFailures].sort().map(([id, failure]): string =>
+      `native-evidence-terminal-failure:${id}:${failure.kind}:${failure.reason}`),
   ];
   const consumeAsyncReviewCompletion = (runId: string, payload: unknown): void => {
     const launch = asyncReviewLaunches.get(runId);
@@ -119,20 +128,35 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     const capture = (async (): Promise<void> => {
       try {
         await retainAsyncNativeReview(nativeExecutions, consumedReviewerSessions, launch, payload);
+        latestSuccessfulAsyncReviewSequence = Math.max(latestSuccessfulAsyncReviewSequence, launch.sequence);
+        for (const [failedRunId, failure] of terminalNativeEvidenceFailures) {
+          if (failure.sequence < launch.sequence) terminalNativeEvidenceFailures.delete(failedRunId);
+        }
       } catch (error) {
         nativeExecutions.delete(launch.toolCallId);
+        let kind: TerminalNativeEvidenceFailureKind = isFileSystemError(error) ? "capture-failed" : "review-rejected";
         let reason = error instanceof Error ? error.message : String(error);
         try {
           await revokePublishedNativeEvidence();
         } catch (revocationError) {
+          kind = "revocation-failed";
           reason = `${reason}; revocation failed: ${revocationError instanceof Error ? revocationError.message : String(revocationError)}`;
         }
-        terminalNativeEvidenceFailures.set(runId, boundedDiagnostic(reason));
+        if (kind !== "revocation-failed" && launch.sequence < latestSuccessfulAsyncReviewSequence) return;
+        terminalNativeEvidenceFailures.set(runId, {
+          kind,
+          reason: boundedDiagnostic(reason),
+          sequence: launch.sequence,
+        });
       }
     })().catch((error: unknown): void => {
-      // This terminal guard must never reject: lifecycle remains fail-closed until the session is replaced.
+      // This terminal guard must never reject: lifecycle remains fail-closed until a newer valid review proves capture recovered.
       nativeExecutions.delete(launch.toolCallId);
-      terminalNativeEvidenceFailures.set(runId, boundedDiagnostic(error instanceof Error ? error.message : String(error)));
+      terminalNativeEvidenceFailures.set(runId, {
+        kind: "capture-failed",
+        reason: boundedDiagnostic(error instanceof Error ? error.message : String(error)),
+        sequence: launch.sequence,
+      });
     });
     activeAsyncReviewCaptures.set(runId, capture);
     void capture.then((): void => { activeAsyncReviewCaptures.delete(runId); });
@@ -164,6 +188,8 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     consumedReviewerSessions.clear();
     activeAsyncReviewCaptures.clear();
     terminalNativeEvidenceFailures.clear();
+    subagentLaunchSequence = 0;
+    latestSuccessfulAsyncReviewSequence = 0;
     observedCommandDigests.length = 0;
     nativeTestDiagnostics.length = 0;
     failedBashCommand = false;
@@ -190,6 +216,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
           codeStateDigest: await captureCodeStateDigest(ctx.cwd),
           args: event.args,
           launchedAt: Date.now(),
+          sequence: ++subagentLaunchSequence,
         });
       }
     }
@@ -831,15 +858,21 @@ async function retainAsyncNativeReview(
     if (!entry || !result || !workflowChild || !role || roles.has(role) || entry.key !== key || entry.agent !== "reviewer" ||
       entry.requestedContext !== "fresh" || entry.resolvedContext !== "fresh" ||
       step.agent !== "reviewer" || step.status !== "completed" || step.parentWorkflowRunId !== launch.runId ||
-      typeof childRunId !== "string" || !childRunId || step.runId !== childRunId || result.runId !== childRunId ||
+      typeof childRunId !== "string" || eventIdentity({ id: childRunId }) !== childRunId ||
+      step.async !== true || step.runId !== childRunId || result.runId !== childRunId ||
       workflowChild.runId !== childRunId || workflowChild.agent !== "reviewer" || workflowChild.state !== "completed" ||
       (entry.latestRunId !== undefined && entry.latestRunId !== childRunId) ||
       result.agent !== "reviewer" || result.success !== true || result.status !== "completed" ||
       result.outputState !== "present" || typeof step.sessionFile !== "string" || result.sessionFile !== step.sessionFile ||
       typeof entry.outputReference !== "string" || result.outputReference !== entry.outputReference ||
-      artifactPaths?.outputPath !== entry.outputReference
+      typeof artifactPaths?.outputPath !== "string"
     ) throw new Error("Asynchronous native review child identity, role, freshness, or artifact binding was incomplete");
 
+    const expectedChildAsyncDir = join(piSubagentsTempRoot(), "async-subagent-runs", childRunId);
+    if (resolve(artifactPaths.outputPath) !== expectedChildAsyncDir) {
+      throw new Error("Asynchronous native review child artifact did not identify its installed async run");
+    }
+    await assertCanonicalDirectory(artifactPaths.outputPath, join(piSubagentsTempRoot(), "async-subagent-runs"));
     const canonicalSession = await assertCanonicalRegularFile(step.sessionFile, [sessionRoot]);
     if (reviewerSessions.has(canonicalSession) || consumedReviewerSessions.has(canonicalSession)) {
       throw new Error("Asynchronous native review reused a reviewer session");
@@ -873,6 +906,8 @@ async function retainAsyncNativeReview(
   const completedAt = new Date(timestamp).toISOString();
   const endpoint = process.env[WORKER_BRIDGE_ENDPOINT_ENV];
   if (!endpoint || !isAbsolute(endpoint)) throw new Error("Attempt-bound worker bridge endpoint is unavailable");
+  // A successful capture must also prove that a prior public-index revocation failure no longer exists.
+  await revokePublishedNativeEvidence();
   const evidenceDirectory = join(dirname(endpoint), "native-evidence");
   await mkdir(evidenceDirectory, { recursive: true, mode: 0o700 });
   const sourcePath = join(evidenceDirectory, `reviews-${randomUUID()}-async-execution.json`);
@@ -1021,6 +1056,10 @@ async function readCanonicalBoundedFile(
 
 function boundedDiagnostic(value: string): string {
   return value.replace(/[\r\n:]+/g, " ").slice(0, 500) || "unknown asynchronous evidence failure";
+}
+
+function isFileSystemError(value: unknown): boolean {
+  return value instanceof Error && typeof (value as NodeJS.ErrnoException).code === "string";
 }
 
 function classifyNativeReviewResult(result: unknown): "passed" | "blocked" | "unrelated" {

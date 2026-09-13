@@ -1846,15 +1846,18 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
   await mkdir(artifactRoot, { recursive: true });
   await writeFile(parentSessionFile, "parent\n");
 
-  // Fixture provenance: pi-subagents 0.67.0 writes this public workflow result in
-  // runs/foreground/subagent-executor.ts:5721-5732, its version-1 receipt in
-  // workflows/workflow-receipt.ts:12-84, and child session paths in terminal status.
+  // Fixture provenance: pi-subagents 0.67.0 puts each nested child's asyncDir
+  // first in artifactPaths (runs/foreground/subagent-executor.ts:4232-4238),
+  // publishes that path at result.artifactPaths.outputPath (:5721-5732), and
+  // separately retains the report as receipt/result outputReference
+  // (workflows/workflow-receipt.ts:63-65).
   const workflowFixture = async (input: {
     runId: string;
     toolCallId: string;
     completionOwnerId: string;
     blocking?: boolean;
     artifactOverride?: string;
+    asyncArtifactOverride?: string;
     incomplete?: boolean;
   }): Promise<{ asyncDir: string; completion: Record<string, unknown>; reports: string[] }> => {
     const asyncDir = join(piSubagentsTempRoot, "async-subagent-runs", input.runId);
@@ -1862,10 +1865,15 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
     const keys = ["policy-axis", "requirements-axis"];
     const labels = ["Standards review", "Specification review"];
     const childRunIds = [`${input.runId}-child-a`, `${input.runId}-child-b`];
+    const childAsyncDirs = childRunIds.map((childRunId): string =>
+      join(piSubagentsTempRoot, "async-subagent-runs", childRunId));
     const sessions = childRunIds.map((childRunId, index): string =>
       join(childSessionRoot, input.runId, `run-${index}`, `${childRunId}.jsonl`));
     const reports = childRunIds.map((childRunId): string => join(artifactRoot, `${childRunId}.md`));
     await mkdir(asyncDir, { recursive: true });
+    await Promise.all(childAsyncDirs.map(async (childAsyncDir): Promise<void> => {
+      await mkdir(childAsyncDir, { recursive: true });
+    }));
     await Promise.all(sessions.map(async (session): Promise<void> => {
       await mkdir(dirname(session), { recursive: true });
       await writeFile(session, "fresh reviewer session\n");
@@ -1933,6 +1941,7 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
         parentWorkflowRunId: input.runId,
         status: "completed",
         startedAt,
+        async: true,
         runId: childRunIds[index],
         sessionFile: sessions[index],
       })),
@@ -1960,7 +1969,11 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
           outputState: "present",
           success: true,
           outputReference: index === 0 && input.artifactOverride ? input.artifactOverride : reports[index],
-          artifactPaths: { outputPath: index === 0 && input.artifactOverride ? input.artifactOverride : reports[index] },
+          artifactPaths: {
+            outputPath: index === 0 && input.asyncArtifactOverride
+              ? input.asyncArtifactOverride
+              : childAsyncDirs[index],
+          },
           status: "completed",
           index,
         })),
@@ -1983,32 +1996,36 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
       isError: false,
     }, context);
     const workflowScript = `return runs.all([\n  { key: "policy-axis", label: "Standards review", agent: "reviewer", context: "fresh", task: "Review standards" },\n  { key: "requirements-axis", label: "Specification review", agent: "reviewer", context: "fresh", task: "Review requirements" }\n]);`;
-    await hostHandlers.get("tool_execution_start")!({
-      toolCallId: "async-review-tool",
-      toolName: "subagent",
-      args: { workflowScript },
-    }, context);
-    const passingFixture = await workflowFixture({
+    const launchReview = async (input: Parameters<typeof workflowFixture>[0]): Promise<Awaited<ReturnType<typeof workflowFixture>>> => {
+      await hostHandlers.get("tool_execution_start")!({
+        toolCallId: input.toolCallId,
+        toolName: "subagent",
+        args: { workflowScript },
+      }, context);
+      const fixture = await workflowFixture(input);
+      await hostHandlers.get("tool_execution_end")!({
+        toolCallId: input.toolCallId,
+        toolName: "subagent",
+        isError: false,
+        result: {
+          content: [{ type: "text", text: "Async workflow started" }],
+          details: {
+            mode: "workflow",
+            runId: input.runId,
+            toolCallId: input.toolCallId,
+            asyncId: input.runId,
+            asyncDir: fixture.asyncDir,
+            results: [],
+          },
+        },
+      }, context);
+      return fixture;
+    };
+    const passingFixture = await launchReview({
       runId: "async-review-run",
       toolCallId: "async-review-tool",
       completionOwnerId: "completion-owner",
     });
-    await hostHandlers.get("tool_execution_end")!({
-      toolCallId: "async-review-tool",
-      toolName: "subagent",
-      isError: false,
-      result: {
-        content: [{ type: "text", text: "Async workflow started" }],
-        details: {
-          mode: "workflow",
-          runId: "async-review-run",
-          toolCallId: "async-review-tool",
-          asyncId: "async-review-run",
-          asyncDir: passingFixture.asyncDir,
-          results: [],
-        },
-      },
-    }, context);
     const passingCompletion = passingFixture.completion;
     events.emit("subagent:async-complete", passingCompletion);
     const candidate = await new RealGitWorktreeAdapter().captureCandidate({ path: repo.root, sourceBase: repo.head });
@@ -2041,6 +2058,102 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
     );
     assert.deepEqual(afterReplay.map((record): string => record.kind).sort(), ["reviews", "tests"]);
 
+    const blockingFixture = await launchReview({
+      runId: "blocking-recovery-run",
+      toolCallId: "blocking-recovery-tool",
+      completionOwnerId: "blocking-recovery-owner",
+      blocking: true,
+    });
+    events.emit("subagent:async-complete", blockingFixture.completion);
+    await hostHandlers.get("agent_settled")!({}, context);
+    const blockedLifecycle = JSON.parse(await readFile(join(bridgeDirectory, "lifecycle.json"), "utf8")) as {
+      state: string;
+      outstandingJobs: string[];
+    };
+    assert.equal(blockedLifecycle.state, "settled");
+    assert.ok(blockedLifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("blocking-recovery-run:review-rejected")));
+    await assert.rejects(
+      nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, {
+        sessionId: "native-session",
+        codeStateDigest: candidate.codeStateDigest,
+      }),
+      /ENOENT/,
+    );
+    const sameStateRecovery = await launchReview({
+      runId: "same-state-recovery-run",
+      toolCallId: "same-state-recovery-tool",
+      completionOwnerId: "same-state-recovery-owner",
+    });
+    events.emit("subagent:async-complete", sameStateRecovery.completion);
+    await hostHandlers.get("agent_settled")!({}, context);
+    const sameStateRecords = await nativeEvidenceModule.readProducedNativeEvidence(
+      latestEvidencePath,
+      { sessionId: "native-session", codeStateDigest: candidate.codeStateDigest },
+    );
+    assert.deepEqual(sameStateRecords.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+
+    const olderBlockingReview = await launchReview({
+      runId: "older-concurrent-blocking-run",
+      toolCallId: "older-concurrent-blocking-tool",
+      completionOwnerId: "older-concurrent-blocking-owner",
+      blocking: true,
+    });
+    const newerPassingReview = await launchReview({
+      runId: "newer-concurrent-passing-run",
+      toolCallId: "newer-concurrent-passing-tool",
+      completionOwnerId: "newer-concurrent-passing-owner",
+    });
+    events.emit("subagent:async-complete", newerPassingReview.completion);
+    await hostHandlers.get("agent_settled")!({}, context);
+    events.emit("subagent:async-complete", olderBlockingReview.completion);
+    await hostHandlers.get("agent_settled")!({}, context);
+    await nativeEvidenceModule.readProducedNativeEvidence(
+      latestEvidencePath,
+      { sessionId: "native-session", codeStateDigest: candidate.codeStateDigest },
+    );
+
+    const preRepairFailure = await launchReview({
+      runId: "pre-repair-failure-run",
+      toolCallId: "pre-repair-failure-tool",
+      completionOwnerId: "pre-repair-failure-owner",
+      blocking: true,
+    });
+    events.emit("subagent:async-complete", preRepairFailure.completion);
+    await hostHandlers.get("agent_settled")!({}, context);
+    await writeFile(join(repo.root, "README.md"), "project\nrepaired\n");
+    await hostHandlers.get("tool_result")!({
+      toolCallId: "repaired-native-tests",
+      toolName: "bash",
+      input: { command: "node --import tsx --test test/execution-controller.test.ts" },
+      isError: false,
+    }, context);
+    const repairedCandidate = await new RealGitWorktreeAdapter().captureCandidate({
+      path: repo.root,
+      sourceBase: repo.head,
+    });
+    assert.notEqual(repairedCandidate.codeStateDigest, candidate.codeStateDigest);
+    await hostHandlers.get("agent_settled")!({}, context);
+    await assert.rejects(
+      nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, {
+        sessionId: "native-session",
+        codeStateDigest: repairedCandidate.codeStateDigest,
+      }),
+      /ENOENT/,
+    );
+    const repairedReview = await launchReview({
+      runId: "repaired-candidate-run",
+      toolCallId: "repaired-candidate-tool",
+      completionOwnerId: "repaired-candidate-owner",
+    });
+    events.emit("subagent:async-complete", repairedReview.completion);
+    await hostHandlers.get("agent_settled")!({}, context);
+    const repairedRecords = await nativeEvidenceModule.readProducedNativeEvidence(
+      latestEvidencePath,
+      { sessionId: "native-session", codeStateDigest: repairedCandidate.codeStateDigest },
+    );
+    assert.deepEqual(repairedRecords.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+
     const foreignReport = join(bridgeDirectory, "foreign-report.md");
     const symlinkedReport = join(artifactRoot, "symlinked-report.md");
     await writeFile(foreignReport, "## Review\nNo issues found.\n\nMerge verdict: OK\n");
@@ -2063,6 +2176,12 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
         toolCallId: "symlink-artifact-review-tool",
         completionOwnerId: "symlink-completion-owner",
         artifactOverride: symlinkedReport,
+      },
+      {
+        runId: "mismatched-async-artifact-review-run",
+        toolCallId: "mismatched-async-artifact-review-tool",
+        completionOwnerId: "mismatched-async-artifact-owner",
+        asyncArtifactOverride: piSubagentsTempRoot,
       },
       {
         runId: "incomplete-review-run",
@@ -2110,10 +2229,17 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
         },
       }, context);
     }
+    const passingWhileRevocationBroken = await launchReview({
+      runId: "unresolved-revocation-run",
+      toolCallId: "unresolved-revocation-tool",
+      completionOwnerId: "unresolved-revocation-owner",
+    });
     // A directory at the publication path forces unlink(2) revocation to fail while
-    // remaining unreadable as evidence, exercising the fire-and-forget terminal guard.
+    // remaining unreadable as evidence. Even a valid review payload must stay blocked.
     await mkdir(latestEvidencePath);
-    for (const fixture of rejectedFixtures) events.emit("subagent:async-complete", fixture.completion);
+    for (const fixture of [...rejectedFixtures, passingWhileRevocationBroken]) {
+      events.emit("subagent:async-complete", fixture.completion);
+    }
     let terminalFailures: string[] = [];
     for (let attempt = 0; attempt < 40; attempt += 1) {
       await hostHandlers.get("agent_settled")!({}, context);
@@ -2122,20 +2248,40 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
       };
       terminalFailures = lifecycle.outstandingJobs.filter((job): boolean =>
         job.startsWith("native-evidence-terminal-failure:"));
-      if (terminalFailures.length === rejectedFixtures.length &&
+      if (terminalFailures.length === rejectedFixtures.length + 1 &&
         !lifecycle.outstandingJobs.some((job): boolean => job.startsWith("native-async-review-capture:"))) break;
       await new Promise((resolveWait): void => { setTimeout(resolveWait, 20); });
     }
-    assert.equal(terminalFailures.length, rejectedFixtures.length);
-    assert.ok(terminalFailures.some((failure): boolean => failure.includes("revocation failed")));
+    assert.equal(terminalFailures.length, rejectedFixtures.length + 1);
+    assert.ok(terminalFailures.some((failure): boolean =>
+      failure.includes("unresolved-revocation-run:revocation-failed") && failure.includes("revocation failed")));
     await assert.rejects(
       nativeEvidenceModule.readProducedNativeEvidence(
         latestEvidencePath,
-        { sessionId: "native-session", codeStateDigest: candidate.codeStateDigest },
+        { sessionId: "native-session", codeStateDigest: repairedCandidate.codeStateDigest },
       ),
       /bounded regular file/,
     );
     for (const record of records) await new nativeEvidenceModule.FileNativeEvidenceAdapter().verify({ record, candidate });
+
+    await rm(latestEvidencePath, { recursive: true });
+    const infrastructureRecovery = await launchReview({
+      runId: "infrastructure-recovery-run",
+      toolCallId: "infrastructure-recovery-tool",
+      completionOwnerId: "infrastructure-recovery-owner",
+    });
+    events.emit("subagent:async-complete", infrastructureRecovery.completion);
+    await hostHandlers.get("agent_settled")!({}, context);
+    const recoveredRecords = await nativeEvidenceModule.readProducedNativeEvidence(
+      latestEvidencePath,
+      { sessionId: "native-session", codeStateDigest: repairedCandidate.codeStateDigest },
+    );
+    assert.deepEqual(recoveredRecords.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+    const recoveredLifecycle = JSON.parse(await readFile(join(bridgeDirectory, "lifecycle.json"), "utf8")) as {
+      outstandingJobs: string[];
+    };
+    assert.equal(recoveredLifecycle.outstandingJobs.some((job): boolean =>
+      job.startsWith("native-evidence-terminal-failure:")), false);
   } finally {
     if (previousEndpoint === undefined) delete process.env.HERDR_WORKER_BRIDGE_ENDPOINT;
     else process.env.HERDR_WORKER_BRIDGE_ENDPOINT = previousEndpoint;
