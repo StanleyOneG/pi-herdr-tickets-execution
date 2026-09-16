@@ -1971,19 +1971,59 @@ test("ordinary implementation tool events produce candidate-bound native test an
   }
 });
 
-test("ordinary asynchronous runs.all reviews accept only canonical complete Standards and Spec evidence", async (): Promise<void> => {
+interface AsyncReviewFixtureInput {
+  runId: string;
+  toolCallId: string;
+  completionOwnerId: string;
+  blocking?: boolean;
+  artifactOverride?: string;
+  asyncArtifactOverride?: string;
+  incomplete?: boolean;
+  dirtyScope?: boolean;
+  sessionTasks?: readonly [string, string];
+  launchSessionDir?: string;
+  reportedSessionRoot?: string;
+  sessionStorageRoot?: string;
+}
+
+interface AsyncReviewFixture {
+  asyncDir: string;
+  completion: Record<string, unknown>;
+  reports: string[];
+}
+
+interface AsyncReviewHarness {
+  repo: TestRepository;
+  bridgeDirectory: string;
+  fallbackSessionRoot: string;
+  artifactRoot: string;
+  evidenceDirectory: string;
+  latestEvidencePath: string;
+  context: Record<string, unknown>;
+  hostHandlers: Map<string, (event: any, ctx: any) => unknown>;
+  recordPassingTests: () => Promise<void>;
+  launchReview: (input: AsyncReviewFixtureInput) => Promise<AsyncReviewFixture>;
+  completeAndSettle: (completion: Record<string, unknown>) => Promise<void>;
+  settle: () => Promise<void>;
+  readLifecycle: () => Promise<{ state?: string; outstandingJobs: string[] }>;
+  dispose: () => Promise<void>;
+}
+
+async function createAsyncReviewHarness(options: { configuredDefaultSessionRoot?: boolean } = {}): Promise<AsyncReviewHarness> {
   const repo = await repository();
   const bridgeDirectory = join(repo.root, ".git", "herdr", "async-native-producer");
   await mkdir(bridgeDirectory, { recursive: true });
   const previousEndpoint = process.env.HERDR_WORKER_BRIDGE_ENDPOINT;
   const previousNonce = process.env.HERDR_WORKER_BRIDGE_NONCE;
   const previousPiSubagentsTempRoot = process.env.PI_SUBAGENTS_TEMP_ROOT;
+  const previousPiAgentDir = process.env.PI_CODING_AGENT_DIR;
   const piSubagentsTempRoot = join(bridgeDirectory, "pi-subagents-temp");
+  const piAgentDir = join(bridgeDirectory, "pi-agent");
   process.env.HERDR_WORKER_BRIDGE_ENDPOINT = join(bridgeDirectory, "readiness.json");
   process.env.HERDR_WORKER_BRIDGE_NONCE = "async-native-producer-nonce";
   process.env.PI_SUBAGENTS_TEMP_ROOT = piSubagentsTempRoot;
+  process.env.PI_CODING_AGENT_DIR = piAgentDir;
   const hostHandlers = new Map<string, (event: any, ctx: any) => unknown>();
-  const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
   const eventHandlers = new Map<string, Array<(payload: unknown) => void>>();
   const events = {
     on(name: string, handler: (payload: unknown) => void): () => void {
@@ -2020,7 +2060,7 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
     events,
     on(name: string, handler: (event: any, ctx: any) => unknown): void { hostHandlers.set(name, handler); },
     registerCommand(): void {},
-    registerTool(tool: { name: string; execute: (...args: any[]) => Promise<any> }): void { tools.set(tool.name, tool); },
+    registerTool(): void {},
     getAllTools: (): Array<{ name: string }> => [{ name: "subagent" }],
   } as unknown as ExtensionAPI;
   const parentSessionFile = join(bridgeDirectory, "parent-session.jsonl");
@@ -2032,13 +2072,23 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
     },
     hasPendingMessages: (): boolean => false,
   };
-  const childSessionRoot = join(bridgeDirectory, "parent-session");
+  const fallbackSessionRoot = join(bridgeDirectory, "parent-session");
+  const defaultSessionRoot = options.configuredDefaultSessionRoot
+    ? join(bridgeDirectory, "configured-default-sessions")
+    : undefined;
   const artifactRoot = join(bridgeDirectory, "subagent-artifacts");
   const evidenceDirectory = join(bridgeDirectory, "native-evidence");
-  let evidencePermissionsRestricted = false;
-  await mkdir(childSessionRoot, { recursive: true });
+  const latestEvidencePath = join(evidenceDirectory, "latest.json");
+  const lifecyclePath = join(bridgeDirectory, "lifecycle.json");
+  await mkdir(fallbackSessionRoot, { recursive: true });
   await mkdir(artifactRoot, { recursive: true });
   await writeFile(parentSessionFile, "parent\n");
+  if (defaultSessionRoot) {
+    await mkdir(defaultSessionRoot, { recursive: true });
+    const configDirectory = join(piAgentDir, "extensions", "subagent");
+    await mkdir(configDirectory, { recursive: true });
+    await writeFile(join(configDirectory, "config.json"), `${JSON.stringify({ defaultSessionDir: defaultSessionRoot })}\n`);
+  }
 
   const reviewTasks = [
     `Review the candidate against documented standards and identify code smells. Inspect git diff ${repo.head}...HEAD. End with one merge verdict.`,
@@ -2048,21 +2098,12 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
     `${task} Review all staged, unstaged, and untracked working-tree content.`) as [string, string];
   const workflowScriptFor = (tasks: readonly [string, string]): string =>
     `const reviews = await runs.all([\n  { key: "policy-axis", label: "Review first axis", agent: "reviewer", context: "fresh", task: ${JSON.stringify(tasks[0])} },\n  { key: "requirements-axis", label: "Review second axis", agent: "reviewer", context: "fresh", task: ${JSON.stringify(tasks[1])} }\n]);\nreturn reviews.map((review) => review.output);`;
-  // Fixture provenance: pi-subagents 0.68.0 puts each nested child's asyncDir
-  // first in artifactPaths, publishes that path at result.artifactPaths.outputPath,
-  // separately retains the report as receipt/result outputReference, and persists
-  // the actual `Task: ...` prompt in the child's fresh Pi session.
-  const workflowFixture = async (input: {
-    runId: string;
-    toolCallId: string;
-    completionOwnerId: string;
-    blocking?: boolean;
-    artifactOverride?: string;
-    asyncArtifactOverride?: string;
-    incomplete?: boolean;
-    dirtyScope?: boolean;
-    sessionTasks?: readonly [string, string];
-  }): Promise<{ asyncDir: string; completion: Record<string, unknown>; reports: string[] }> => {
+
+  // Fixture provenance: pi-subagents 0.68.0 publishes the configured base root
+  // in status.sessionRoot. Each nested fresh child then uses
+  // <sessionRoot>/<childRunId>/run-0/session.jsonl. The child async directory in
+  // artifactPaths remains distinct from the retained report outputReference.
+  const workflowFixture = async (input: AsyncReviewFixtureInput): Promise<AsyncReviewFixture> => {
     const asyncDir = join(piSubagentsTempRoot, "async-subagent-runs", input.runId);
     const startedAt = Date.now();
     const tasks = input.sessionTasks ?? (input.dirtyScope ? dirtyReviewTasks : reviewTasks);
@@ -2071,8 +2112,11 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
     const childRunIds = [`${input.runId}-child-a`, `${input.runId}-child-b`];
     const childAsyncDirs = childRunIds.map((childRunId): string =>
       join(piSubagentsTempRoot, "async-subagent-runs", childRunId));
-    const sessions = childRunIds.map((childRunId, index): string =>
-      join(childSessionRoot, input.runId, `run-${index}`, `${childRunId}.jsonl`));
+    const configuredRoot = input.launchSessionDir ?? defaultSessionRoot ?? fallbackSessionRoot;
+    const sessionStorageRoot = input.sessionStorageRoot ?? configuredRoot;
+    const reportedSessionRoot = input.reportedSessionRoot ?? configuredRoot;
+    const sessions = childRunIds.map((childRunId): string =>
+      join(sessionStorageRoot, childRunId, "run-0", "session.jsonl"));
     const reports = childRunIds.map((childRunId): string => join(artifactRoot, `${childRunId}.md`));
     await mkdir(asyncDir, { recursive: true });
     await Promise.all(childAsyncDirs.map(async (childAsyncDir): Promise<void> => {
@@ -2145,7 +2189,7 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
       endedAt,
       lastUpdate: endedAt,
       cwd: repo.root,
-      sessionRoot: childSessionRoot,
+      sessionRoot: reportedSessionRoot,
       workflowReceiptPath: receiptPath,
       workflowChildren,
       steps: keys.map((key, index) => ({
@@ -2201,206 +2245,383 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
       },
     };
   };
-  try {
-    herdrWorkerBridge(fakePi);
+
+  herdrWorkerBridge(fakePi);
+
+  const recordPassingTests = async (): Promise<void> => {
     await hostHandlers.get("tool_result")!({
       toolCallId: "native-tests",
       toolName: "bash",
       input: { command: "node --import tsx --test test/execution-controller.test.ts" },
       isError: false,
     }, context);
-    const launchReview = async (input: Parameters<typeof workflowFixture>[0]): Promise<Awaited<ReturnType<typeof workflowFixture>>> => {
-      await hostHandlers.get("tool_execution_start")!({
-        toolCallId: input.toolCallId,
-        toolName: "subagent",
-        args: { workflowScript: workflowScriptFor(input.dirtyScope ? dirtyReviewTasks : reviewTasks) },
-      }, context);
-      const fixture = await workflowFixture(input);
-      await hostHandlers.get("tool_execution_end")!({
-        toolCallId: input.toolCallId,
-        toolName: "subagent",
-        isError: false,
-        result: {
-          content: [{ type: "text", text: "Async workflow started" }],
-          details: {
-            mode: "workflow",
-            runId: input.runId,
-            toolCallId: input.toolCallId,
-            asyncId: input.runId,
-            asyncDir: fixture.asyncDir,
-            results: [],
-          },
+  };
+  const launchReview = async (input: AsyncReviewFixtureInput): Promise<AsyncReviewFixture> => {
+    const tasks = input.dirtyScope ? dirtyReviewTasks : reviewTasks;
+    await hostHandlers.get("tool_execution_start")!({
+      toolCallId: input.toolCallId,
+      toolName: "subagent",
+      args: {
+        workflowScript: workflowScriptFor(tasks),
+        ...(input.launchSessionDir ? { sessionDir: input.launchSessionDir } : {}),
+      },
+    }, context);
+    const fixture = await workflowFixture(input);
+    await hostHandlers.get("tool_execution_end")!({
+      toolCallId: input.toolCallId,
+      toolName: "subagent",
+      isError: false,
+      result: {
+        content: [{ type: "text", text: "Async workflow started" }],
+        details: {
+          mode: "workflow",
+          runId: input.runId,
+          toolCallId: input.toolCallId,
+          asyncId: input.runId,
+          asyncDir: fixture.asyncDir,
+          results: [],
         },
-      }, context);
-      return fixture;
-    };
-    const passingFixture = await launchReview({
+      },
+    }, context);
+    return fixture;
+  };
+  const settle = async (): Promise<void> => {
+    await hostHandlers.get("agent_settled")!({}, context);
+  };
+  const completeAndSettle = async (completion: Record<string, unknown>): Promise<void> => {
+    events.emit("subagent:async-complete", completion);
+    await settle();
+  };
+  const readLifecycle = async (): Promise<{ state?: string; outstandingJobs: string[] }> =>
+    JSON.parse(await readFile(lifecyclePath, "utf8")) as { state?: string; outstandingJobs: string[] };
+  const dispose = async (): Promise<void> => {
+    try { await chmod(evidenceDirectory, 0o700); } catch {}
+    if (previousEndpoint === undefined) delete process.env.HERDR_WORKER_BRIDGE_ENDPOINT;
+    else process.env.HERDR_WORKER_BRIDGE_ENDPOINT = previousEndpoint;
+    if (previousNonce === undefined) delete process.env.HERDR_WORKER_BRIDGE_NONCE;
+    else process.env.HERDR_WORKER_BRIDGE_NONCE = previousNonce;
+    if (previousPiSubagentsTempRoot === undefined) delete process.env.PI_SUBAGENTS_TEMP_ROOT;
+    else process.env.PI_SUBAGENTS_TEMP_ROOT = previousPiSubagentsTempRoot;
+    if (previousPiAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousPiAgentDir;
+  };
+
+  return {
+    repo,
+    bridgeDirectory,
+    fallbackSessionRoot,
+    artifactRoot,
+    evidenceDirectory,
+    latestEvidencePath,
+    context,
+    hostHandlers,
+    recordPassingTests,
+    launchReview,
+    completeAndSettle,
+    settle,
+    readLifecycle,
+    dispose,
+  };
+}
+
+async function asyncReviewCandidate(harness: AsyncReviewHarness): Promise<Awaited<ReturnType<RealGitWorktreeAdapter["captureCandidate"]>>> {
+  return new RealGitWorktreeAdapter().captureCandidate({ path: harness.repo.root, sourceBase: harness.repo.head });
+}
+
+async function readAsyncReviewEvidence(
+  harness: AsyncReviewHarness,
+  candidate: Awaited<ReturnType<RealGitWorktreeAdapter["captureCandidate"]>>,
+): Promise<Awaited<ReturnType<typeof import("../src/native-evidence.js")["readProducedNativeEvidence"]>>> {
+  const nativeEvidenceModule = await import("../src/native-evidence.js");
+  return nativeEvidenceModule.readProducedNativeEvidence(harness.latestEvidencePath, {
+    sessionId: "native-session",
+    codeStateDigest: candidate.codeStateDigest,
+  });
+}
+
+test("ordinary asynchronous runs.all reviews publish canonical immutable Standards and Spec evidence", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness();
+  try {
+    await harness.recordPassingTests();
+    const fixture = await harness.launchReview({
       runId: "async-review-run",
       toolCallId: "async-review-tool",
       completionOwnerId: "completion-owner",
     });
-    const passingCompletion = passingFixture.completion;
-    events.emit("subagent:async-complete", passingCompletion);
-    const candidate = await new RealGitWorktreeAdapter().captureCandidate({ path: repo.root, sourceBase: repo.head });
-    const nativeEvidenceModule = await import("../src/native-evidence.js");
-    const latestEvidencePath = join(bridgeDirectory, "native-evidence", "latest.json");
-    let records: Awaited<ReturnType<typeof nativeEvidenceModule.readProducedNativeEvidence>> | undefined;
-    for (let attempt = 0; attempt < 20 && !records; attempt += 1) {
-      await hostHandlers.get("agent_settled")!({}, context);
-      try {
-        records = await nativeEvidenceModule.readProducedNativeEvidence(
-          latestEvidencePath,
-          { sessionId: "native-session", codeStateDigest: candidate.codeStateDigest },
-        );
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        await new Promise((resolveWait): void => { setTimeout(resolveWait, 20); });
-      }
-    }
-    assert.ok(records, "settlement should publish retained asynchronous review evidence");
+    await harness.completeAndSettle(fixture.completion);
+    const candidate = await asyncReviewCandidate(harness);
+    const records = await readAsyncReviewEvidence(harness, candidate);
+
     assert.deepEqual(records.map((record): string => record.kind).sort(), ["reviews", "tests"]);
-    for (const record of records) await new nativeEvidenceModule.FileNativeEvidenceAdapter().verify({ record, candidate });
-    await Promise.all(passingFixture.reports.map((report): Promise<void> => rm(report)));
-    for (const record of records) await new nativeEvidenceModule.FileNativeEvidenceAdapter().verify({ record, candidate });
+    for (const record of records) await new FileNativeEvidenceAdapter().verify({ record, candidate });
+    await Promise.all(fixture.reports.map((report): Promise<void> => rm(report)));
+    for (const record of records) await new FileNativeEvidenceAdapter().verify({ record, candidate });
+  } finally {
+    await harness.dispose();
+  }
+});
 
-    events.emit("subagent:async-complete", { ...passingCompletion, timestamp: Date.now() });
-    await hostHandlers.get("agent_settled")!({}, context);
-    const afterReplay = await nativeEvidenceModule.readProducedNativeEvidence(
-      latestEvidencePath,
-      { sessionId: "native-session", codeStateDigest: candidate.codeStateDigest },
-    );
-    assert.deepEqual(afterReplay.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+test("asynchronous review completion replay does not replace accepted evidence", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness();
+  try {
+    await harness.recordPassingTests();
+    const fixture = await harness.launchReview({
+      runId: "replayed-review-run",
+      toolCallId: "replayed-review-tool",
+      completionOwnerId: "replayed-review-owner",
+    });
+    await harness.completeAndSettle(fixture.completion);
+    const candidate = await asyncReviewCandidate(harness);
+    await readAsyncReviewEvidence(harness, candidate);
 
-    const unrelatedTaskFixture = await launchReview({
+    await harness.completeAndSettle({ ...fixture.completion, timestamp: Date.now() });
+
+    const replayedRecords = await readAsyncReviewEvidence(harness, candidate);
+    assert.deepEqual(replayedRecords.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("asynchronous reviews accept an explicit producer sessionDir outside the parent-derived root", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness();
+  try {
+    await harness.recordPassingTests();
+    const configuredRoot = join(harness.bridgeDirectory, "configured-explicit-sessions");
+    await mkdir(configuredRoot, { recursive: true });
+    const fixture = await harness.launchReview({
+      runId: "explicit-session-root-run",
+      toolCallId: "explicit-session-root-tool",
+      completionOwnerId: "explicit-session-root-owner",
+      launchSessionDir: configuredRoot,
+    });
+
+    await harness.completeAndSettle(fixture.completion);
+
+    const records = await readAsyncReviewEvidence(harness, await asyncReviewCandidate(harness));
+    assert.deepEqual(records.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("asynchronous reviews reject a status sessionRoot that differs from the launch sessionDir", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness();
+  try {
+    await harness.recordPassingTests();
+    const configuredRoot = join(harness.bridgeDirectory, "configured-explicit-sessions");
+    await mkdir(configuredRoot, { recursive: true });
+    const fixture = await harness.launchReview({
+      runId: "mismatched-explicit-session-root-run",
+      toolCallId: "mismatched-explicit-session-root-tool",
+      completionOwnerId: "mismatched-explicit-session-root-owner",
+      launchSessionDir: configuredRoot,
+      reportedSessionRoot: harness.fallbackSessionRoot,
+      sessionStorageRoot: harness.fallbackSessionRoot,
+    });
+
+    await harness.completeAndSettle(fixture.completion);
+
+    const lifecycle = await harness.readLifecycle();
+    assert.ok(lifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("mismatched-explicit-session-root-run:review-rejected")));
+    await assert.rejects(readAsyncReviewEvidence(harness, await asyncReviewCandidate(harness)), /ENOENT/);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("asynchronous reviews accept the producer defaultSessionDir outside the parent-derived root", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness({ configuredDefaultSessionRoot: true });
+  try {
+    await harness.recordPassingTests();
+    const fixture = await harness.launchReview({
+      runId: "default-session-root-run",
+      toolCallId: "default-session-root-tool",
+      completionOwnerId: "default-session-root-owner",
+    });
+
+    await harness.completeAndSettle(fixture.completion);
+
+    const records = await readAsyncReviewEvidence(harness, await asyncReviewCandidate(harness));
+    assert.deepEqual(records.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("asynchronous reviews reject a status sessionRoot that differs from defaultSessionDir configuration", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness({ configuredDefaultSessionRoot: true });
+  try {
+    await harness.recordPassingTests();
+    const fixture = await harness.launchReview({
+      runId: "untrusted-session-root-run",
+      toolCallId: "untrusted-session-root-tool",
+      completionOwnerId: "untrusted-session-root-owner",
+      reportedSessionRoot: harness.fallbackSessionRoot,
+      sessionStorageRoot: harness.fallbackSessionRoot,
+    });
+
+    await harness.completeAndSettle(fixture.completion);
+
+    const lifecycle = await harness.readLifecycle();
+    assert.ok(lifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("untrusted-session-root-run:review-rejected")));
+    await assert.rejects(readAsyncReviewEvidence(harness, await asyncReviewCandidate(harness)), /ENOENT/);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("asynchronous reviews reject unrelated persisted child tasks until a relevant rerun passes", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness();
+  try {
+    await harness.recordPassingTests();
+    const unrelated = await harness.launchReview({
       runId: "unrelated-task-review-run",
       toolCallId: "unrelated-task-review-tool",
       completionOwnerId: "unrelated-task-review-owner",
       sessionTasks: [
-        `Summarize naming choices. Inspect git diff ${repo.head}...HEAD. End with one merge verdict.`,
-        `Review runtime speed. Inspect git diff ${repo.head}...HEAD. End with one merge verdict.`,
+        `Summarize naming choices. Inspect git diff ${harness.repo.head}...HEAD. End with one merge verdict.`,
+        `Review runtime speed. Inspect git diff ${harness.repo.head}...HEAD. End with one merge verdict.`,
       ],
     });
-    events.emit("subagent:async-complete", unrelatedTaskFixture.completion);
-    await hostHandlers.get("agent_settled")!({}, context);
-    const unrelatedTaskLifecycle = JSON.parse(await readFile(join(bridgeDirectory, "lifecycle.json"), "utf8")) as {
-      outstandingJobs: string[];
-    };
-    assert.ok(unrelatedTaskLifecycle.outstandingJobs.some((job): boolean =>
+    await harness.completeAndSettle(unrelated.completion);
+    const rejectedLifecycle = await harness.readLifecycle();
+    assert.ok(rejectedLifecycle.outstandingJobs.some((job): boolean =>
       job.includes("unrelated-task-review-run:review-rejected")));
-    await assert.rejects(
-      nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, {
-        sessionId: "native-session",
-        codeStateDigest: candidate.codeStateDigest,
-      }),
-      /ENOENT/,
-    );
-    const unrelatedTaskRecovery = await launchReview({
+
+    const recovery = await harness.launchReview({
       runId: "unrelated-task-recovery-run",
       toolCallId: "unrelated-task-recovery-tool",
       completionOwnerId: "unrelated-task-recovery-owner",
     });
-    events.emit("subagent:async-complete", unrelatedTaskRecovery.completion);
-    await hostHandlers.get("agent_settled")!({}, context);
+    await harness.completeAndSettle(recovery.completion);
 
-    await chmod(evidenceDirectory, 0o500);
-    evidencePermissionsRestricted = true;
-    const reviewStartedDuringRevocationFailure = await launchReview({
+    const records = await readAsyncReviewEvidence(harness, await asyncReviewCandidate(harness));
+    assert.deepEqual(records.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("a review started during evidence revocation failure recovers only after valid completion", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness();
+  try {
+    await harness.recordPassingTests();
+    const initial = await harness.launchReview({
+      runId: "initial-revocation-run",
+      toolCallId: "initial-revocation-tool",
+      completionOwnerId: "initial-revocation-owner",
+    });
+    await harness.completeAndSettle(initial.completion);
+    const candidate = await asyncReviewCandidate(harness);
+
+    await chmod(harness.evidenceDirectory, 0o500);
+    const started = await harness.launchReview({
       runId: "started-review-revocation-run",
       toolCallId: "started-review-revocation-tool",
       completionOwnerId: "started-review-revocation-owner",
     });
-    await hostHandlers.get("agent_settled")!({}, context);
-    const readableBeforeStartedReviewCompletion = await nativeEvidenceModule.readProducedNativeEvidence(
-      latestEvidencePath,
-      { sessionId: "native-session", codeStateDigest: candidate.codeStateDigest },
-    );
-    assert.deepEqual(readableBeforeStartedReviewCompletion.map((record): string => record.kind).sort(), ["reviews", "tests"]);
-    const startedReviewBlockedLifecycle = JSON.parse(await readFile(join(bridgeDirectory, "lifecycle.json"), "utf8")) as {
-      outstandingJobs: string[];
-    };
-    assert.ok(startedReviewBlockedLifecycle.outstandingJobs.some((job): boolean =>
+    await harness.settle();
+    const readableRecords = await readAsyncReviewEvidence(harness, candidate);
+    const blockedLifecycle = await harness.readLifecycle();
+    assert.deepEqual(readableRecords.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+    assert.ok(blockedLifecycle.outstandingJobs.some((job): boolean =>
       job.includes("started-review-revocation-tool:revocation-failed")));
 
-    await chmod(evidenceDirectory, 0o700);
-    evidencePermissionsRestricted = false;
-    events.emit("subagent:async-complete", reviewStartedDuringRevocationFailure.completion);
-    await hostHandlers.get("agent_settled")!({}, context);
-    await nativeEvidenceModule.readProducedNativeEvidence(
-      latestEvidencePath,
-      { sessionId: "native-session", codeStateDigest: candidate.codeStateDigest },
-    );
-    const startedReviewRecoveredLifecycle = JSON.parse(await readFile(join(bridgeDirectory, "lifecycle.json"), "utf8")) as {
-      outstandingJobs: string[];
-    };
-    assert.equal(startedReviewRecoveredLifecycle.outstandingJobs.some((job): boolean =>
-      job.includes("started-review-revocation-tool:revocation-failed")), false);
+    await chmod(harness.evidenceDirectory, 0o700);
+    await harness.completeAndSettle(started.completion);
 
-    const blockingFixture = await launchReview({
+    await readAsyncReviewEvidence(harness, candidate);
+    const recoveredLifecycle = await harness.readLifecycle();
+    assert.equal(recoveredLifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("started-review-revocation-tool:revocation-failed")), false);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("a blocking asynchronous review revokes evidence until a same-state review passes", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness();
+  try {
+    await harness.recordPassingTests();
+    const passing = await harness.launchReview({
+      runId: "initial-passing-run",
+      toolCallId: "initial-passing-tool",
+      completionOwnerId: "initial-passing-owner",
+    });
+    await harness.completeAndSettle(passing.completion);
+    const candidate = await asyncReviewCandidate(harness);
+
+    const blocking = await harness.launchReview({
       runId: "blocking-recovery-run",
       toolCallId: "blocking-recovery-tool",
       completionOwnerId: "blocking-recovery-owner",
       blocking: true,
     });
-    events.emit("subagent:async-complete", blockingFixture.completion);
-    await hostHandlers.get("agent_settled")!({}, context);
-    const blockedLifecycle = JSON.parse(await readFile(join(bridgeDirectory, "lifecycle.json"), "utf8")) as {
-      state: string;
-      outstandingJobs: string[];
-    };
+    await harness.completeAndSettle(blocking.completion);
+    const blockedLifecycle = await harness.readLifecycle();
     assert.equal(blockedLifecycle.state, "settled");
     assert.ok(blockedLifecycle.outstandingJobs.some((job): boolean =>
       job.includes("blocking-recovery-run:review-rejected")));
-    await assert.rejects(
-      nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, {
-        sessionId: "native-session",
-        codeStateDigest: candidate.codeStateDigest,
-      }),
-      /ENOENT/,
-    );
-    const sameStateRecovery = await launchReview({
+    await assert.rejects(readAsyncReviewEvidence(harness, candidate), /ENOENT/);
+
+    const recovery = await harness.launchReview({
       runId: "same-state-recovery-run",
       toolCallId: "same-state-recovery-tool",
       completionOwnerId: "same-state-recovery-owner",
     });
-    events.emit("subagent:async-complete", sameStateRecovery.completion);
-    await hostHandlers.get("agent_settled")!({}, context);
-    const sameStateRecords = await nativeEvidenceModule.readProducedNativeEvidence(
-      latestEvidencePath,
-      { sessionId: "native-session", codeStateDigest: candidate.codeStateDigest },
-    );
-    assert.deepEqual(sameStateRecords.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+    await harness.completeAndSettle(recovery.completion);
 
-    const olderBlockingReview = await launchReview({
+    const recoveredRecords = await readAsyncReviewEvidence(harness, candidate);
+    assert.deepEqual(recoveredRecords.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("an older blocking asynchronous completion cannot revoke a newer passing review", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness();
+  try {
+    await harness.recordPassingTests();
+    const olderBlocking = await harness.launchReview({
       runId: "older-concurrent-blocking-run",
       toolCallId: "older-concurrent-blocking-tool",
       completionOwnerId: "older-concurrent-blocking-owner",
       blocking: true,
     });
-    const newerPassingReview = await launchReview({
+    const newerPassing = await harness.launchReview({
       runId: "newer-concurrent-passing-run",
       toolCallId: "newer-concurrent-passing-tool",
       completionOwnerId: "newer-concurrent-passing-owner",
     });
-    events.emit("subagent:async-complete", newerPassingReview.completion);
-    await hostHandlers.get("agent_settled")!({}, context);
-    events.emit("subagent:async-complete", olderBlockingReview.completion);
-    await hostHandlers.get("agent_settled")!({}, context);
-    await nativeEvidenceModule.readProducedNativeEvidence(
-      latestEvidencePath,
-      { sessionId: "native-session", codeStateDigest: candidate.codeStateDigest },
-    );
 
-    const olderPassingReview = await launchReview({
+    await harness.completeAndSettle(newerPassing.completion);
+    await harness.completeAndSettle(olderBlocking.completion);
+
+    const records = await readAsyncReviewEvidence(harness, await asyncReviewCandidate(harness));
+    assert.deepEqual(records.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("an older passing asynchronous completion cannot override a newer direct blocking review", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness();
+  try {
+    await harness.recordPassingTests();
+    const olderPassing = await harness.launchReview({
       runId: "older-concurrent-passing-run",
       toolCallId: "older-concurrent-passing-tool",
       completionOwnerId: "older-concurrent-passing-owner",
     });
-    await hostHandlers.get("tool_execution_start")!({
+    await harness.hostHandlers.get("tool_execution_start")!({
       toolCallId: "newer-direct-blocking-tool",
       toolName: "subagent",
       args: { task: "Review the implementation after the asynchronous review launched" },
-    }, context);
-    await hostHandlers.get("tool_execution_end")!({
+    }, harness.context);
+    await harness.hostHandlers.get("tool_execution_end")!({
       toolCallId: "newer-direct-blocking-tool",
       toolName: "subagent",
       isError: false,
@@ -2414,255 +2635,227 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
           residualRisks: ["acceptance bypass"],
         },
       }] } },
-    }, context);
-    events.emit("subagent:async-complete", olderPassingReview.completion);
-    await hostHandlers.get("agent_settled")!({}, context);
-    const reverseCompletionLifecycle = JSON.parse(await readFile(join(bridgeDirectory, "lifecycle.json"), "utf8")) as {
-      outstandingJobs: string[];
-    };
-    assert.ok(reverseCompletionLifecycle.outstandingJobs.some((job): boolean =>
-      job.includes("newer-direct-blocking-tool:review-rejected")));
-    await assert.rejects(
-      nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, {
-        sessionId: "native-session",
-        codeStateDigest: candidate.codeStateDigest,
-      }),
-      /ENOENT/,
-    );
-    const reverseCompletionRecovery = await launchReview({
-      runId: "reverse-completion-recovery-run",
-      toolCallId: "reverse-completion-recovery-tool",
-      completionOwnerId: "reverse-completion-recovery-owner",
-    });
-    events.emit("subagent:async-complete", reverseCompletionRecovery.completion);
-    await hostHandlers.get("agent_settled")!({}, context);
+    }, harness.context);
 
-    const preRepairFailure = await launchReview({
-      runId: "pre-repair-failure-run",
-      toolCallId: "pre-repair-failure-tool",
-      completionOwnerId: "pre-repair-failure-owner",
-      blocking: true,
-    });
-    events.emit("subagent:async-complete", preRepairFailure.completion);
-    await hostHandlers.get("agent_settled")!({}, context);
-    const preMutationReview = await launchReview({
+    await harness.completeAndSettle(olderPassing.completion);
+
+    const lifecycle = await harness.readLifecycle();
+    assert.ok(lifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("newer-direct-blocking-tool:review-rejected")));
+    await assert.rejects(readAsyncReviewEvidence(harness, await asyncReviewCandidate(harness)), /ENOENT/);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("an asynchronous review completed after a content mutation cannot prove the changed candidate", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness();
+  try {
+    await harness.recordPassingTests();
+    const review = await harness.launchReview({
       runId: "pre-mutation-review-run",
       toolCallId: "pre-mutation-review-tool",
       completionOwnerId: "pre-mutation-review-owner",
     });
-    await writeFile(join(repo.root, "README.md"), "project\nrepaired\n");
-    events.emit("subagent:async-complete", preMutationReview.completion);
-    await hostHandlers.get("agent_settled")!({}, context);
-    const contentMutationLifecycle = JSON.parse(await readFile(join(bridgeDirectory, "lifecycle.json"), "utf8")) as {
-      outstandingJobs: string[];
-    };
-    assert.ok(contentMutationLifecycle.outstandingJobs.some((job): boolean =>
+    await writeFile(join(harness.repo.root, "README.md"), "project\nrepaired\n");
+
+    await harness.completeAndSettle(review.completion);
+
+    const lifecycle = await harness.readLifecycle();
+    assert.ok(lifecycle.outstandingJobs.some((job): boolean =>
       job.includes("pre-mutation-review-run:review-rejected")));
-    await hostHandlers.get("tool_result")!({
-      toolCallId: "repaired-native-tests",
-      toolName: "bash",
-      input: { command: "node --import tsx --test test/execution-controller.test.ts" },
-      isError: false,
-    }, context);
-    const repairedCandidate = await new RealGitWorktreeAdapter().captureCandidate({
-      path: repo.root,
-      sourceBase: repo.head,
-    });
-    assert.notEqual(repairedCandidate.codeStateDigest, candidate.codeStateDigest);
-    await hostHandlers.get("agent_settled")!({}, context);
-    await assert.rejects(
-      nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, {
-        sessionId: "native-session",
-        codeStateDigest: repairedCandidate.codeStateDigest,
-      }),
-      /ENOENT/,
-    );
-    const omittedDirtyScopeReview = await launchReview({
+    await assert.rejects(readAsyncReviewEvidence(harness, await asyncReviewCandidate(harness)), /ENOENT/);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("dirty asynchronous review scope survives a content-identical commit but not a changed source base", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness();
+  try {
+    await writeFile(join(harness.repo.root, "README.md"), "project\nrepaired\n");
+    await harness.recordPassingTests();
+    const candidate = await asyncReviewCandidate(harness);
+
+    const omittedScope = await harness.launchReview({
       runId: "omitted-dirty-scope-run",
       toolCallId: "omitted-dirty-scope-tool",
       completionOwnerId: "omitted-dirty-scope-owner",
     });
-    events.emit("subagent:async-complete", omittedDirtyScopeReview.completion);
-    await hostHandlers.get("agent_settled")!({}, context);
-    const omittedDirtyScopeLifecycle = JSON.parse(await readFile(join(bridgeDirectory, "lifecycle.json"), "utf8")) as {
-      outstandingJobs: string[];
-    };
-    assert.ok(omittedDirtyScopeLifecycle.outstandingJobs.some((job): boolean =>
+    await harness.completeAndSettle(omittedScope.completion);
+    const omittedLifecycle = await harness.readLifecycle();
+    assert.ok(omittedLifecycle.outstandingJobs.some((job): boolean =>
       job.includes("omitted-dirty-scope-run:review-rejected")));
-    const repairedReview = await launchReview({
+
+    const fullScope = await harness.launchReview({
       runId: "repaired-candidate-run",
       toolCallId: "repaired-candidate-tool",
       completionOwnerId: "repaired-candidate-owner",
       dirtyScope: true,
     });
-    events.emit("subagent:async-complete", repairedReview.completion);
-    await hostHandlers.get("agent_settled")!({}, context);
-    const repairedRecords = await nativeEvidenceModule.readProducedNativeEvidence(
-      latestEvidencePath,
-      { sessionId: "native-session", codeStateDigest: repairedCandidate.codeStateDigest },
-    );
-    assert.deepEqual(repairedRecords.map((record): string => record.kind).sort(), ["reviews", "tests"]);
-    for (const record of repairedRecords) {
-      await new nativeEvidenceModule.FileNativeEvidenceAdapter().verify({ record, candidate: repairedCandidate });
-    }
-    git(repo.root, "add", "README.md");
-    git(repo.root, "commit", "-qm", "commit reviewed content");
-    const committedReviewedCandidate = await new RealGitWorktreeAdapter().captureCandidate({
-      path: repo.root,
-      sourceBase: repo.head,
-    });
-    assert.equal(committedReviewedCandidate.codeStateDigest, repairedCandidate.codeStateDigest);
-    assert.notEqual(committedReviewedCandidate.head, repairedCandidate.head);
-    for (const record of repairedRecords) {
-      await new nativeEvidenceModule.FileNativeEvidenceAdapter().verify({ record, candidate: committedReviewedCandidate });
-    }
-    const reviewRecord = repairedRecords.find((record): boolean => record.kind === "reviews")!;
+    await harness.completeAndSettle(fullScope.completion);
+    const records = await readAsyncReviewEvidence(harness, candidate);
+    for (const record of records) await new FileNativeEvidenceAdapter().verify({ record, candidate });
+
+    git(harness.repo.root, "add", "README.md");
+    git(harness.repo.root, "commit", "-qm", "commit reviewed content");
+    const committedCandidate = await asyncReviewCandidate(harness);
+    assert.equal(committedCandidate.codeStateDigest, candidate.codeStateDigest);
+    assert.notEqual(committedCandidate.head, candidate.head);
+    for (const record of records) await new FileNativeEvidenceAdapter().verify({ record, candidate: committedCandidate });
+    const reviewRecord = records.find((record): boolean => record.kind === "reviews")!;
     await assert.rejects(
-      new nativeEvidenceModule.FileNativeEvidenceAdapter().verify({
+      new FileNativeEvidenceAdapter().verify({
         record: reviewRecord,
-        candidate: { ...committedReviewedCandidate, sourceBase: committedReviewedCandidate.head },
+        candidate: { ...committedCandidate, sourceBase: committedCandidate.head },
       }),
       /candidate-mismatched/,
     );
+  } finally {
+    await harness.dispose();
+  }
+});
 
-    const foreignReport = join(bridgeDirectory, "foreign-report.md");
-    const symlinkedReport = join(artifactRoot, "symlinked-report.md");
+interface RejectedAsyncReviewArrangement {
+  input: AsyncReviewFixtureInput;
+  mutateCompletion?: (completion: Record<string, unknown>) => void;
+}
+
+async function assertAsyncReviewRejected(
+  arrange: (harness: AsyncReviewHarness) => Promise<RejectedAsyncReviewArrangement> | RejectedAsyncReviewArrangement,
+): Promise<void> {
+  const harness = await createAsyncReviewHarness();
+  try {
+    await harness.recordPassingTests();
+    const arrangement = await arrange(harness);
+    const fixture = await harness.launchReview(arrangement.input);
+    arrangement.mutateCompletion?.(fixture.completion);
+
+    await harness.completeAndSettle(fixture.completion);
+
+    const lifecycle = await harness.readLifecycle();
+    assert.ok(lifecycle.outstandingJobs.some((job): boolean =>
+      job.startsWith("native-evidence-terminal-failure:") && job.includes(arrangement.input.runId)));
+    await assert.rejects(readAsyncReviewEvidence(harness, await asyncReviewCandidate(harness)), /ENOENT/);
+  } finally {
+    await harness.dispose();
+  }
+}
+
+test("asynchronous reviews reject reports outside producer artifact roots", async (): Promise<void> => {
+  await assertAsyncReviewRejected(async (harness): Promise<RejectedAsyncReviewArrangement> => {
+    const foreignReport = join(harness.bridgeDirectory, "foreign-report.md");
     await writeFile(foreignReport, "## Review\nNo issues found.\n\nMerge verdict: OK\n");
-    await symlink(foreignReport, symlinkedReport);
-    const rejectedInputs = [
-      {
-        runId: "blocking-async-review-run",
-        toolCallId: "blocking-async-review-tool",
-        completionOwnerId: "blocking-completion-owner",
-        blocking: true,
-      },
-      {
+    return {
+      input: {
         runId: "foreign-artifact-review-run",
         toolCallId: "foreign-artifact-review-tool",
         completionOwnerId: "foreign-completion-owner",
         artifactOverride: foreignReport,
       },
-      {
+    };
+  });
+});
+
+test("asynchronous reviews reject symlinked reports", async (): Promise<void> => {
+  await assertAsyncReviewRejected(async (harness): Promise<RejectedAsyncReviewArrangement> => {
+    const foreignReport = join(harness.bridgeDirectory, "foreign-report.md");
+    const symlinkedReport = join(harness.artifactRoot, "symlinked-report.md");
+    await writeFile(foreignReport, "## Review\nNo issues found.\n\nMerge verdict: OK\n");
+    await symlink(foreignReport, symlinkedReport);
+    return {
+      input: {
         runId: "symlink-artifact-review-run",
         toolCallId: "symlink-artifact-review-tool",
         completionOwnerId: "symlink-completion-owner",
         artifactOverride: symlinkedReport,
       },
-      {
-        runId: "mismatched-async-artifact-review-run",
-        toolCallId: "mismatched-async-artifact-review-tool",
-        completionOwnerId: "mismatched-async-artifact-owner",
-        asyncArtifactOverride: piSubagentsTempRoot,
-      },
-      {
-        runId: "incomplete-review-run",
-        toolCallId: "incomplete-review-tool",
-        completionOwnerId: "incomplete-completion-owner",
-        incomplete: true,
-      },
-      {
-        runId: "stale-review-run",
-        toolCallId: "stale-review-tool",
-        completionOwnerId: "stale-completion-owner",
-        stale: true,
-      },
-      {
-        runId: "unrelated-review-run",
-        toolCallId: "unrelated-review-tool",
-        completionOwnerId: "unrelated-completion-owner",
-        unrelated: true,
-      },
-    ].map((input) => ({ ...input, dirtyScope: true }));
-    const rejectedFixtures: Array<Awaited<ReturnType<typeof workflowFixture>>> = [];
-    for (const input of rejectedInputs) {
-      await hostHandlers.get("tool_execution_start")!({
-        toolCallId: input.toolCallId,
-        toolName: "subagent",
-        args: { workflowScript: workflowScriptFor(dirtyReviewTasks) },
-      }, context);
-      const fixture = await workflowFixture(input);
-      if ("stale" in input) fixture.completion.timestamp = 0;
-      if ("unrelated" in input) fixture.completion.sessionId = "another-session";
-      rejectedFixtures.push(fixture);
-      await hostHandlers.get("tool_execution_end")!({
-        toolCallId: input.toolCallId,
-        toolName: "subagent",
-        isError: false,
-        result: {
-          details: {
-            mode: "workflow",
-            runId: input.runId,
-            toolCallId: input.toolCallId,
-            asyncId: input.runId,
-            asyncDir: fixture.asyncDir,
-            results: [],
-          },
-        },
-      }, context);
-      events.emit("subagent:async-complete", fixture.completion);
-      await hostHandlers.get("agent_settled")!({}, context);
-    }
-    const passingWhileRevocationBroken = await launchReview({
+    };
+  });
+});
+
+test("asynchronous reviews reject child artifact paths that do not identify the child run", async (): Promise<void> => {
+  await assertAsyncReviewRejected((harness): RejectedAsyncReviewArrangement => ({
+    input: {
+      runId: "mismatched-async-artifact-review-run",
+      toolCallId: "mismatched-async-artifact-review-tool",
+      completionOwnerId: "mismatched-async-artifact-owner",
+      asyncArtifactOverride: join(harness.bridgeDirectory, "pi-subagents-temp"),
+    },
+  }));
+});
+
+test("asynchronous reviews reject incomplete child inventory", async (): Promise<void> => {
+  await assertAsyncReviewRejected((): RejectedAsyncReviewArrangement => ({
+    input: {
+      runId: "incomplete-review-run",
+      toolCallId: "incomplete-review-tool",
+      completionOwnerId: "incomplete-completion-owner",
+      incomplete: true,
+    },
+  }));
+});
+
+test("asynchronous reviews reject stale completion timestamps", async (): Promise<void> => {
+  await assertAsyncReviewRejected((): RejectedAsyncReviewArrangement => ({
+    input: {
+      runId: "stale-review-run",
+      toolCallId: "stale-review-tool",
+      completionOwnerId: "stale-completion-owner",
+    },
+    mutateCompletion: (completion): void => { completion.timestamp = 0; },
+  }));
+});
+
+test("asynchronous reviews reject completion from another parent session", async (): Promise<void> => {
+  await assertAsyncReviewRejected((): RejectedAsyncReviewArrangement => ({
+    input: {
+      runId: "unrelated-review-run",
+      toolCallId: "unrelated-review-tool",
+      completionOwnerId: "unrelated-completion-owner",
+    },
+    mutateCompletion: (completion): void => { completion.sessionId = "another-session"; },
+  }));
+});
+
+test("asynchronous review evidence stays blocked through revocation I/O failure and recovers on a newer review", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness();
+  try {
+    await writeFile(join(harness.repo.root, "README.md"), "project\nrepaired\n");
+    await harness.recordPassingTests();
+    const candidate = await asyncReviewCandidate(harness);
+    const passingWhileBroken = await harness.launchReview({
       runId: "unresolved-revocation-run",
       toolCallId: "unresolved-revocation-tool",
       completionOwnerId: "unresolved-revocation-owner",
       dirtyScope: true,
     });
-    // A directory at the publication path forces unlink(2) revocation to fail while
-    // remaining unreadable as evidence. Even a valid review payload must stay blocked.
-    await mkdir(latestEvidencePath);
-    events.emit("subagent:async-complete", passingWhileRevocationBroken.completion);
-    let terminalFailures: string[] = [];
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      await hostHandlers.get("agent_settled")!({}, context);
-      const lifecycle = JSON.parse(await readFile(join(bridgeDirectory, "lifecycle.json"), "utf8")) as {
-        outstandingJobs: string[];
-      };
-      terminalFailures = lifecycle.outstandingJobs.filter((job): boolean =>
-        job.startsWith("native-evidence-terminal-failure:"));
-      if (terminalFailures.length === rejectedFixtures.length + 1 &&
-        !lifecycle.outstandingJobs.some((job): boolean => job.startsWith("native-async-review-capture:"))) break;
-      await new Promise((resolveWait): void => { setTimeout(resolveWait, 20); });
-    }
-    assert.equal(terminalFailures.length, rejectedFixtures.length + 1);
-    assert.ok(terminalFailures.some((failure): boolean =>
-      failure.includes("unresolved-revocation-run:revocation-failed") && failure.includes("revocation failed")));
-    await assert.rejects(
-      nativeEvidenceModule.readProducedNativeEvidence(
-        latestEvidencePath,
-        { sessionId: "native-session", codeStateDigest: repairedCandidate.codeStateDigest },
-      ),
-      /bounded regular file/,
-    );
-    for (const record of records) await new nativeEvidenceModule.FileNativeEvidenceAdapter().verify({ record, candidate });
+    await mkdir(harness.evidenceDirectory, { recursive: true });
+    await mkdir(harness.latestEvidencePath);
 
-    await rm(latestEvidencePath, { recursive: true });
-    const infrastructureRecovery = await launchReview({
+    await harness.completeAndSettle(passingWhileBroken.completion);
+
+    const blockedLifecycle = await harness.readLifecycle();
+    assert.ok(blockedLifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("unresolved-revocation-run:revocation-failed") && job.includes("revocation failed")));
+    await assert.rejects(readAsyncReviewEvidence(harness, candidate), /bounded regular file/);
+
+    await rm(harness.latestEvidencePath, { recursive: true });
+    const recovery = await harness.launchReview({
       runId: "infrastructure-recovery-run",
       toolCallId: "infrastructure-recovery-tool",
       completionOwnerId: "infrastructure-recovery-owner",
       dirtyScope: true,
     });
-    events.emit("subagent:async-complete", infrastructureRecovery.completion);
-    await hostHandlers.get("agent_settled")!({}, context);
-    const recoveredRecords = await nativeEvidenceModule.readProducedNativeEvidence(
-      latestEvidencePath,
-      { sessionId: "native-session", codeStateDigest: repairedCandidate.codeStateDigest },
-    );
-    assert.deepEqual(recoveredRecords.map((record): string => record.kind).sort(), ["reviews", "tests"]);
-    const recoveredLifecycle = JSON.parse(await readFile(join(bridgeDirectory, "lifecycle.json"), "utf8")) as {
-      outstandingJobs: string[];
-    };
+    await harness.completeAndSettle(recovery.completion);
+
+    const records = await readAsyncReviewEvidence(harness, candidate);
+    const recoveredLifecycle = await harness.readLifecycle();
+    assert.deepEqual(records.map((record): string => record.kind).sort(), ["reviews", "tests"]);
     assert.equal(recoveredLifecycle.outstandingJobs.some((job): boolean =>
       job.startsWith("native-evidence-terminal-failure:")), false);
   } finally {
-    if (evidencePermissionsRestricted) await chmod(evidenceDirectory, 0o700);
-    if (previousEndpoint === undefined) delete process.env.HERDR_WORKER_BRIDGE_ENDPOINT;
-    else process.env.HERDR_WORKER_BRIDGE_ENDPOINT = previousEndpoint;
-    if (previousNonce === undefined) delete process.env.HERDR_WORKER_BRIDGE_NONCE;
-    else process.env.HERDR_WORKER_BRIDGE_NONCE = previousNonce;
-    if (previousPiSubagentsTempRoot === undefined) delete process.env.PI_SUBAGENTS_TEMP_ROOT;
-    else process.env.PI_SUBAGENTS_TEMP_ROOT = previousPiSubagentsTempRoot;
+    await harness.dispose();
   }
 });
 

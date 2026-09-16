@@ -7,12 +7,13 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 import { promisify } from "node:util";
 
 import { StringEnum } from "@earendil-works/pi-ai";
-import type {
-  AgentToolResult,
-  AgentToolUpdateCallback,
-  ExtensionAPI,
-  ExtensionCommandContext,
-  ExtensionContext,
+import {
+  CONFIG_DIR_NAME,
+  type AgentToolResult,
+  type AgentToolUpdateCallback,
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 
@@ -77,6 +78,8 @@ interface PendingSubagentLaunch {
   sourceSessionId: string;
   sourceSessionFile?: string;
   sourceSessionIdentities: Set<string>;
+  producerSessionRoot?: string;
+  producerSessionRootError?: string;
   codeStateDigest: string;
   launchHead: string;
   launchStatusDigest: string;
@@ -289,13 +292,19 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
       const sourceSessionId = ctx.sessionManager.getSessionId();
       if (sourceSessionId) {
         const sessionFile = ctx.sessionManager.getSessionFile?.();
-        const launchGit = await captureReviewLaunchGitState(ctx.cwd, looksLikeReviewRequest(event.args));
+        const asyncReviewRequested = looksLikeReviewRequest(event.args);
+        const launchGit = await captureReviewLaunchGitState(ctx.cwd, asyncReviewRequested);
+        const producerSessionRoot = asyncReviewRequested
+          ? await resolveProducerSessionRoot(event.args, sessionFile)
+          : {};
         pendingSubagentLaunches.set(event.toolCallId, {
           toolCallId: event.toolCallId,
           cwd: ctx.cwd,
           sourceSessionId,
           ...(sessionFile ? { sourceSessionFile: sessionFile } : {}),
           sourceSessionIdentities: new Set([sourceSessionId, ...(sessionFile ? [sessionFile] : [])]),
+          ...(producerSessionRoot.root ? { producerSessionRoot: producerSessionRoot.root } : {}),
+          ...(producerSessionRoot.error ? { producerSessionRootError: producerSessionRoot.error } : {}),
           codeStateDigest: launchGit.codeStateDigest,
           launchHead: launchGit.head,
           launchStatusDigest: launchGit.statusDigest,
@@ -913,6 +922,65 @@ function isAsyncLaunchLike(value: unknown): boolean {
   return Boolean(details && typeof details.runId === "string" && Array.isArray(details.results) && details.results.length === 0);
 }
 
+async function resolveProducerSessionRoot(
+  args: unknown,
+  sourceSessionFile: string | undefined,
+): Promise<{ root?: string; error?: string }> {
+  try {
+    const explicitSessionDir = objectRecord(args)?.sessionDir;
+    if (explicitSessionDir !== undefined) {
+      return { root: resolveProducerPath(explicitSessionDir, "sessionDir") };
+    }
+    const defaultSessionDir = await readProducerDefaultSessionDir();
+    if (defaultSessionDir !== undefined) {
+      return { root: resolveProducerPath(defaultSessionDir, "defaultSessionDir") };
+    }
+    if (!sourceSessionFile || !isAbsolute(sourceSessionFile)) {
+      throw new Error("Asynchronous native review source session root was unavailable");
+    }
+    return { root: resolve(join(dirname(sourceSessionFile), basename(sourceSessionFile, ".jsonl"))) };
+  } catch (error) {
+    return { error: boundedDiagnostic(error instanceof Error ? error.message : String(error)) };
+  }
+}
+
+async function readProducerDefaultSessionDir(): Promise<string | undefined> {
+  const agentDirectory = producerAgentDirectory();
+  const configPath = join(agentDirectory, "extensions", "subagent", "config.json");
+  let configFile: { content: string };
+  try {
+    configFile = await readCanonicalBoundedFile(configPath, [agentDirectory], 256 * 1024);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new Error(`Could not validate the installed pi-subagents configuration: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const config = parseJsonRecord(configFile);
+  if (!config) throw new Error("Installed pi-subagents configuration was not a JSON object");
+  if (config.defaultSessionDir === undefined) return undefined;
+  if (typeof config.defaultSessionDir !== "string") {
+    throw new Error("Installed pi-subagents defaultSessionDir was not a supported path");
+  }
+  return config.defaultSessionDir;
+}
+
+function producerAgentDirectory(): string {
+  const home = process.env.HOME || process.env.USERPROFILE || homedir();
+  const configured = process.env.PI_CODING_AGENT_DIR;
+  if (configured === "~") return resolve(home);
+  if (configured?.startsWith("~/") || configured?.startsWith("~\\")) {
+    return resolve(home, configured.slice(2));
+  }
+  return resolve(configured ?? join(home, CONFIG_DIR_NAME, "agent"));
+}
+
+function resolveProducerPath(value: unknown, field: "sessionDir" | "defaultSessionDir"): string {
+  if (typeof value !== "string" || value.trim().length === 0 || value.length > 32 * 1024 || value.includes("\0")) {
+    throw new Error(`Installed pi-subagents ${field} was not a supported path`);
+  }
+  const expanded = value.startsWith("~/") ? join(homedir(), value.slice(2)) : value;
+  return resolve(expanded);
+}
+
 function parseAsyncLaunchResult(value: unknown): { runId: string; toolCallId: string; mode: "workflow"; asyncDir: string } | undefined {
   const details = objectRecord(objectRecord(value)?.details);
   if (!details || details.mode !== "workflow" || typeof details.runId !== "string" ||
@@ -970,6 +1038,8 @@ async function retainAsyncNativeReview(
   if (!status || !receipt || status.runId !== launch.runId || status.toolCallId !== launch.toolCallId ||
     status.mode !== "workflow" || status.state !== "complete" || status.cwd !== launch.cwd ||
     status.sessionId !== completion.sessionId || status.completionOwnerId !== completion.completionOwnerId ||
+    launch.producerSessionRootError || !launch.producerSessionRoot || typeof status.sessionRoot !== "string" ||
+    resolve(status.sessionRoot) !== launch.producerSessionRoot ||
     status.workflowReceiptPath !== receiptPath || !Number.isFinite(status.endedAt) ||
     Number(status.endedAt) < launch.launchedAt || Number(status.endedAt) > timestamp ||
     receipt.version !== 1 || receipt.workflowRunId !== launch.runId || receipt.state !== "complete" ||
@@ -994,8 +1064,10 @@ async function retainAsyncNativeReview(
     results.set(result.workflowKey, result);
   }
 
-  if (!launch.sourceSessionFile) throw new Error("Asynchronous native review source session root was unavailable");
-  const sessionRoot = join(dirname(launch.sourceSessionFile), basename(launch.sourceSessionFile, ".jsonl"));
+  if (!launch.sourceSessionFile || !launch.producerSessionRoot) {
+    throw new Error(launch.producerSessionRootError ?? "Asynchronous native review source session root was unavailable");
+  }
+  const sessionRoot = await assertCanonicalDirectory(launch.producerSessionRoot, launch.producerSessionRoot);
   const outputRoots = [
     launch.asyncDir,
     join(dirname(launch.sourceSessionFile), "subagent-artifacts"),
@@ -1050,6 +1122,10 @@ async function retainAsyncNativeReview(
       throw new Error("Asynchronous native review child artifact did not identify its installed async run");
     }
     await assertCanonicalDirectory(artifactPaths.outputPath, join(piSubagentsTempRoot(), "async-subagent-runs"));
+    const expectedSessionFile = join(sessionRoot, childRunId, "run-0", "session.jsonl");
+    if (resolve(step.sessionFile) !== expectedSessionFile) {
+      throw new Error("Asynchronous native review child session did not match its configured root and run identity");
+    }
     const session = await readCanonicalBoundedFile(step.sessionFile, [sessionRoot], 16 * 1024 * 1024);
     const task = parseFreshReviewerTask(session.content, launch);
     const role = reviewRoleFromTask(task);
