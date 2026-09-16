@@ -36,7 +36,11 @@ import { registerHerdrExtension } from "../src/extension.js";
 import { FileWorkerBridgeTransport } from "../src/file-worker-bridge.js";
 import { LocalControllerDaemon, UnixControllerClient } from "../src/local-daemon.js";
 import { FileNativeEvidenceAdapter } from "../src/native-evidence.js";
-import { NATIVE_EVIDENCE_STATE_FILE } from "../src/native-evidence-state.js";
+import {
+  NATIVE_EVIDENCE_STATE_FILE,
+  readNativeEvidenceState,
+  type NativeEvidenceState,
+} from "../src/native-evidence-state.js";
 import { digest } from "../src/policy.js";
 import type {
   WorkerBridgeChannel,
@@ -1591,6 +1595,9 @@ interface DirectEvidenceHarness {
   readLifecycle: () => Promise<WorkerLifecycleReceipt>;
   settle: () => Promise<void>;
   reload: () => Promise<void>;
+  recreateRuntime: () => Promise<void>;
+  setAppendEntryFailure: (enabled: boolean) => void;
+  setPassedAppendFailure: (enabled: boolean) => void;
   restrictEvidenceWrites: () => Promise<void>;
   restoreEvidenceWrites: () => Promise<void>;
   assertPublicAcceptanceBlocked: (records: ProducedNativeEvidence) => Promise<void>;
@@ -1625,6 +1632,8 @@ async function createDirectEvidenceHarness(): Promise<DirectEvidenceHarness> {
   const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
   const eventHandlers = new Map<string, Array<(payload: unknown) => void>>();
   const sessionEntries: Array<{ type: "custom"; customType: string; data: unknown }> = [];
+  let appendEntryFailure = false;
+  let passedAppendFailure = false;
   const events = {
     on(name: string, handler: (payload: unknown) => void): () => void {
       const handlers = eventHandlers.get(name) ?? [];
@@ -1659,6 +1668,11 @@ async function createDirectEvidenceHarness(): Promise<DirectEvidenceHarness> {
     registerCommand(): void {},
     registerTool(tool: { name: string; execute: (...args: any[]) => Promise<any> }): void { tools.set(tool.name, tool); },
     appendEntry(customType: string, data: unknown): void {
+      const state = data as Partial<NativeEvidenceState>;
+      if (appendEntryFailure || (passedAppendFailure && Object.values(state.obligations ?? {}).length === 2 &&
+        Object.values(state.obligations ?? {}).every((obligation): boolean => obligation.status === "passed"))) {
+        throw new Error("session append unavailable");
+      }
       sessionEntries.push({ type: "custom", customType, data: structuredClone(data) });
     },
     getAllTools: (): Array<{ name: string }> => [{ name: "subagent" }],
@@ -1813,6 +1827,19 @@ async function createDirectEvidenceHarness(): Promise<DirectEvidenceHarness> {
     await hostHandlers.get("session_start")!({ reason: "reload" }, context);
     await settle();
   };
+  const recreateRuntime = async (): Promise<void> => {
+    hostHandlers.clear();
+    tools.clear();
+    herdrWorkerBridge(fakePi);
+    await hostHandlers.get("session_start")!({ reason: "reload" }, context);
+    await settle();
+  };
+  const setAppendEntryFailure = (enabled: boolean): void => {
+    appendEntryFailure = enabled;
+  };
+  const setPassedAppendFailure = (enabled: boolean): void => {
+    passedAppendFailure = enabled;
+  };
   const restrictEvidenceWrites = async (): Promise<void> => {
     await chmod(evidenceDirectory, 0o500);
     evidencePermissionsRestricted = true;
@@ -1864,6 +1891,9 @@ async function createDirectEvidenceHarness(): Promise<DirectEvidenceHarness> {
     readLifecycle,
     settle,
     reload,
+    recreateRuntime,
+    setAppendEntryFailure,
+    setPassedAppendFailure,
     restrictEvidenceWrites,
     restoreEvidenceWrites,
     assertPublicAcceptanceBlocked,
@@ -1940,6 +1970,23 @@ test("direct successful test and review events publish candidate-bound immutable
     for (const record of records) {
       await new FileNativeEvidenceAdapter().verify({ record, candidate: harness.candidate });
     }
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("runtime recreation rejects passing evidence from the previous lifecycle generation", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  try {
+    const cachedRecords = await harness.publishPassingEvidence();
+
+    await harness.recreateRuntime();
+
+    const cachedTest = cachedRecords.find((record): boolean => record.kind === "tests")!;
+    await assert.rejects(
+      new FileNativeEvidenceAdapter().verify({ record: cachedTest, candidate: harness.candidate }),
+      /stale|lifecycle|obligation/i,
+    );
   } finally {
     await harness.dispose();
   }
@@ -2107,6 +2154,231 @@ test("a failed test obligation survives reload and rejects cached evidence", asy
   }
 });
 
+test("a session append failure immediately rejects earlier passing test evidence", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  try {
+    const cachedRecords = await harness.publishPassingEvidence();
+    harness.setAppendEntryFailure(true);
+
+    await harness.completeBash("append-failed-test", "node --import tsx --test test/execution-controller.test.ts", true);
+
+    const cachedTest = cachedRecords.find((record): boolean => record.kind === "tests")!;
+    await assert.rejects(
+      new FileNativeEvidenceAdapter().verify({ record: cachedTest, candidate: harness.candidate }),
+      /stale|lifecycle|obligation/i,
+    );
+  } finally {
+    harness.setAppendEntryFailure(false);
+    await harness.dispose();
+  }
+});
+
+test("a session append failure blocks controller acceptance immediately", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  try {
+    const cachedRecords = await harness.publishPassingEvidence();
+    harness.setAppendEntryFailure(true);
+
+    await harness.completeBash("append-failed-controller-test", "node --import tsx --test test/execution-controller.test.ts", true);
+    await harness.settle();
+
+    await harness.assertPublicAcceptanceBlocked(cachedRecords);
+  } finally {
+    harness.setAppendEntryFailure(false);
+    await harness.dispose();
+  }
+});
+
+test("a newer sidecar pending state is not overwritten by an older session pass", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  const statePath = join(harness.repo.root, ".git", "herdr", "native-producer", NATIVE_EVIDENCE_STATE_FILE);
+  try {
+    await harness.publishPassingEvidence();
+    harness.setAppendEntryFailure(true);
+    await harness.completeBash("append-failed-recreated-test", "node --import tsx --test test/execution-controller.test.ts", true);
+    const pending = await readNativeEvidenceState(statePath);
+
+    await harness.recreateRuntime();
+
+    const restored = await readNativeEvidenceState(statePath);
+    assert.deepEqual(restored.obligations.tests, {
+      sequence: pending.obligations.tests.sequence,
+      status: "pending",
+    });
+  } finally {
+    harness.setAppendEntryFailure(false);
+    await harness.dispose();
+  }
+});
+
+test("a session append failure blocks controller acceptance after runtime recreation", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  try {
+    const cachedRecords = await harness.publishPassingEvidence();
+    harness.setAppendEntryFailure(true);
+    await harness.completeBash("append-failed-recreated-controller-test", "node --import tsx --test test/execution-controller.test.ts", true);
+
+    await harness.recreateRuntime();
+
+    await harness.assertPublicAcceptanceBlocked(cachedRecords);
+  } finally {
+    harness.setAppendEntryFailure(false);
+    await harness.dispose();
+  }
+});
+
+test("a failed passed-state append leaves the obligation pending", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  try {
+    const cachedRecords = await harness.publishPassingEvidence();
+    harness.setPassedAppendFailure(true);
+
+    await harness.completeBash("passed-state-append-failure", "node --import tsx --test test/execution-controller.test.ts", false);
+
+    const cachedTest = cachedRecords.find((record): boolean => record.kind === "tests")!;
+    await assert.rejects(
+      new FileNativeEvidenceAdapter().verify({ record: cachedTest, candidate: harness.candidate }),
+      /stale|lifecycle|obligation/i,
+    );
+  } finally {
+    harness.setPassedAppendFailure(false);
+    await harness.dispose();
+  }
+});
+
+test("newer test proof recovers after a failed passed-state append", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  try {
+    await harness.publishPassingEvidence();
+    harness.setPassedAppendFailure(true);
+    await harness.completeBash("passed-state-append-failure", "node --import tsx --test test/execution-controller.test.ts", false);
+    harness.setPassedAppendFailure(false);
+
+    await harness.completeBash("passed-state-append-recovery", "node --import tsx --test test/execution-controller.test.ts", false);
+    await harness.settle();
+
+    const records = await harness.readEvidence();
+    assert.deepEqual(records.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+  } finally {
+    harness.setPassedAppendFailure(false);
+    await harness.dispose();
+  }
+});
+
+test("a sidecar write failure immediately rejects earlier passing test evidence", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  const statePath = join(harness.repo.root, ".git", "herdr", "native-producer", NATIVE_EVIDENCE_STATE_FILE);
+  try {
+    const cachedRecords = await harness.publishPassingEvidence();
+    await rm(statePath);
+    await mkdir(statePath);
+
+    await harness.completeBash("sidecar-failed-test", "node --import tsx --test test/execution-controller.test.ts", true);
+
+    const cachedTest = cachedRecords.find((record): boolean => record.kind === "tests")!;
+    await assert.rejects(
+      new FileNativeEvidenceAdapter().verify({ record: cachedTest, candidate: harness.candidate }),
+      /bounded regular file|obligation state/i,
+    );
+  } finally {
+    await rm(statePath, { recursive: true, force: true });
+    await harness.dispose();
+  }
+});
+
+test("a newer session pending test state survives sidecar failure and runtime recreation", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  const statePath = join(harness.repo.root, ".git", "herdr", "native-producer", NATIVE_EVIDENCE_STATE_FILE);
+  try {
+    const cachedRecords = await harness.publishPassingEvidence();
+    await rm(statePath);
+    await mkdir(statePath);
+    await harness.completeBash("sidecar-failed-recreated-test", "node --import tsx --test test/execution-controller.test.ts", true);
+    await rm(statePath, { recursive: true });
+
+    await harness.recreateRuntime();
+
+    const cachedTest = cachedRecords.find((record): boolean => record.kind === "tests")!;
+    await assert.rejects(
+      new FileNativeEvidenceAdapter().verify({ record: cachedTest, candidate: harness.candidate }),
+      /stale|lifecycle|obligation/i,
+    );
+  } finally {
+    await rm(statePath, { recursive: true, force: true });
+    await harness.dispose();
+  }
+});
+
+test("restored session append I/O allows fresh same-generation evidence recovery", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  try {
+    await harness.publishPassingEvidence();
+    harness.setAppendEntryFailure(true);
+    await harness.completeBash("append-failed-recovery-test", "node --import tsx --test test/execution-controller.test.ts", true);
+    await harness.recreateRuntime();
+    harness.setAppendEntryFailure(false);
+
+    await harness.completeBash("append-recovered-test", "node --import tsx --test test/execution-controller.test.ts", false);
+    await harness.completeReview("append-recovered-review", "passed");
+    await harness.settle();
+
+    const records = await harness.readEvidence();
+    assert.deepEqual(records.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+  } finally {
+    harness.setAppendEntryFailure(false);
+    await harness.dispose();
+  }
+});
+
+test("same-sequence pending and passed store conflict restores as pending", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  const statePath = join(harness.repo.root, ".git", "herdr", "native-producer", NATIVE_EVIDENCE_STATE_FILE);
+  try {
+    await harness.publishPassingEvidence();
+    const priorPassed = await readNativeEvidenceState(statePath);
+    await harness.completeBash("conflicting-test-state", "node --import tsx --test test/execution-controller.test.ts", true);
+    const pending = await readNativeEvidenceState(statePath);
+    const conflictingPassed: NativeEvidenceState = structuredClone(pending);
+    const proof = structuredClone(priorPassed.obligations.tests.proof!);
+    proof.sequence = pending.obligations.tests.sequence;
+    conflictingPassed.obligations.tests = {
+      sequence: pending.obligations.tests.sequence,
+      status: "passed",
+      proof,
+    };
+    await writeFile(statePath, `${JSON.stringify(conflictingPassed)}\n`);
+
+    await harness.recreateRuntime();
+
+    const restored = await readNativeEvidenceState(statePath);
+    assert.deepEqual(restored.obligations.tests, {
+      sequence: pending.obligations.tests.sequence,
+      status: "pending",
+    });
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("a malformed sidecar rejects cached evidence after runtime recreation", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  const statePath = join(harness.repo.root, ".git", "herdr", "native-producer", NATIVE_EVIDENCE_STATE_FILE);
+  try {
+    const cachedRecords = await harness.publishPassingEvidence();
+    await writeFile(statePath, "{malformed\n");
+
+    await harness.recreateRuntime();
+
+    const cachedTest = cachedRecords.find((record): boolean => record.kind === "tests")!;
+    await assert.rejects(
+      new FileNativeEvidenceAdapter().verify({ record: cachedTest, candidate: harness.candidate }),
+      /stale|lifecycle|obligation/i,
+    );
+  } finally {
+    await harness.dispose();
+  }
+});
+
 test("a successful test rerun recovers the persisted test obligation after reload", async (): Promise<void> => {
   const harness = await createDirectEvidenceHarness();
   try {
@@ -2115,6 +2387,7 @@ test("a successful test rerun recovers the persisted test obligation after reloa
     await harness.reload();
 
     await harness.completeBash("successful-test-rerun", "node --import tsx --test test/execution-controller.test.ts", false);
+    await harness.completeReview("fresh-review-after-reload", "passed");
     await harness.settle();
 
     await harness.readEvidence();
@@ -2960,6 +3233,7 @@ test("a blocking review remains durable across reload until newer same-obligatio
       /stale|lifecycle|obligation/i,
     );
 
+    await harness.recordPassingTests();
     const recovery = await harness.launchReview({
       runId: "reload-review-recovery-run",
       toolCallId: "reload-review-recovery-tool",

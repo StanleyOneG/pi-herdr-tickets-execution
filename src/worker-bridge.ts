@@ -25,7 +25,9 @@ import {
   NATIVE_EVIDENCE_STATE_ENTRY,
   NATIVE_EVIDENCE_STATE_FILE,
   isNativeEvidenceState,
+  readNativeEvidenceState,
   type NativeEvidenceObligation,
+  type NativeEvidenceObligationState,
   type NativeEvidenceProofState,
   type NativeEvidenceState,
 } from "./native-evidence-state.js";
@@ -175,12 +177,23 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
       sequence,
     });
   };
-  const writeNativeEvidenceState = async (next: NativeEvidenceState): Promise<void> => {
-    pi.appendEntry(NATIVE_EVIDENCE_STATE_ENTRY, structuredClone(next));
-    const statePath = nativeEvidenceStatePath();
-    await mkdir(dirname(statePath), { recursive: true, mode: 0o700 });
-    await atomicWritePrivateFile(statePath, `${JSON.stringify(next)}\n`);
-    nativeEvidenceState = structuredClone(next);
+  const writeNativeEvidenceStateStores = async (next: NativeEvidenceState): Promise<void> => {
+    const failures: unknown[] = [];
+    try {
+      pi.appendEntry(NATIVE_EVIDENCE_STATE_ENTRY, structuredClone(next));
+    } catch (error) {
+      failures.push(error);
+    }
+    try {
+      const statePath = nativeEvidenceStatePath();
+      await mkdir(dirname(statePath), { recursive: true, mode: 0o700 });
+      await atomicWritePrivateFile(statePath, `${JSON.stringify(next)}\n`);
+    } catch (error) {
+      failures.push(error);
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, "Native evidence obligation state was not persisted to every durable store");
+    }
   };
   const enqueueStateWrite = async <T>(operation: () => Promise<T>): Promise<T> => {
     const result = stateWriteQueue.then(operation);
@@ -188,7 +201,10 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     return result;
   };
   const persistNativeEvidenceState = (next: NativeEvidenceState): Promise<void> =>
-    enqueueStateWrite((): Promise<void> => writeNativeEvidenceState(next));
+    enqueueStateWrite(async (): Promise<void> => {
+      nativeEvidenceState = structuredClone(next);
+      await writeNativeEvidenceStateStores(next);
+    });
   const transitionObligation = (
     obligation: NativeEvidenceObligation,
     sequence: number,
@@ -200,18 +216,40 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     next.obligations[obligation] = status === "passed" && proof
       ? { sequence, status, proof: structuredClone(proof) }
       : { sequence, status: "pending" };
-    try {
-      await writeNativeEvidenceState(next);
-    } catch (error) {
-      if (status === "passed") {
-        const blocked = structuredClone(next);
-        blocked.obligations[obligation] = { sequence, status: "pending" };
-        nativeEvidenceState = blocked;
-        try {
-          pi.appendEntry(NATIVE_EVIDENCE_STATE_ENTRY, structuredClone(blocked));
-        } catch {
-          // The in-memory pending state still blocks publication for the rest of this process.
+    if (status === "pending") {
+      nativeEvidenceState = structuredClone(next);
+      try {
+        await unlink(nativeEvidenceStatePath());
+      } catch (error) {
+        if (!isMissingFileError(error)) {
+          try {
+            await writeNativeEvidenceStateStores(next);
+            nativeEvidenceState = structuredClone(next);
+            return true;
+          } catch (writeError) {
+            throw new AggregateError(
+              [error, writeError],
+              "Pending native evidence could not invalidate or replace the previous sidecar",
+            );
+          }
         }
+      }
+    }
+    try {
+      await writeNativeEvidenceStateStores(next);
+      nativeEvidenceState = structuredClone(next);
+    } catch (error) {
+      if (status !== "passed") throw error;
+      const blocked = structuredClone(next);
+      blocked.obligations[obligation] = { sequence, status: "pending" };
+      nativeEvidenceState = structuredClone(blocked);
+      try {
+        await writeNativeEvidenceStateStores(blocked);
+      } catch (blockingError) {
+        throw new AggregateError(
+          [error, blockingError],
+          "Passed native evidence could not be published and its pending fallback was not persisted to every durable store",
+        );
       }
       throw error;
     }
@@ -379,50 +417,83 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     failedBashCommand = false;
     mutationToolUsed = false;
     isAgentRunning = false;
+    const restoreFailures: unknown[] = [];
+    const sessionId = ctx.sessionManager.getSessionId();
+    const persistedStates: NativeEvidenceState[] = [];
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (entry.type !== "custom" || entry.customType !== NATIVE_EVIDENCE_STATE_ENTRY) continue;
+      if (!isNativeEvidenceState(entry.data)) {
+        restoreFailures.push(new Error("Persisted native evidence obligation state is malformed"));
+        continue;
+      }
+      if (entry.data.sessionId === sessionId) persistedStates.push(structuredClone(entry.data));
+    }
+    let statePath: string | undefined;
     try {
-      const sessionId = ctx.sessionManager.getSessionId();
-      let restored: NativeEvidenceState | undefined;
-      for (const entry of ctx.sessionManager.getBranch()) {
-        if (entry.type !== "custom" || entry.customType !== NATIVE_EVIDENCE_STATE_ENTRY) continue;
-        if (!isNativeEvidenceState(entry.data)) throw new Error("Persisted native evidence obligation state is malformed");
-        if (entry.data.sessionId === sessionId) restored = structuredClone(entry.data);
-      }
-      if (restored) {
-        const statePath = nativeEvidenceStatePath();
-        await mkdir(dirname(statePath), { recursive: true, mode: 0o700 });
-        await atomicWritePrivateFile(statePath, `${JSON.stringify(restored)}\n`);
-        nativeEvidenceState = restored;
-      } else {
-        await persistNativeEvidenceState({
-          schemaVersion: 1,
-          producer: "herdr-worker-bridge",
-          sessionId,
-          generation: randomUUID(),
-          obligations: {
-            tests: { sequence: 0, status: "required" },
-            reviews: { sequence: 0, status: "required" },
-          },
-        });
-      }
-      for (const obligation of ["tests", "reviews"] as const) {
-        const state = nativeEvidenceState!.obligations[obligation];
-        latestObligationSequence[obligation] = state.sequence;
-        nativeEvidenceSequence = Math.max(nativeEvidenceSequence, state.sequence);
-        if (state.status === "passed") {
-          nativeExecutions.set(`restored:${obligation}:${state.sequence}`, structuredClone(state.proof!));
-        } else if (state.status === "pending") {
-          recordTerminalEvidenceFailure(
-            `restored-${obligation}-${state.sequence}`,
-            "execution-failed",
-            obligation,
-            state.sequence,
-            `The persisted ${obligation} obligation has no newer valid proof`,
-          );
-        }
-      }
+      statePath = nativeEvidenceStatePath();
     } catch (error) {
-      recordTerminalEvidenceFailure("restore-tests", "persistence-failed", "tests", 0, error);
-      recordTerminalEvidenceFailure("restore-reviews", "persistence-failed", "reviews", 0, error);
+      restoreFailures.push(error);
+    }
+    if (statePath) {
+      try {
+        const sidecar = await readNativeEvidenceState(statePath);
+        if (sidecar.sessionId !== sessionId) {
+          restoreFailures.push(new Error("Native evidence obligation sidecar belongs to another session"));
+        } else {
+          persistedStates.push(sidecar);
+        }
+      } catch (error) {
+        if (!isMissingFileError(error)) restoreFailures.push(error);
+      }
+    }
+    try {
+      await revokePublishedNativeEvidence();
+    } catch (error) {
+      restoreFailures.push(error);
+    }
+    const reconciled = reconcileNativeEvidenceStates(persistedStates);
+    const forcePending = restoreFailures.length > 0;
+    // A reconstructed runtime cannot reuse proofs from the prior lifecycle generation.
+    const freshState: NativeEvidenceState = {
+      schemaVersion: 1,
+      producer: "herdr-worker-bridge",
+      sessionId,
+      generation: randomUUID(),
+      obligations: {
+        tests: rotateNativeEvidenceObligation(reconciled?.tests, forcePending),
+        reviews: rotateNativeEvidenceObligation(reconciled?.reviews, forcePending),
+      },
+    };
+    nativeEvidenceState = structuredClone(freshState);
+    for (const obligation of ["tests", "reviews"] as const) {
+      const state = freshState.obligations[obligation];
+      latestObligationSequence[obligation] = state.sequence;
+      nativeEvidenceSequence = Math.max(nativeEvidenceSequence, state.sequence);
+      if (state.status === "pending") {
+        recordTerminalEvidenceFailure(
+          `restored-${obligation}-${state.sequence}`,
+          "execution-failed",
+          obligation,
+          state.sequence,
+          `The persisted ${obligation} obligation has no newer valid proof`,
+        );
+      }
+    }
+    if (statePath) {
+      try {
+        await unlink(statePath);
+      } catch (error) {
+        if (!isMissingFileError(error)) restoreFailures.push(error);
+      }
+    }
+    try {
+      await persistNativeEvidenceState(freshState);
+    } catch (error) {
+      restoreFailures.push(error);
+    }
+    for (const [index, error] of restoreFailures.entries()) {
+      recordTerminalEvidenceFailure(`restore-tests-${index}`, "persistence-failed", "tests", freshState.obligations.tests.sequence, error);
+      recordTerminalEvidenceFailure(`restore-reviews-${index}`, "persistence-failed", "reviews", freshState.obligations.reviews.sequence, error);
     }
   });
   pi.on("agent_start", async (_event, ctx): Promise<void> => {
@@ -1027,6 +1098,50 @@ function nativeEvidenceStatePath(): string {
   const endpoint = process.env[WORKER_BRIDGE_ENDPOINT_ENV];
   if (!endpoint || !isAbsolute(endpoint)) throw new Error("Attempt-bound worker bridge endpoint is unavailable");
   return join(dirname(endpoint), NATIVE_EVIDENCE_STATE_FILE);
+}
+
+function reconcileNativeEvidenceStates(
+  states: NativeEvidenceState[],
+): Record<NativeEvidenceObligation, NativeEvidenceObligationState> | undefined {
+  if (states.length === 0) return undefined;
+  return {
+    tests: reconcileNativeEvidenceObligation(states, "tests"),
+    reviews: reconcileNativeEvidenceObligation(states, "reviews"),
+  };
+}
+
+function reconcileNativeEvidenceObligation(
+  states: NativeEvidenceState[],
+  obligation: NativeEvidenceObligation,
+): NativeEvidenceObligationState {
+  const newestSequence = Math.max(...states.map((state): number => state.obligations[obligation].sequence));
+  const newest = states.filter((state): boolean => state.obligations[obligation].sequence === newestSequence);
+  if (newest.some((state): boolean => state.obligations[obligation].status === "pending")) {
+    return { sequence: newestSequence, status: "pending" };
+  }
+  const statuses = new Set(newest.map((state): string => state.obligations[obligation].status));
+  if (statuses.size !== 1) return { sequence: newestSequence, status: "pending" };
+  const first = newest[0]!;
+  const state = first.obligations[obligation];
+  if (state.status !== "passed") return { sequence: newestSequence, status: "required" };
+  const proofIdentity = JSON.stringify({ generation: first.generation, proof: state.proof });
+  if (!newest.every((candidate): boolean => JSON.stringify({
+    generation: candidate.generation,
+    proof: candidate.obligations[obligation].proof,
+  }) === proofIdentity)) {
+    return { sequence: newestSequence, status: "pending" };
+  }
+  return structuredClone(state);
+}
+
+function rotateNativeEvidenceObligation(
+  reconciled: NativeEvidenceObligationState | undefined,
+  forcePending: boolean,
+): NativeEvidenceObligationState {
+  const sequence = reconciled?.sequence ?? 0;
+  return forcePending || reconciled?.status === "pending"
+    ? { sequence, status: "pending" }
+    : { sequence, status: "required" };
 }
 
 async function revokePublishedNativeEvidence(): Promise<void> {
@@ -1673,6 +1788,10 @@ function boundedDiagnostic(value: string): string {
 
 function isFileSystemError(value: unknown): boolean {
   return value instanceof Error && typeof (value as NodeJS.ErrnoException).code === "string";
+}
+
+function isMissingFileError(value: unknown): boolean {
+  return isFileSystemError(value) && (value as NodeJS.ErrnoException).code === "ENOENT";
 }
 
 function classifyNativeReviewResult(result: unknown): "passed" | "blocked" | "unrelated" {
