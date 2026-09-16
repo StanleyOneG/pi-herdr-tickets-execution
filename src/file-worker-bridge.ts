@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { constants } from "node:fs";
-import { chmod, mkdir, open, readdir, unlink } from "node:fs/promises";
+import { chmod, mkdir, readdir, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join } from "node:path";
 
 import { atomicWritePrivateFile } from "./atomic-file.js";
+import { readBoundedRegularFile } from "./bounded-regular-file.js";
 import type {
   WorkerBridgeChannel,
   WorkerBridgeTransport,
@@ -231,19 +231,7 @@ export class FileWorkerBridgeTransport implements WorkerBridgeTransport {
 }
 
 async function readBounded(path: string): Promise<string> {
-  const file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
-  try {
-    const metadata = await file.stat();
-    if (!metadata.isFile() || metadata.size <= 0 || metadata.size > MAX_RECEIPT_BYTES) {
-      throw new Error("Worker bridge record is not a bounded regular file");
-    }
-    const data = Buffer.alloc(metadata.size + 1);
-    const { bytesRead } = await file.read(data, 0, data.length, 0);
-    if (bytesRead !== metadata.size) throw new Error("Worker bridge record changed while it was read");
-    return data.subarray(0, bytesRead).toString("utf8");
-  } finally {
-    await file.close();
-  }
+  return (await readBoundedRegularFile(path, MAX_RECEIPT_BYTES, "Worker bridge record")).toString("utf8");
 }
 
 function isChannel(value: unknown): value is Required<WorkerBridgeChannel> {

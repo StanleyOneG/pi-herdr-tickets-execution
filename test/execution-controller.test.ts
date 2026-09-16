@@ -2173,7 +2173,7 @@ interface AsyncReviewFixtureInput {
   artifactOverride?: string;
   asyncArtifactOverride?: string;
   incomplete?: boolean;
-  dirtyScope?: boolean;
+  omitDirtyScope?: boolean;
   reviewBase?: string;
   sessionTasks?: readonly [string, string];
   launchSessionDir?: string;
@@ -2196,6 +2196,7 @@ interface AsyncReviewHarness {
   latestEvidencePath: string;
   context: Record<string, unknown>;
   hostHandlers: Map<string, (event: any, ctx: any) => unknown>;
+  reviewGuidance: string;
   recordPassingTests: () => Promise<void>;
   launchReview: (input: AsyncReviewFixtureInput) => Promise<AsyncReviewFixture>;
   completeAndSettle: (completion: Record<string, unknown>) => Promise<void>;
@@ -2295,11 +2296,13 @@ async function createAsyncReviewHarness(options: { configuredDefaultSessionRoot?
     `Review the candidate against documented standards and identify code smells. Inspect git diff ${base}...HEAD. End with one merge verdict.`,
     `Review the candidate for missing or partial requirements and scope creep. Inspect git diff ${base}...HEAD. End with one merge verdict.`,
   ];
+  let reviewGuidance = "";
   const tasksFor = (input: AsyncReviewFixtureInput): [string, string] => {
     const tasks = reviewTasks(input.reviewBase ?? repo.head);
-    return input.dirtyScope
-      ? tasks.map((task): string => `${task} Review all staged, unstaged, and untracked working-tree content.`) as [string, string]
-      : tasks;
+    if (input.omitDirtyScope) return tasks;
+    const scope = /include this sentence verbatim in each reviewer task: "([^"]+)"/i.exec(reviewGuidance)?.[1];
+    if (!scope) throw new Error("Ordinary implementation-session guidance omitted its complete working-tree review scope");
+    return tasks.map((task): string => `${task} ${scope}`) as [string, string];
   };
   const workflowScriptFor = (tasks: readonly [string, string]): string =>
     `const reviews = await runs.all([\n  { key: "policy-axis", label: "Review first axis", agent: "reviewer", context: "fresh", task: ${JSON.stringify(tasks[0])} },\n  { key: "requirements-axis", label: "Review second axis", agent: "reviewer", context: "fresh", task: ${JSON.stringify(tasks[1])} }\n]);\nreturn reviews.map((review) => review.output);`;
@@ -2453,6 +2456,12 @@ async function createAsyncReviewHarness(options: { configuredDefaultSessionRoot?
 
   herdrWorkerBridge(fakePi);
   await hostHandlers.get("session_start")!({ reason: "startup" }, context);
+  const guidance = await hostHandlers.get("before_agent_start")!({
+    prompt: "/skill:implement issue-5",
+    systemPrompt: "ordinary Pi system prompt",
+    systemPromptOptions: { selectedTools: ["subagent"], skills: [{ name: "implement" }, { name: "code-review" }] },
+  }, context) as { systemPrompt: string };
+  reviewGuidance = guidance.systemPrompt;
 
   const recordPassingTests = async (): Promise<void> => {
     await hostHandlers.get("tool_result")!({
@@ -2464,13 +2473,20 @@ async function createAsyncReviewHarness(options: { configuredDefaultSessionRoot?
   };
   const launchReview = async (input: AsyncReviewFixtureInput): Promise<AsyncReviewFixture> => {
     const tasks = tasksFor(input);
+    const args = {
+      workflowScript: workflowScriptFor(tasks),
+      ...(input.launchSessionDir ? { sessionDir: input.launchSessionDir } : {}),
+    };
+    const preflight = await hostHandlers.get("tool_call")!({
+      toolCallId: input.toolCallId,
+      toolName: "subagent",
+      input: args,
+    }, context) as { block?: boolean; reason?: string } | undefined;
+    if (preflight?.block) throw new Error(preflight.reason ?? "Native review launch was blocked");
     await hostHandlers.get("tool_execution_start")!({
       toolCallId: input.toolCallId,
       toolName: "subagent",
-      args: {
-        workflowScript: workflowScriptFor(tasks),
-        ...(input.launchSessionDir ? { sessionDir: input.launchSessionDir } : {}),
-      },
+      args,
     }, context);
     const fixture = await workflowFixture(input);
     await hostHandlers.get("tool_execution_end")!({
@@ -2525,6 +2541,7 @@ async function createAsyncReviewHarness(options: { configuredDefaultSessionRoot?
     latestEvidencePath,
     context,
     hostHandlers,
+    reviewGuidance,
     recordPassingTests,
     launchReview,
     completeAndSettle,
@@ -2549,6 +2566,18 @@ async function readAsyncReviewEvidence(
     codeStateDigest: candidate.codeStateDigest,
   });
 }
+
+test("ordinary implementation sessions receive the complete dirty review protocol", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness();
+  try {
+    assert.match(harness.reviewGuidance, /do not stop when git diff <fixed-point>\.\.\.HEAD is empty/i);
+    assert.match(harness.reviewGuidance, /review before commit/i);
+    assert.match(harness.reviewGuidance, /runs\.all.*fresh Standards and Spec reviewers/is);
+    assert.match(harness.reviewGuidance, /include this sentence verbatim in each reviewer task: "Review all staged, unstaged, and untracked working-tree content\."/i);
+  } finally {
+    await harness.dispose();
+  }
+});
 
 test("ordinary asynchronous runs.all reviews publish canonical immutable Standards and Spec evidence", async (): Promise<void> => {
   const harness = await createAsyncReviewHarness();
@@ -3089,22 +3118,43 @@ test("an asynchronous review completed after a content mutation cannot prove the
   }
 });
 
-test("dirty asynchronous reviews reject tasks that omit staged, unstaged, and untracked scope", async (): Promise<void> => {
+test("dirty asynchronous review preflight rejects generated tasks that omit complete working-tree scope", async (): Promise<void> => {
   const harness = await createAsyncReviewHarness();
   try {
     await writeFile(join(harness.repo.root, "README.md"), "project\nrepaired\n");
     await harness.recordPassingTests();
-    const omittedScope = await harness.launchReview({
+
+    await assert.rejects(harness.launchReview({
       runId: "omitted-dirty-scope-run",
       toolCallId: "omitted-dirty-scope-tool",
       completionOwnerId: "omitted-dirty-scope-owner",
+      omitDirtyScope: true,
+    }), /each fresh reviewer task.*staged, unstaged, and untracked/i);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("guided dirty review publishes evidence before commit when the committed three-dot diff is empty", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness();
+  try {
+    await writeFile(join(harness.repo.root, "README.md"), "project\nrepaired\n");
+    await harness.recordPassingTests();
+    assert.equal(execFileSync("git", ["diff", `${harness.repo.head}...HEAD`], {
+      cwd: harness.repo.root,
+      encoding: "utf8",
+    }), "");
+    const review = await harness.launchReview({
+      runId: "empty-committed-diff-run",
+      toolCallId: "empty-committed-diff-tool",
+      completionOwnerId: "empty-committed-diff-owner",
     });
 
-    await harness.completeAndSettle(omittedScope.completion);
+    await harness.completeAndSettle(review.completion);
 
-    const lifecycle = await harness.readLifecycle();
-    assert.ok(lifecycle.outstandingJobs.some((job): boolean =>
-      job.includes("omitted-dirty-scope-run:review-rejected")));
+    const records = await readAsyncReviewEvidence(harness, await asyncReviewCandidate(harness));
+    assert.equal(execFileSync("git", ["rev-parse", "HEAD"], { cwd: harness.repo.root, encoding: "utf8" }).trim(), harness.repo.head);
+    assert.deepEqual(records.map((record): string => record.kind).sort(), ["reviews", "tests"]);
   } finally {
     await harness.dispose();
   }
@@ -3120,7 +3170,6 @@ test("valid dirty review proof survives a content-identical commit", async (): P
       runId: "commit-correspondence-run",
       toolCallId: "commit-correspondence-tool",
       completionOwnerId: "commit-correspondence-owner",
-      dirtyScope: true,
     });
     await harness.completeAndSettle(fullScope.completion);
     const records = await readAsyncReviewEvidence(harness, dirtyCandidate);
@@ -3147,7 +3196,6 @@ test("dirty review proof rejects a changed source base after a content-identical
       runId: "changed-base-run",
       toolCallId: "changed-base-tool",
       completionOwnerId: "changed-base-owner",
-      dirtyScope: true,
     });
     await harness.completeAndSettle(fullScope.completion);
     const records = await readAsyncReviewEvidence(harness, dirtyCandidate);
@@ -3280,7 +3328,6 @@ test("asynchronous review evidence stays blocked through revocation I/O failure 
       runId: "unresolved-revocation-run",
       toolCallId: "unresolved-revocation-tool",
       completionOwnerId: "unresolved-revocation-owner",
-      dirtyScope: true,
     });
     await mkdir(harness.evidenceDirectory, { recursive: true });
     await mkdir(harness.latestEvidencePath);
@@ -3297,7 +3344,6 @@ test("asynchronous review evidence stays blocked through revocation I/O failure 
       runId: "infrastructure-recovery-run",
       toolCallId: "infrastructure-recovery-tool",
       completionOwnerId: "infrastructure-recovery-owner",
-      dirtyScope: true,
     });
     await harness.completeAndSettle(recovery.completion);
 

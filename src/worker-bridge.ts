@@ -18,6 +18,7 @@ import {
 import { Type, type Static } from "typebox";
 
 import { atomicWritePrivateFile } from "./atomic-file.js";
+import { readBoundedRegularFile as readBoundedFile } from "./bounded-regular-file.js";
 import type { CapturedModel, NativeEvidenceRecord, ThinkingLevel } from "./contracts.js";
 import { RealGitWorktreeAdapter } from "./git-worktrees.js";
 import {
@@ -46,6 +47,17 @@ const HISTORY_ENTRY_TYPES = new Set(["message", "custom_message", "compaction", 
 const executeFile = promisify(execFile);
 const MAX_GIT_BINDING_OUTPUT_BYTES = 2 * 1024 * 1024;
 const EMPTY_SHA256 = createHash("sha256").update(Buffer.alloc(0)).digest("hex");
+const COMPLETE_WORKING_TREE_REVIEW_SCOPE = "Review all staged, unstaged, and untracked working-tree content.";
+const NATIVE_EVIDENCE_GUIDANCE = [
+  "Herdr native evidence requirements: run project-native tests through one directly executed bash test command after the final edit; shell wrappers, chaining, output claims, status masking, help/version/list/collect-only/no-run/dry-run modes, typecheck, and lint do not count as tests.",
+  "Rerun an obligation successfully if a later test fails or review blocks on the same code state.",
+  "Perform the implementation skill's final review with the installed code-review skill and subagent tool.",
+  "Use one fixed review base for both axes. Review before commit: when the candidate has staged, unstaged, or untracked changes, do not stop when git diff <fixed-point>...HEAD is empty and do not commit merely to make that committed diff nonempty.",
+  `Use runs.all to launch separate fresh Standards and Spec reviewers. Each reviewer task must contain exactly one git diff <fixed-point>...HEAD scope, inspect the complete current candidate, retain its output artifact, and include this sentence verbatim in each reviewer task: "${COMPLETE_WORKING_TREE_REVIEW_SCOPE}"`,
+  "Each reviewer must end with exactly one \"Merge verdict: BLOCK\", \"Merge verdict: OK\", or \"Merge verdict: OK with notes\" line. Only after both reviewers finish without blockers may you commit the unchanged reviewed candidate.",
+  "Foreground reviews remain supported when they return structured no-blocker acceptance metadata.",
+  "The live worker bridge automatically captures execution-backed results when Pi settles on the unchanged final code state. Do not manufacture receipt files or substitute a prose completion claim.",
+].join(" ");
 const REVIEW_SCHEMA = Type.Object({
   kind: StringEnum(["standards", "spec"] as const),
   verdict: StringEnum(["passed", "blocked"] as const),
@@ -417,6 +429,25 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     isAgentRunning = true;
     await writeLifecycle(ctx, "working", outstandingJobs());
   });
+  pi.on("tool_call", async (event, ctx): Promise<{ block: true; reason: string } | undefined> => {
+    if (event.toolName !== "subagent" || !looksLikeReviewRequest(event.input)) return undefined;
+    let launchState: Awaited<ReturnType<typeof captureReviewLaunchGitState>>;
+    try {
+      launchState = await captureReviewLaunchGitState(ctx.cwd, false, event.input);
+    } catch (error) {
+      return {
+        block: true,
+        reason: `Herdr could not verify the candidate before native review launch: ${boundedDiagnostic(error instanceof Error ? error.message : String(error))}`,
+      };
+    }
+    if (launchState.statusDigest === EMPTY_SHA256 || reviewWorkflowCoversCompleteWorkingTree(event.input)) {
+      return undefined;
+    }
+    return {
+      block: true,
+      reason: `The dirty candidate review was not launched. Include this sentence in each fresh reviewer task: \"${COMPLETE_WORKING_TREE_REVIEW_SCOPE}\" Then retry the same two-axis workflow before committing.`,
+    };
+  });
   pi.on("tool_execution_start", async (event, ctx): Promise<void> => {
     activeTools.add(event.toolCallId);
     if (event.toolName === "edit" || event.toolName === "write") mutationToolUsed = true;
@@ -581,7 +612,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   });
 
   pi.on("before_agent_start", (event): { systemPrompt: string } => ({
-    systemPrompt: `${event.systemPrompt}\n\nHerdr native evidence requirements: run project-native tests through one directly executed bash test command after the final edit; shell wrappers, chaining, output claims, status masking, help/version/list/collect-only/no-run/dry-run modes, typecheck, and lint do not count as tests. Rerun an obligation successfully if a later test fails or review blocks on the same code state. Perform the implementation skill's final review with the installed subagent tool. Its ordinary asynchronous parallel code-review workflow is supported when every reviewer uses a fresh context, retains its output artifact, and ends with exactly one "Merge verdict: BLOCK", "Merge verdict: OK", or "Merge verdict: OK with notes" line. Foreground reviews remain supported when they return structured no-blocker acceptance metadata. The live worker bridge automatically captures execution-backed results when Pi settles on the unchanged final code state. Do not manufacture receipt files or substitute a prose completion claim.`,
+    systemPrompt: `${event.systemPrompt}\n\n${NATIVE_EVIDENCE_GUIDANCE}`,
   }));
 
   pi.registerTool({
@@ -1089,6 +1120,13 @@ function looksLikeReviewRequest(args: unknown): boolean {
   const serialized = serializeBoundedToolArgs(args);
   return Boolean(serialized && /runs\.all/i.test(serialized) && /review/i.test(serialized) &&
     /standards/i.test(serialized) && /(?:\bspec\b|requirements?)/i.test(serialized));
+}
+
+function reviewWorkflowCoversCompleteWorkingTree(args: unknown): boolean {
+  const serialized = serializeBoundedToolArgs(args);
+  if (!serialized) return false;
+  const scope = COMPLETE_WORKING_TREE_REVIEW_SCOPE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return [...serialized.matchAll(new RegExp(scope, "gi"))].length >= 2;
 }
 
 function isAsyncLaunchLike(value: unknown): boolean {
@@ -1762,7 +1800,11 @@ async function respondToLifecycleChallenge(): Promise<void> {
   const challengePath = join(dirname(endpoint), "lifecycle-challenge.json");
   const responsePath = join(dirname(endpoint), "lifecycle-challenge-response.json");
   try {
-    const parsed = JSON.parse(await readBoundedRegularFile(challengePath)) as Record<string, unknown>;
+    const parsed = JSON.parse((await readBoundedFile(
+      challengePath,
+      256 * 1024,
+      "Worker bridge challenge",
+    )).toString("utf8")) as Record<string, unknown>;
     if (parsed.schemaVersion !== 1 || parsed.nonce !== nonce || typeof parsed.challenge !== "string" ||
       !/^[A-Za-z0-9_-]{1,200}$/.test(parsed.challenge) || !Number.isSafeInteger(parsed.expectedPiPid) ||
       typeof parsed.requestedAt !== "string" || !Number.isFinite(Date.parse(parsed.requestedAt))
@@ -1778,22 +1820,6 @@ async function respondToLifecycleChallenge(): Promise<void> {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
       // Malformed or unsafe challenges are ignored; the controller fails closed on timeout.
     }
-  }
-}
-
-async function readBoundedRegularFile(path: string): Promise<string> {
-  const file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
-  try {
-    const metadata = await file.stat();
-    if (!metadata.isFile() || metadata.size <= 0 || metadata.size > 256 * 1024) {
-      throw new Error("Worker bridge challenge is not a bounded regular file");
-    }
-    const bytes = Buffer.alloc(metadata.size + 1);
-    const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
-    if (bytesRead !== metadata.size) throw new Error("Worker bridge challenge changed while it was read");
-    return bytes.subarray(0, bytesRead).toString("utf8");
-  } finally {
-    await file.close();
   }
 }
 
