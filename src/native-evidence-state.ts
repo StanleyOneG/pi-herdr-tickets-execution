@@ -1,6 +1,6 @@
-import { constants } from "node:fs";
-import { open } from "node:fs/promises";
 import { isAbsolute } from "node:path";
+
+import { readBoundedRegularFile } from "./bounded-regular-file.js";
 
 export const NATIVE_EVIDENCE_STATE_ENTRY = "herdr-native-evidence-state";
 export const NATIVE_EVIDENCE_STATE_FILE = "obligation-state.json";
@@ -44,23 +44,14 @@ export interface NativeEvidenceLifecycleBinding {
 
 export async function readNativeEvidenceState(path: string): Promise<NativeEvidenceState> {
   if (!isAbsolute(path)) throw new Error("Native evidence obligation state path must be absolute");
-  const file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
-  try {
-    const metadata = await file.stat();
-    if (!metadata.isFile() || metadata.size <= 0 || metadata.size > MAX_NATIVE_EVIDENCE_STATE_BYTES) {
-      throw new Error("Native evidence obligation state is not a bounded regular file");
-    }
-    const bytes = Buffer.alloc(MAX_NATIVE_EVIDENCE_STATE_BYTES + 1);
-    const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
-    if (bytesRead === 0 || bytesRead > MAX_NATIVE_EVIDENCE_STATE_BYTES) {
-      throw new Error("Native evidence obligation state is empty or exceeds its bound");
-    }
-    const parsed: unknown = JSON.parse(bytes.subarray(0, bytesRead).toString("utf8"));
-    if (!isNativeEvidenceState(parsed)) throw new Error("Native evidence obligation state is malformed");
-    return structuredClone(parsed);
-  } finally {
-    await file.close();
-  }
+  const bytes = await readBoundedRegularFile(
+    path,
+    MAX_NATIVE_EVIDENCE_STATE_BYTES,
+    "Native evidence obligation state",
+  );
+  const parsed: unknown = JSON.parse(bytes.toString("utf8"));
+  if (!isNativeEvidenceState(parsed)) throw new Error("Native evidence obligation state is malformed");
+  return structuredClone(parsed);
 }
 
 export function isNativeEvidenceState(value: unknown): value is NativeEvidenceState {

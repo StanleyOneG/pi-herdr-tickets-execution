@@ -1,8 +1,7 @@
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
-import { open } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 
+import { readBoundedRegularFile } from "./bounded-regular-file.js";
 import type { CandidateGitState, NativeEvidencePort, NativeEvidenceRecord } from "./contracts.js";
 import {
   NATIVE_EVIDENCE_STATE_FILE,
@@ -19,7 +18,7 @@ export async function readProducedNativeEvidence(
   expected: { sessionId: string; codeStateDigest: string },
 ): Promise<NativeEvidenceRecord[]> {
   if (!isAbsolute(path)) throw new Error("Native evidence index path must be absolute");
-  const parsed: unknown = JSON.parse((await readBoundedRegularFile(path)).toString("utf8"));
+  const parsed: unknown = JSON.parse((await readNativeEvidenceFile(path)).toString("utf8"));
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Native evidence index is malformed");
   const index = parsed as Record<string, unknown>;
   if (index.schemaVersion !== 1 || index.producer !== "herdr-worker-bridge" ||
@@ -40,7 +39,7 @@ export class FileNativeEvidenceAdapter implements NativeEvidencePort {
   async verify(input: { record: NativeEvidenceRecord; candidate: CandidateGitState }): Promise<void> {
     const { record, candidate } = input;
     if (!isAbsolute(record.evidenceReference)) throw new Error("Native evidence reference must be an absolute local artifact");
-    const bytes = await readBoundedRegularFile(record.evidenceReference);
+    const bytes = await readNativeEvidenceFile(record.evidenceReference);
     if (hash(bytes) !== record.evidenceDigest) throw new Error("Native evidence artifact digest changed");
     const parsed: unknown = JSON.parse(bytes.toString("utf8"));
     if (!isReceipt(parsed) || parsed.kind !== record.kind || parsed.status !== record.status ||
@@ -58,7 +57,7 @@ export class FileNativeEvidenceAdapter implements NativeEvidencePort {
       if (!isAbsolute(artifact.reference) || artifact.reference === record.evidenceReference) {
         throw new Error("Native evidence source artifact reference is unsafe");
       }
-      const retained = await readBoundedRegularFile(artifact.reference);
+      const retained = await readNativeEvidenceFile(artifact.reference);
       if (hash(retained) !== artifact.digest || !isProducerReceipt(JSON.parse(retained.toString("utf8")), parsed, candidate)) {
         throw new Error("Native evidence source artifact is missing, changed, or candidate-mismatched");
       }
@@ -182,22 +181,8 @@ function isRetainedReviewArtifact(value: unknown): boolean {
     createHash("sha256").update(artifact.report).digest("hex") === artifact.digest;
 }
 
-async function readBoundedRegularFile(path: string): Promise<Buffer> {
-  const file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
-  try {
-    const metadata = await file.stat();
-    if (!metadata.isFile() || metadata.size <= 0 || metadata.size > MAX_NATIVE_EVIDENCE_BYTES) {
-      throw new Error("Native evidence artifact is not a bounded regular file");
-    }
-    const bytes = Buffer.alloc(MAX_NATIVE_EVIDENCE_BYTES + 1);
-    const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
-    if (bytesRead === 0 || bytesRead > MAX_NATIVE_EVIDENCE_BYTES) {
-      throw new Error("Native evidence artifact is empty or exceeds its bound");
-    }
-    return bytes.subarray(0, bytesRead);
-  } finally {
-    await file.close();
-  }
+function readNativeEvidenceFile(path: string): Promise<Buffer> {
+  return readBoundedRegularFile(path, MAX_NATIVE_EVIDENCE_BYTES, "Native evidence artifact");
 }
 
 function hash(value: Buffer): string {

@@ -1575,7 +1575,29 @@ test("daemon routes a worker decision and stops on an execution-time checkout mu
   }
 });
 
-test("ordinary implementation tool events produce candidate-bound native test and review receipts", async (): Promise<void> => {
+type ProducedNativeEvidence = Awaited<ReturnType<typeof import("../src/native-evidence.js")["readProducedNativeEvidence"]>>;
+
+interface DirectEvidenceHarness {
+  repo: TestRepository;
+  workerRoot: string;
+  candidate: Awaited<ReturnType<RealGitWorktreeAdapter["captureCandidate"]>>;
+  context: Record<string, unknown>;
+  tools: Map<string, { execute: (...args: any[]) => Promise<any> }>;
+  completeBash: (toolCallId: string, command: string, isError: boolean, announcedCommand?: string) => Promise<void>;
+  completeReview: (toolCallId: string, outcome: "passed" | "blocked" | "error") => Promise<void>;
+  startAsyncReview: (toolCallId: string) => Promise<void>;
+  publishPassingEvidence: () => Promise<ProducedNativeEvidence>;
+  readEvidence: () => Promise<ProducedNativeEvidence>;
+  readLifecycle: () => Promise<WorkerLifecycleReceipt>;
+  settle: () => Promise<void>;
+  reload: () => Promise<void>;
+  restrictEvidenceWrites: () => Promise<void>;
+  restoreEvidenceWrites: () => Promise<void>;
+  assertPublicAcceptanceBlocked: (records: ProducedNativeEvidence) => Promise<void>;
+  dispose: () => Promise<void>;
+}
+
+async function createDirectEvidenceHarness(): Promise<DirectEvidenceHarness> {
   const repo = await repository();
   const worker = new ControlledWorker();
   const acceptance: AcceptanceAdapters = {
@@ -1651,30 +1673,210 @@ test("ordinary implementation tool events produce candidate-bound native test an
     hasPendingMessages: (): boolean => false,
   };
   const evidenceDirectory = join(bridgeDirectory, "native-evidence");
+  const latestEvidencePath = join(evidenceDirectory, "latest.json");
+  const lifecyclePath = join(bridgeDirectory, "lifecycle.json");
   let evidencePermissionsRestricted = false;
-  try {
-    herdrWorkerBridge(fakePi);
-    await hostHandlers.get("session_start")!({ reason: "startup" }, context);
-    assert.ok(tools.has("herdr_capture_native_evidence"));
-    await hostHandlers.get("tool_execution_start")!({ toolCallId: "review-call", toolName: "subagent", args: { task: "Review the implementation" } }, context);
+  let acceptanceAttempt: { attemptId: string; candidateDigest: string } | undefined;
+
+  herdrWorkerBridge(fakePi);
+  await hostHandlers.get("session_start")!({ reason: "startup" }, context);
+  const candidate = await new RealGitWorktreeAdapter().captureCandidate({
+    path: workerRoot,
+    sourceBase: running.attempt.worktree!.head,
+  });
+  const expectedEvidence = {
+    sessionId: running.attempt.worker!.sessionId,
+    codeStateDigest: candidate.codeStateDigest,
+  };
+  const settle = async (): Promise<void> => {
+    await hostHandlers.get("agent_settled")!({}, context);
+  };
+  const completeBash = async (
+    toolCallId: string,
+    command: string,
+    isError: boolean,
+    announcedCommand = command,
+  ): Promise<void> => {
+    await hostHandlers.get("tool_execution_start")!({
+      toolCallId,
+      toolName: "bash",
+      args: { command: announcedCommand },
+    }, context);
+    await hostHandlers.get("tool_result")!({
+      toolCallId,
+      toolName: "bash",
+      input: { command },
+      isError,
+    }, context);
     await hostHandlers.get("tool_execution_end")!({
-      toolCallId: "review-call",
+      toolCallId,
+      toolName: "bash",
+      isError,
+      result: {},
+    }, context);
+  };
+  const completeReview = async (
+    toolCallId: string,
+    outcome: "passed" | "blocked" | "error",
+  ): Promise<void> => {
+    const task = outcome === "passed" ? "Review the corrected implementation" : "Review the implementation again";
+    await hostHandlers.get("tool_execution_start")!({
+      toolCallId,
+      toolName: "subagent",
+      args: { task },
+    }, context);
+    await hostHandlers.get("tool_execution_end")!({
+      toolCallId,
+      toolName: "subagent",
+      isError: outcome === "error",
+      result: outcome === "error"
+        ? { details: { runId: `${toolCallId}-run`, results: [] } }
+        : { details: { runId: `${toolCallId}-run`, results: [{
+          agent: "reviewer",
+          task,
+          exitCode: 0,
+          structuredAcceptanceReport: outcome === "passed"
+            ? {
+              criteriaSatisfied: [{ id: "review", status: "satisfied", evidence: "No blocking findings" }],
+              reviewFindings: ["no blockers"],
+              residualRisks: ["none"],
+            }
+            : {
+              criteriaSatisfied: [{ id: "review", status: "not-satisfied", evidence: "A blocker remains" }],
+              reviewFindings: ["blocker: native evidence is stale"],
+              residualRisks: ["acceptance bypass"],
+            },
+        }] } },
+    }, context);
+  };
+  const startAsyncReview = async (toolCallId: string): Promise<void> => {
+    const runId = `${toolCallId}-run`;
+    const asyncDir = join(piSubagentsTempRoot, "async-subagent-runs", runId);
+    await mkdir(asyncDir, { recursive: true });
+    await hostHandlers.get("tool_execution_start")!({
+      toolCallId,
+      toolName: "subagent",
+      args: {
+        workflowScript: "return runs.all([{ key: 'standards', task: 'Review standards' }, { key: 'spec', task: 'Review spec' }]);",
+      },
+    }, context);
+    await hostHandlers.get("tool_execution_end")!({
+      toolCallId,
       toolName: "subagent",
       isError: false,
-      result: { details: { runId: "review-run", results: [{
-        agent: "reviewer", task: "Review the implementation", exitCode: 0,
-        structuredAcceptanceReport: {
-          criteriaSatisfied: [{ id: "review", status: "satisfied", evidence: "No blocking findings" }],
-          reviewFindings: ["no blockers"], residualRisks: ["none"],
+      result: {
+        details: {
+          mode: "workflow",
+          runId,
+          toolCallId,
+          asyncId: runId,
+          asyncDir,
+          results: [],
         },
-      }] } },
+      },
     }, context);
-    const candidate = await new RealGitWorktreeAdapter().captureCandidate({
-      path: workerRoot,
-      sourceBase: running.attempt.worktree!.head,
+  };
+  const readEvidence = async (): Promise<ProducedNativeEvidence> => {
+    const nativeEvidenceModule = await import("../src/native-evidence.js");
+    return nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence);
+  };
+  const readLifecycle = async (): Promise<WorkerLifecycleReceipt> =>
+    JSON.parse(await readFile(lifecyclePath, "utf8")) as WorkerLifecycleReceipt;
+  const preparePublicAcceptance = async (): Promise<void> => {
+    if (acceptanceAttempt) return;
+    worker.inspectOverride = async (identity): Promise<WorkerObservation> => {
+      const lifecycle = await readLifecycle();
+      return {
+        identity,
+        status: "done",
+        artifactReferences: [],
+        settled: lifecycle.state === "settled",
+        outstandingJobs: lifecycle.outstandingJobs,
+      };
+    };
+    const completed = value(await running.controller.recordWorkerObservation(actor, monitoredObservation(
+      running.attempt,
+      await worker.inspect(running.attempt.worker!),
+    )));
+    const captured = value(await running.controller.captureCandidate(actor, { attemptId: completed.id }));
+    acceptanceAttempt = { attemptId: completed.id, candidateDigest: captured.candidate.candidateDigest };
+  };
+  const publishPassingEvidence = async (): Promise<ProducedNativeEvidence> => {
+    await completeReview("initial-review", "passed");
+    await completeBash("initial-test", "node --import tsx --test test/execution-controller.test.ts", false);
+    await settle();
+    const records = await readEvidence();
+    await preparePublicAcceptance();
+    return records;
+  };
+  const reload = async (): Promise<void> => {
+    await hostHandlers.get("session_start")!({ reason: "reload" }, context);
+    await settle();
+  };
+  const restrictEvidenceWrites = async (): Promise<void> => {
+    await chmod(evidenceDirectory, 0o500);
+    evidencePermissionsRestricted = true;
+  };
+  const restoreEvidenceWrites = async (): Promise<void> => {
+    await chmod(evidenceDirectory, 0o700);
+    evidencePermissionsRestricted = false;
+  };
+  const assertPublicAcceptanceBlocked = async (records: ProducedNativeEvidence): Promise<void> => {
+    await preparePublicAcceptance();
+    if (!acceptanceAttempt) throw new Error("Public acceptance fixture was not prepared");
+    const rejected = await running.controller.acceptCandidate(actor, {
+      attemptId: acceptanceAttempt.attemptId,
+      candidateDigest: acceptanceAttempt.candidateDigest,
+      nativeEvidence: records,
     });
+    assert.equal(rejected.ok, false);
+    if (!rejected.ok) {
+      assert.deepEqual(rejected.error.diagnostics, [
+        "Acceptance requires the exact settled implementation worker with no outstanding jobs",
+      ]);
+    }
+  };
+  const dispose = async (): Promise<void> => {
+    if (evidencePermissionsRestricted) await chmod(evidenceDirectory, 0o700);
+    if (previousEndpoint === undefined) delete process.env.HERDR_WORKER_BRIDGE_ENDPOINT;
+    else process.env.HERDR_WORKER_BRIDGE_ENDPOINT = previousEndpoint;
+    if (previousNonce === undefined) delete process.env.HERDR_WORKER_BRIDGE_NONCE;
+    else process.env.HERDR_WORKER_BRIDGE_NONCE = previousNonce;
+    if (previousVerificationEndpoint === undefined) delete process.env.HERDR_WORKER_NATIVE_VERIFICATION_ENDPOINT;
+    else process.env.HERDR_WORKER_NATIVE_VERIFICATION_ENDPOINT = previousVerificationEndpoint;
+    if (previousReviewNonce === undefined) delete process.env.HERDR_WORKER_REVIEW_NONCE;
+    else process.env.HERDR_WORKER_REVIEW_NONCE = previousReviewNonce;
+    if (previousPiSubagentsTempRoot === undefined) delete process.env.PI_SUBAGENTS_TEMP_ROOT;
+    else process.env.PI_SUBAGENTS_TEMP_ROOT = previousPiSubagentsTempRoot;
+  };
+
+  return {
+    repo,
+    workerRoot,
+    candidate,
+    context,
+    tools,
+    completeBash,
+    completeReview,
+    startAsyncReview,
+    publishPassingEvidence,
+    readEvidence,
+    readLifecycle,
+    settle,
+    reload,
+    restrictEvidenceWrites,
+    restoreEvidenceWrites,
+    assertPublicAcceptanceBlocked,
+    dispose,
+  };
+}
+
+test("only a directly executed successful native test command satisfies test provenance", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  try {
+    assert.ok(harness.tools.has("herdr_capture_native_evidence"));
     const nodeHelpOutput = execFileSync(process.execPath, ["--test", "--help"], {
-      cwd: workerRoot,
+      cwd: harness.workerRoot,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -1698,291 +1900,268 @@ test("ordinary implementation tool events produce candidate-bound native test an
       ["cargo-no-run-call", "cargo test --no-run"],
       ["cargo-list-call", "cargo test -- --list"],
       ["bun-dry-run-call", "bun test --dry-run"],
-    ]) {
-      const announcedCommand = toolCallId === "echo-call" ? "npm test" : command;
-      await hostHandlers.get("tool_execution_start")!({ toolCallId, toolName: "bash", args: { command: announcedCommand } }, context);
-      await hostHandlers.get("tool_result")!({ toolCallId, toolName: "bash", input: { command }, isError: false }, context);
-      await hostHandlers.get("tool_execution_end")!({ toolCallId, toolName: "bash", isError: false, result: {} }, context);
+    ] as const) {
+      await harness.completeBash(toolCallId, command, false, toolCallId === "echo-call" ? "npm test" : command);
       await assert.rejects(
-        tools.get("herdr_capture_native_evidence")!.execute("rejected-capture", {}, undefined, undefined, context),
+        harness.tools.get("herdr_capture_native_evidence")!.execute("rejected-capture", {}, undefined, undefined, harness.context),
         /directly executed test command|typecheck and lint do not satisfy native tests|do not execute tests/i,
       );
     }
-    await assert.rejects(tools.get("herdr_submit_native_verification")!.execute("rejected-verification", {
+    await assert.rejects(harness.tools.get("herdr_submit_native_verification")!.execute("rejected-verification", {
       status: "passed",
-      candidateCommit: repo.head,
-      codeStateDigest: candidate.codeStateDigest,
+      candidateCommit: harness.repo.head,
+      codeStateDigest: harness.candidate.codeStateDigest,
       findings: [],
-    }, undefined, undefined, context), /actual successful native test command/i);
-    await hostHandlers.get("tool_execution_start")!({
-      toolCallId: "test-call",
-      toolName: "bash",
-      args: { command: "node --import tsx --test test/execution-controller.test.ts" },
-    }, context);
-    await hostHandlers.get("tool_result")!({
-      toolCallId: "test-call",
-      toolName: "bash",
-      input: { command: "node --import tsx --test test/execution-controller.test.ts" },
-      isError: false,
-    }, context);
-    await hostHandlers.get("tool_execution_end")!({ toolCallId: "test-call", toolName: "bash", isError: false, result: {} }, context);
-    await tools.get("herdr_submit_native_verification")!.execute("accepted-verification", {
+    }, undefined, undefined, harness.context), /actual successful native test command/i);
+
+    await harness.completeBash(
+      "accepted-test",
+      "node --import tsx --test test/execution-controller.test.ts",
+      false,
+    );
+
+    await harness.tools.get("herdr_submit_native_verification")!.execute("accepted-verification", {
       status: "passed",
-      candidateCommit: repo.head,
-      codeStateDigest: candidate.codeStateDigest,
+      candidateCommit: harness.repo.head,
+      codeStateDigest: harness.candidate.codeStateDigest,
       findings: [],
-    }, undefined, undefined, context);
-    const nativeEvidenceModule = await import("../src/native-evidence.js");
-    const latestEvidencePath = join(evidenceDirectory, "latest.json");
-    const expectedEvidence = { sessionId: running.attempt.worker!.sessionId, codeStateDigest: candidate.codeStateDigest };
-    await hostHandlers.get("agent_settled")!({}, context);
-    const firstPublishedRecords = await nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence);
-    const immutableArtifacts = firstPublishedRecords.flatMap((record) => [record.evidenceReference]);
-    const lifecyclePath = join(bridgeDirectory, "lifecycle.json");
-    worker.inspectOverride = async (identity): Promise<WorkerObservation> => {
-      const lifecycle = JSON.parse(await readFile(lifecyclePath, "utf8")) as WorkerLifecycleReceipt;
-      return {
-        identity,
-        status: "done",
-        artifactReferences: [],
-        settled: lifecycle.state === "settled",
-        outstandingJobs: lifecycle.outstandingJobs,
-      };
-    };
-    const completed = value(await running.controller.recordWorkerObservation(actor, monitoredObservation(
-      running.attempt,
-      await worker.inspect(running.attempt.worker!),
-    )));
-    const captured = value(await running.controller.captureCandidate(actor, { attemptId: completed.id }));
-    const assertPublicAcceptanceBlocked = async (records: typeof firstPublishedRecords): Promise<void> => {
-      const rejected = await running.controller.acceptCandidate(actor, {
-        attemptId: completed.id,
-        candidateDigest: captured.candidate.candidateDigest,
-        nativeEvidence: records,
-      });
-      assert.equal(rejected.ok, false);
-      if (!rejected.ok) {
-        assert.deepEqual(rejected.error.diagnostics, [
-          "Acceptance requires the exact settled implementation worker with no outstanding jobs",
-        ]);
-      }
-    };
+    }, undefined, undefined, harness.context);
+  } finally {
+    await harness.dispose();
+  }
+});
 
-    await chmod(evidenceDirectory, 0o500);
-    evidencePermissionsRestricted = true;
-    await hostHandlers.get("tool_execution_start")!({
-      toolCallId: "failed-test-revocation",
-      toolName: "bash",
-      args: { command: "node --import tsx --test test/execution-controller.test.ts" },
-    }, context);
-    await hostHandlers.get("tool_result")!({
-      toolCallId: "failed-test-revocation",
-      toolName: "bash",
-      input: { command: "node --import tsx --test test/execution-controller.test.ts" },
-      isError: true,
-    }, context);
-    await hostHandlers.get("tool_execution_end")!({
-      toolCallId: "failed-test-revocation",
-      toolName: "bash",
-      isError: true,
-      result: {},
-    }, context);
-    await hostHandlers.get("agent_settled")!({}, context);
-    const readableStaleTestRecords = await nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence);
-    const failedTestLifecycle = JSON.parse(await readFile(lifecyclePath, "utf8")) as WorkerLifecycleReceipt;
-    assert.ok(failedTestLifecycle.outstandingJobs.some((job): boolean =>
-      job.includes("failed-test-revocation:revocation-failed")));
-    await assertPublicAcceptanceBlocked(readableStaleTestRecords);
-    await Promise.all(immutableArtifacts.map((artifact) => readFile(artifact)));
+test("direct successful test and review events publish candidate-bound immutable evidence", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  try {
+    const records = await harness.publishPassingEvidence();
 
-    await hostHandlers.get("tool_execution_start")!({
-      toolCallId: "failed-review-revocation",
-      toolName: "subagent",
-      args: { task: "Review the implementation again" },
-    }, context);
-    await hostHandlers.get("tool_execution_end")!({
-      toolCallId: "failed-review-revocation",
-      toolName: "subagent",
-      isError: true,
-      result: { details: { runId: "failed-review-run", results: [] } },
-    }, context);
-    await hostHandlers.get("agent_settled")!({}, context);
-    const readableStaleReviewRecords = await nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence);
-    const failedReviewLifecycle = JSON.parse(await readFile(lifecyclePath, "utf8")) as WorkerLifecycleReceipt;
-    assert.ok(failedReviewLifecycle.outstandingJobs.some((job): boolean =>
-      job.includes("failed-review-revocation:revocation-failed")));
-    await assertPublicAcceptanceBlocked(readableStaleReviewRecords);
-
-    const startedReviewAsyncDir = join(piSubagentsTempRoot, "async-subagent-runs", "started-review-run");
-    await mkdir(startedReviewAsyncDir, { recursive: true });
-    await hostHandlers.get("tool_execution_start")!({
-      toolCallId: "started-review-revocation",
-      toolName: "subagent",
-      args: {
-        workflowScript: "return runs.all([{ key: 'standards', task: 'Review standards' }, { key: 'spec', task: 'Review spec' }]);",
-      },
-    }, context);
-    await hostHandlers.get("tool_execution_end")!({
-      toolCallId: "started-review-revocation",
-      toolName: "subagent",
-      isError: false,
-      result: {
-        details: {
-          mode: "workflow",
-          runId: "started-review-run",
-          toolCallId: "started-review-revocation",
-          asyncId: "started-review-run",
-          asyncDir: startedReviewAsyncDir,
-          results: [],
-        },
-      },
-    }, context);
-    await hostHandlers.get("agent_settled")!({}, context);
-    const readableStaleStartedReviewRecords = await nativeEvidenceModule.readProducedNativeEvidence(
-      latestEvidencePath,
-      expectedEvidence,
-    );
-    const startedReviewLifecycle = JSON.parse(await readFile(lifecyclePath, "utf8")) as WorkerLifecycleReceipt;
-    assert.ok(startedReviewLifecycle.outstandingJobs.some((job): boolean =>
-      job.includes("started-review-revocation:revocation-failed")));
-    await assertPublicAcceptanceBlocked(readableStaleStartedReviewRecords);
-
-    await chmod(evidenceDirectory, 0o700);
-    evidencePermissionsRestricted = false;
-    await hostHandlers.get("tool_result")!({
-      toolCallId: "successful-test-revocation-recovery",
-      toolName: "bash",
-      input: { command: "node --import tsx --test test/execution-controller.test.ts" },
-      isError: false,
-    }, context);
-    await hostHandlers.get("agent_settled")!({}, context);
-    const testOnlyRecoveryLifecycle = JSON.parse(await readFile(lifecyclePath, "utf8")) as WorkerLifecycleReceipt;
-    assert.equal(testOnlyRecoveryLifecycle.outstandingJobs.some((job): boolean =>
-      job.includes("failed-test-revocation:revocation-failed")), false);
-    assert.ok(testOnlyRecoveryLifecycle.outstandingJobs.some((job): boolean =>
-      job.includes("failed-review-revocation:revocation-failed")));
-    await assert.rejects(nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence), /ENOENT/);
-
-    await hostHandlers.get("tool_execution_start")!({
-      toolCallId: "successful-review-revocation-recovery",
-      toolName: "subagent",
-      args: { task: "Review the corrected implementation" },
-    }, context);
-    await hostHandlers.get("tool_execution_end")!({
-      toolCallId: "successful-review-revocation-recovery",
-      toolName: "subagent",
-      isError: false,
-      result: { details: { runId: "successful-review-recovery-run", results: [{
-        agent: "reviewer", task: "Review the corrected implementation", exitCode: 0,
-        structuredAcceptanceReport: {
-          criteriaSatisfied: [{ id: "review", status: "satisfied", evidence: "No blocking findings" }],
-          reviewFindings: ["no blockers"], residualRisks: ["none"],
-        },
-      }] } },
-    }, context);
-    await hostHandlers.get("agent_settled")!({}, context);
-    const recoveredLifecycle = JSON.parse(await readFile(lifecyclePath, "utf8")) as WorkerLifecycleReceipt;
-    assert.equal(recoveredLifecycle.outstandingJobs.some((job): boolean =>
-      job.includes("revocation-failed")), false);
-    await nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence);
-
-    await hostHandlers.get("tool_result")!({
-      toolCallId: "failed-test-rerun",
-      toolName: "bash",
-      input: { command: "node --import tsx --test test/execution-controller.test.ts" },
-      isError: true,
-    }, context);
-    await assert.rejects(nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence), /ENOENT/);
-    await Promise.all(immutableArtifacts.map((artifact) => readFile(artifact)));
-    await assert.rejects(
-      tools.get("herdr_capture_native_evidence")!.execute("stale-test-capture", {}, undefined, undefined, context),
-      /lacks observed successful native tests/i,
-    );
-    await hostHandlers.get("agent_settled")!({}, context);
-    await assert.rejects(nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence), /ENOENT/);
-    const failedTestRerunLifecycle = JSON.parse(await readFile(lifecyclePath, "utf8")) as WorkerLifecycleReceipt;
-    assert.ok(failedTestRerunLifecycle.outstandingJobs.some((job): boolean =>
-      job.includes("failed-test-rerun:execution-failed")));
-    await hostHandlers.get("session_start")!({ reason: "reload" }, context);
-    await hostHandlers.get("agent_settled")!({}, context);
-    const reloadedFailureLifecycle = JSON.parse(await readFile(lifecyclePath, "utf8")) as WorkerLifecycleReceipt;
-    assert.ok(reloadedFailureLifecycle.outstandingJobs.some((job): boolean =>
-      job.includes("restored-tests") && job.includes("execution-failed")));
-    await assertPublicAcceptanceBlocked(firstPublishedRecords);
-
-    await hostHandlers.get("tool_result")!({
-      toolCallId: "successful-test-rerun",
-      toolName: "bash",
-      input: { command: "node --import tsx --test test/execution-controller.test.ts" },
-      isError: false,
-    }, context);
-    await hostHandlers.get("agent_settled")!({}, context);
-    await nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence);
-
-    await hostHandlers.get("tool_execution_start")!({
-      toolCallId: "blocking-review-rerun",
-      toolName: "subagent",
-      args: { task: "Review the implementation again" },
-    }, context);
-    await hostHandlers.get("tool_execution_end")!({
-      toolCallId: "blocking-review-rerun",
-      toolName: "subagent",
-      isError: false,
-      result: { details: { runId: "blocking-review-run", results: [{
-        agent: "reviewer", task: "Review the implementation again", exitCode: 0,
-        structuredAcceptanceReport: {
-          criteriaSatisfied: [{ id: "review", status: "not-satisfied", evidence: "A blocker remains" }],
-          reviewFindings: ["blocker: native evidence is stale"], residualRisks: ["acceptance bypass"],
-        },
-      }] } },
-    }, context);
-    await assert.rejects(nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence), /ENOENT/);
-    await assert.rejects(
-      tools.get("herdr_capture_native_evidence")!.execute("stale-review-capture", {}, undefined, undefined, context),
-      /structured no-blocker review/i,
-    );
-    await hostHandlers.get("agent_settled")!({}, context);
-    await assert.rejects(nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence), /ENOENT/);
-    const blockingReviewLifecycle = JSON.parse(await readFile(lifecyclePath, "utf8")) as WorkerLifecycleReceipt;
-    assert.ok(blockingReviewLifecycle.outstandingJobs.some((job): boolean =>
-      job.includes("blocking-review-rerun:review-rejected")));
-    await assertPublicAcceptanceBlocked(firstPublishedRecords);
-
-    await hostHandlers.get("tool_execution_start")!({
-      toolCallId: "passing-review-rerun",
-      toolName: "subagent",
-      args: { task: "Review the corrected implementation" },
-    }, context);
-    await hostHandlers.get("tool_execution_end")!({
-      toolCallId: "passing-review-rerun",
-      toolName: "subagent",
-      isError: false,
-      result: { details: { runId: "passing-review-run", results: [{
-        agent: "reviewer", task: "Review the corrected implementation", exitCode: 0,
-        structuredAcceptanceReport: {
-          criteriaSatisfied: [{ id: "review", status: "satisfied", evidence: "No blocking findings" }],
-          reviewFindings: ["no blockers"], residualRisks: ["none"],
-        },
-      }] } },
-    }, context);
-    await hostHandlers.get("agent_settled")!({}, context);
-    const records = await nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence);
     assert.deepEqual(records.map((record): string => record.kind).sort(), ["reviews", "tests"]);
     for (const record of records) {
-      await new nativeEvidenceModule.FileNativeEvidenceAdapter().verify({ record, candidate });
+      await new FileNativeEvidenceAdapter().verify({ record, candidate: harness.candidate });
     }
   } finally {
-    if (evidencePermissionsRestricted) await chmod(evidenceDirectory, 0o700);
-    if (previousEndpoint === undefined) delete process.env.HERDR_WORKER_BRIDGE_ENDPOINT;
-    else process.env.HERDR_WORKER_BRIDGE_ENDPOINT = previousEndpoint;
-    if (previousNonce === undefined) delete process.env.HERDR_WORKER_BRIDGE_NONCE;
-    else process.env.HERDR_WORKER_BRIDGE_NONCE = previousNonce;
-    if (previousVerificationEndpoint === undefined) delete process.env.HERDR_WORKER_NATIVE_VERIFICATION_ENDPOINT;
-    else process.env.HERDR_WORKER_NATIVE_VERIFICATION_ENDPOINT = previousVerificationEndpoint;
-    if (previousReviewNonce === undefined) delete process.env.HERDR_WORKER_REVIEW_NONCE;
-    else process.env.HERDR_WORKER_REVIEW_NONCE = previousReviewNonce;
-    if (previousPiSubagentsTempRoot === undefined) delete process.env.PI_SUBAGENTS_TEMP_ROOT;
-    else process.env.PI_SUBAGENTS_TEMP_ROOT = previousPiSubagentsTempRoot;
+    await harness.dispose();
+  }
+});
+
+test("failed test revocation I/O blocks public acceptance", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  try {
+    await harness.publishPassingEvidence();
+    await harness.restrictEvidenceWrites();
+
+    await harness.completeBash("failed-test-revocation", "node --import tsx --test test/execution-controller.test.ts", true);
+    await harness.settle();
+
+    const staleRecords = await harness.readEvidence();
+    const lifecycle = await harness.readLifecycle();
+    assert.ok(lifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("failed-test-revocation:revocation-failed")));
+    await harness.assertPublicAcceptanceBlocked(staleRecords);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("failed test revocation preserves immutable audit artifacts", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  try {
+    const records = await harness.publishPassingEvidence();
+    const immutableArtifacts = records.map((record) => record.evidenceReference);
+    await harness.restrictEvidenceWrites();
+
+    await harness.completeBash("failed-test-audit-revocation", "node --import tsx --test test/execution-controller.test.ts", true);
+    await harness.settle();
+
+    await Promise.all(immutableArtifacts.map((artifact) => readFile(artifact)));
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("failed direct review revocation I/O blocks public acceptance", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  try {
+    await harness.publishPassingEvidence();
+    await harness.restrictEvidenceWrites();
+
+    await harness.completeReview("failed-review-revocation", "error");
+    await harness.settle();
+
+    const staleRecords = await harness.readEvidence();
+    const lifecycle = await harness.readLifecycle();
+    assert.ok(lifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("failed-review-revocation:revocation-failed")));
+    await harness.assertPublicAcceptanceBlocked(staleRecords);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("an asynchronous review launch during revocation I/O failure blocks public acceptance", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  try {
+    await harness.publishPassingEvidence();
+    await harness.restrictEvidenceWrites();
+
+    await harness.startAsyncReview("started-review-revocation");
+    await harness.settle();
+
+    const staleRecords = await harness.readEvidence();
+    const lifecycle = await harness.readLifecycle();
+    assert.ok(lifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("started-review-revocation:revocation-failed")));
+    await harness.assertPublicAcceptanceBlocked(staleRecords);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("successful test recovery clears only the test obligation failure", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  try {
+    await harness.publishPassingEvidence();
+    await harness.restrictEvidenceWrites();
+    await harness.completeBash("failed-test-revocation", "node --import tsx --test test/execution-controller.test.ts", true);
+    await harness.completeReview("failed-review-revocation", "error");
+    await harness.settle();
+    await harness.restoreEvidenceWrites();
+
+    await harness.completeBash("successful-test-recovery", "node --import tsx --test test/execution-controller.test.ts", false);
+    await harness.settle();
+
+    const lifecycle = await harness.readLifecycle();
+    assert.equal(lifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("failed-test-revocation:revocation-failed")), false);
+    assert.ok(lifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("failed-review-revocation:revocation-failed")));
+    await assert.rejects(harness.readEvidence(), /ENOENT/);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("successful direct review recovery clears outstanding revocation failures", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  try {
+    await harness.publishPassingEvidence();
+    await harness.restrictEvidenceWrites();
+    await harness.completeBash("failed-test-revocation", "node --import tsx --test test/execution-controller.test.ts", true);
+    await harness.completeReview("failed-review-revocation", "error");
+    await harness.settle();
+    await harness.restoreEvidenceWrites();
+    await harness.completeBash("successful-test-recovery", "node --import tsx --test test/execution-controller.test.ts", false);
+
+    await harness.completeReview("successful-review-recovery", "passed");
+    await harness.settle();
+
+    const lifecycle = await harness.readLifecycle();
+    assert.equal(lifecycle.outstandingJobs.some((job): boolean => job.includes("revocation-failed")), false);
+    await harness.readEvidence();
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("a failed test rerun revokes publication and cannot be captured as fresh evidence", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  try {
+    await harness.publishPassingEvidence();
+
+    await harness.completeBash("failed-test-rerun", "node --import tsx --test test/execution-controller.test.ts", true);
+    await harness.settle();
+
+    await assert.rejects(harness.readEvidence(), /ENOENT/);
+    await assert.rejects(
+      harness.tools.get("herdr_capture_native_evidence")!.execute("stale-test-capture", {}, undefined, undefined, harness.context),
+      /lacks observed successful native tests/i,
+    );
+    const lifecycle = await harness.readLifecycle();
+    assert.ok(lifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("failed-test-rerun:execution-failed")));
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("a failed test obligation survives reload and rejects cached evidence", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  try {
+    const cachedRecords = await harness.publishPassingEvidence();
+    await harness.completeBash("failed-test-rerun", "node --import tsx --test test/execution-controller.test.ts", true);
+
+    await harness.reload();
+
+    const lifecycle = await harness.readLifecycle();
+    assert.ok(lifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("restored-tests") && job.includes("execution-failed")));
+    const cachedTest = cachedRecords.find((record): boolean => record.kind === "tests")!;
+    await assert.rejects(
+      new FileNativeEvidenceAdapter().verify({ record: cachedTest, candidate: harness.candidate }),
+      /stale|lifecycle|obligation/i,
+    );
+    await harness.assertPublicAcceptanceBlocked(cachedRecords);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("a successful test rerun recovers the persisted test obligation after reload", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  try {
+    await harness.publishPassingEvidence();
+    await harness.completeBash("failed-test-rerun", "node --import tsx --test test/execution-controller.test.ts", true);
+    await harness.reload();
+
+    await harness.completeBash("successful-test-rerun", "node --import tsx --test test/execution-controller.test.ts", false);
+    await harness.settle();
+
+    await harness.readEvidence();
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("a direct blocking review revokes publication and blocks public acceptance", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  try {
+    const cachedRecords = await harness.publishPassingEvidence();
+
+    await harness.completeReview("blocking-review-rerun", "blocked");
+    await harness.settle();
+
+    await assert.rejects(harness.readEvidence(), /ENOENT/);
+    await assert.rejects(
+      harness.tools.get("herdr_capture_native_evidence")!.execute("stale-review-capture", {}, undefined, undefined, harness.context),
+      /structured no-blocker review/i,
+    );
+    const lifecycle = await harness.readLifecycle();
+    assert.ok(lifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("blocking-review-rerun:review-rejected")));
+    await harness.assertPublicAcceptanceBlocked(cachedRecords);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("a newer passing direct review recovers from a blocking review", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  try {
+    await harness.publishPassingEvidence();
+    await harness.completeReview("blocking-review-rerun", "blocked");
+    await harness.settle();
+
+    await harness.completeReview("passing-review-rerun", "passed");
+    await harness.settle();
+
+    const records = await harness.readEvidence();
+    assert.deepEqual(records.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+    for (const record of records) {
+      await new FileNativeEvidenceAdapter().verify({ record, candidate: harness.candidate });
+    }
+  } finally {
+    await harness.dispose();
   }
 });
 
@@ -1995,6 +2174,7 @@ interface AsyncReviewFixtureInput {
   asyncArtifactOverride?: string;
   incomplete?: boolean;
   dirtyScope?: boolean;
+  reviewBase?: string;
   sessionTasks?: readonly [string, string];
   launchSessionDir?: string;
   reportedSessionRoot?: string;
@@ -2111,12 +2291,16 @@ async function createAsyncReviewHarness(options: { configuredDefaultSessionRoot?
     await writeFile(join(configDirectory, "config.json"), `${JSON.stringify({ defaultSessionDir: defaultSessionRoot })}\n`);
   }
 
-  const reviewTasks = [
-    `Review the candidate against documented standards and identify code smells. Inspect git diff ${repo.head}...HEAD. End with one merge verdict.`,
-    `Review the candidate for missing or partial requirements and scope creep. Inspect git diff ${repo.head}...HEAD. End with one merge verdict.`,
-  ] as const;
-  const dirtyReviewTasks = reviewTasks.map((task): string =>
-    `${task} Review all staged, unstaged, and untracked working-tree content.`) as [string, string];
+  const reviewTasks = (base: string): [string, string] => [
+    `Review the candidate against documented standards and identify code smells. Inspect git diff ${base}...HEAD. End with one merge verdict.`,
+    `Review the candidate for missing or partial requirements and scope creep. Inspect git diff ${base}...HEAD. End with one merge verdict.`,
+  ];
+  const tasksFor = (input: AsyncReviewFixtureInput): [string, string] => {
+    const tasks = reviewTasks(input.reviewBase ?? repo.head);
+    return input.dirtyScope
+      ? tasks.map((task): string => `${task} Review all staged, unstaged, and untracked working-tree content.`) as [string, string]
+      : tasks;
+  };
   const workflowScriptFor = (tasks: readonly [string, string]): string =>
     `const reviews = await runs.all([\n  { key: "policy-axis", label: "Review first axis", agent: "reviewer", context: "fresh", task: ${JSON.stringify(tasks[0])} },\n  { key: "requirements-axis", label: "Review second axis", agent: "reviewer", context: "fresh", task: ${JSON.stringify(tasks[1])} }\n]);\nreturn reviews.map((review) => review.output);`;
 
@@ -2127,7 +2311,7 @@ async function createAsyncReviewHarness(options: { configuredDefaultSessionRoot?
   const workflowFixture = async (input: AsyncReviewFixtureInput): Promise<AsyncReviewFixture> => {
     const asyncDir = join(piSubagentsTempRoot, "async-subagent-runs", input.runId);
     const startedAt = Date.now();
-    const tasks = input.sessionTasks ?? (input.dirtyScope ? dirtyReviewTasks : reviewTasks);
+    const tasks = input.sessionTasks ?? tasksFor(input);
     const keys = ["policy-axis", "requirements-axis"];
     const labels = ["Specification review", "Standards review"];
     const childRunIds = [`${input.runId}-child-a`, `${input.runId}-child-b`];
@@ -2279,7 +2463,7 @@ async function createAsyncReviewHarness(options: { configuredDefaultSessionRoot?
     }, context);
   };
   const launchReview = async (input: AsyncReviewFixtureInput): Promise<AsyncReviewFixture> => {
-    const tasks = input.dirtyScope ? dirtyReviewTasks : reviewTasks;
+    const tasks = tasksFor(input);
     await hostHandlers.get("tool_execution_start")!({
       toolCallId: input.toolCallId,
       toolName: "subagent",
@@ -2358,7 +2542,7 @@ async function asyncReviewCandidate(harness: AsyncReviewHarness): Promise<Awaite
 async function readAsyncReviewEvidence(
   harness: AsyncReviewHarness,
   candidate: Awaited<ReturnType<RealGitWorktreeAdapter["captureCandidate"]>>,
-): Promise<Awaited<ReturnType<typeof import("../src/native-evidence.js")["readProducedNativeEvidence"]>>> {
+): Promise<ProducedNativeEvidence> {
   const nativeEvidenceModule = await import("../src/native-evidence.js");
   return nativeEvidenceModule.readProducedNativeEvidence(harness.latestEvidencePath, {
     sessionId: "native-session",
@@ -2383,6 +2567,117 @@ test("ordinary asynchronous runs.all reviews publish canonical immutable Standar
     for (const record of records) await new FileNativeEvidenceAdapter().verify({ record, candidate });
     await Promise.all(fixture.reports.map((report): Promise<void> => rm(report)));
     for (const record of records) await new FileNativeEvidenceAdapter().verify({ record, candidate });
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("ordinary code-review workflow accepts a uniquely resolvable abbreviated commit base", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness();
+  try {
+    await harness.recordPassingTests();
+    const fixture = await harness.launchReview({
+      runId: "abbreviated-base-review-run",
+      toolCallId: "abbreviated-base-review-tool",
+      completionOwnerId: "abbreviated-base-review-owner",
+      reviewBase: harness.repo.head.slice(0, 8),
+    });
+
+    await harness.completeAndSettle(fixture.completion);
+
+    const records = await readAsyncReviewEvidence(harness, await asyncReviewCandidate(harness));
+    assert.deepEqual(records.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("asynchronous reviews reject a named review base that moves after launch", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness();
+  try {
+    await harness.recordPassingTests();
+    git(harness.repo.root, "branch", "review-base", harness.repo.head);
+    const fixture = await harness.launchReview({
+      runId: "moved-base-review-run",
+      toolCallId: "moved-base-review-tool",
+      completionOwnerId: "moved-base-review-owner",
+      reviewBase: "review-base",
+    });
+    const movedCommit = git(
+      harness.repo.root,
+      "commit-tree",
+      `${harness.repo.head}^{tree}`,
+      "-p",
+      harness.repo.head,
+      "-m",
+      "move review base after launch",
+    );
+    git(harness.repo.root, "branch", "-f", "review-base", movedCommit);
+
+    await harness.completeAndSettle(fixture.completion);
+
+    const lifecycle = await harness.readLifecycle();
+    assert.ok(lifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("moved-base-review-run:review-rejected")));
+    await assert.rejects(readAsyncReviewEvidence(harness, await asyncReviewCandidate(harness)), /ENOENT/);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("asynchronous reviews reject shell syntax in a review base without executing it", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness();
+  try {
+    await harness.recordPassingTests();
+    const marker = join(harness.bridgeDirectory, "injected-review-base");
+    const fixture = await harness.launchReview({
+      runId: "injected-base-review-run",
+      toolCallId: "injected-base-review-tool",
+      completionOwnerId: "injected-base-review-owner",
+      reviewBase: `${harness.repo.head.slice(0, 8)};touch>${marker}`,
+    });
+
+    await harness.completeAndSettle(fixture.completion);
+
+    const lifecycle = await harness.readLifecycle();
+    assert.ok(lifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("injected-base-review-run:review-rejected")));
+    await assert.rejects(readFile(marker), { code: "ENOENT" });
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("asynchronous reviews reject an ambiguous abbreviated commit base at launch", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness();
+  try {
+    const tree = git(harness.repo.root, "rev-parse", `${harness.repo.head}^{tree}`);
+    const writeCollisionCommit = (messageIndex: 56 | 238): string => execFileSync(
+      "git",
+      ["hash-object", "-t", "commit", "-w", "--stdin"],
+      {
+        cwd: harness.repo.root,
+        encoding: "utf8",
+        input: [
+          `tree ${tree}`,
+          "author Test User <test@example.invalid> 0 +0000",
+          "committer Test User <test@example.invalid> 0 +0000",
+          "",
+          `ambiguous abbreviated base ${messageIndex}`,
+          "",
+        ].join("\n"),
+      },
+    ).trim();
+    const firstCommit = writeCollisionCommit(56);
+    const secondCommit = writeCollisionCommit(238);
+    assert.equal(firstCommit.slice(0, 4), secondCommit.slice(0, 4));
+
+    await assert.rejects(harness.launchReview({
+      runId: "ambiguous-base-review-run",
+      toolCallId: "ambiguous-base-review-tool",
+      completionOwnerId: "ambiguous-base-review-owner",
+      reviewBase: firstCommit.slice(0, 4),
+    }), /ambiguous|short SHA|unknown revision/i);
   } finally {
     await harness.dispose();
   }
@@ -2794,40 +3089,73 @@ test("an asynchronous review completed after a content mutation cannot prove the
   }
 });
 
-test("dirty asynchronous review scope survives a content-identical commit but not a changed source base", async (): Promise<void> => {
+test("dirty asynchronous reviews reject tasks that omit staged, unstaged, and untracked scope", async (): Promise<void> => {
   const harness = await createAsyncReviewHarness();
   try {
     await writeFile(join(harness.repo.root, "README.md"), "project\nrepaired\n");
     await harness.recordPassingTests();
-    const candidate = await asyncReviewCandidate(harness);
-
     const omittedScope = await harness.launchReview({
       runId: "omitted-dirty-scope-run",
       toolCallId: "omitted-dirty-scope-tool",
       completionOwnerId: "omitted-dirty-scope-owner",
     });
-    await harness.completeAndSettle(omittedScope.completion);
-    const omittedLifecycle = await harness.readLifecycle();
-    assert.ok(omittedLifecycle.outstandingJobs.some((job): boolean =>
-      job.includes("omitted-dirty-scope-run:review-rejected")));
 
+    await harness.completeAndSettle(omittedScope.completion);
+
+    const lifecycle = await harness.readLifecycle();
+    assert.ok(lifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("omitted-dirty-scope-run:review-rejected")));
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("valid dirty review proof survives a content-identical commit", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness();
+  try {
+    await writeFile(join(harness.repo.root, "README.md"), "project\nrepaired\n");
+    await harness.recordPassingTests();
+    const dirtyCandidate = await asyncReviewCandidate(harness);
     const fullScope = await harness.launchReview({
-      runId: "repaired-candidate-run",
-      toolCallId: "repaired-candidate-tool",
-      completionOwnerId: "repaired-candidate-owner",
+      runId: "commit-correspondence-run",
+      toolCallId: "commit-correspondence-tool",
+      completionOwnerId: "commit-correspondence-owner",
       dirtyScope: true,
     });
     await harness.completeAndSettle(fullScope.completion);
-    const records = await readAsyncReviewEvidence(harness, candidate);
-    for (const record of records) await new FileNativeEvidenceAdapter().verify({ record, candidate });
+    const records = await readAsyncReviewEvidence(harness, dirtyCandidate);
 
     git(harness.repo.root, "add", "README.md");
     git(harness.repo.root, "commit", "-qm", "commit reviewed content");
     const committedCandidate = await asyncReviewCandidate(harness);
-    assert.equal(committedCandidate.codeStateDigest, candidate.codeStateDigest);
-    assert.notEqual(committedCandidate.head, candidate.head);
+
+    assert.equal(committedCandidate.codeStateDigest, dirtyCandidate.codeStateDigest);
+    assert.notEqual(committedCandidate.head, dirtyCandidate.head);
     for (const record of records) await new FileNativeEvidenceAdapter().verify({ record, candidate: committedCandidate });
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("dirty review proof rejects a changed source base after a content-identical commit", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness();
+  try {
+    await writeFile(join(harness.repo.root, "README.md"), "project\nrepaired\n");
+    await harness.recordPassingTests();
+    const dirtyCandidate = await asyncReviewCandidate(harness);
+    const fullScope = await harness.launchReview({
+      runId: "changed-base-run",
+      toolCallId: "changed-base-tool",
+      completionOwnerId: "changed-base-owner",
+      dirtyScope: true,
+    });
+    await harness.completeAndSettle(fullScope.completion);
+    const records = await readAsyncReviewEvidence(harness, dirtyCandidate);
+    git(harness.repo.root, "add", "README.md");
+    git(harness.repo.root, "commit", "-qm", "commit reviewed content");
+    const committedCandidate = await asyncReviewCandidate(harness);
     const reviewRecord = records.find((record): boolean => record.kind === "reviews")!;
+
     await assert.rejects(
       new FileNativeEvidenceAdapter().verify({
         record: reviewRecord,

@@ -74,6 +74,10 @@ interface LaunchRefSnapshot {
   name: string;
   objectId: string;
 }
+interface LaunchCommitSnapshot {
+  expression: string;
+  objectId: string;
+}
 interface PendingSubagentLaunch {
   toolCallId: string;
   cwd: string;
@@ -86,6 +90,7 @@ interface PendingSubagentLaunch {
   launchHead: string;
   launchStatusDigest: string;
   launchRefs: LaunchRefSnapshot[];
+  launchCommits: LaunchCommitSnapshot[];
   args: unknown;
   launchedAt: number;
   sequence: number;
@@ -420,7 +425,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
       if (sourceSessionId) {
         const sessionFile = ctx.sessionManager.getSessionFile?.();
         const asyncReviewRequested = looksLikeReviewRequest(event.args);
-        const launchGit = await captureReviewLaunchGitState(ctx.cwd, asyncReviewRequested);
+        const launchGit = await captureReviewLaunchGitState(ctx.cwd, asyncReviewRequested, event.args);
         const producerSessionRoot = asyncReviewRequested
           ? await resolveProducerSessionRoot(event.args, sessionFile)
           : {};
@@ -436,6 +441,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
           launchHead: launchGit.head,
           launchStatusDigest: launchGit.statusDigest,
           launchRefs: launchGit.refs,
+          launchCommits: launchGit.commits,
           args: event.args,
           launchedAt: Date.now(),
           sequence: ++nativeEvidenceSequence,
@@ -1009,11 +1015,12 @@ async function captureCodeStateDigest(cwd: string): Promise<string> {
   return candidate.codeStateDigest;
 }
 
-async function captureReviewLaunchGitState(cwd: string, includeRefs: boolean): Promise<{
+async function captureReviewLaunchGitState(cwd: string, includeRefs: boolean, args: unknown): Promise<{
   head: string;
   codeStateDigest: string;
   statusDigest: string;
   refs: LaunchRefSnapshot[];
+  commits: LaunchCommitSnapshot[];
 }> {
   const git = new RealGitWorktreeAdapter();
   const worktree = await git.inspectWorktree(cwd);
@@ -1035,12 +1042,27 @@ async function captureReviewLaunchGitState(cwd: string, includeRefs: boolean): P
   if ((includeRefs && refs.length === 0) || refs.length > 20_000) {
     throw new Error("Git review ref snapshot was empty or exceeded its bound");
   }
+  const commitExpressions = includeRefs ? extractReviewCommitExpressions(args) : [];
+  const commits = await Promise.all(commitExpressions.map(async (expression): Promise<LaunchCommitSnapshot> => ({
+    expression,
+    objectId: await gitResolveCommit(cwd, expression),
+  })));
   return {
     head: candidate.head,
     codeStateDigest: candidate.codeStateDigest,
     statusDigest: candidate.statusDigest,
     refs,
+    commits,
   };
+}
+
+function extractReviewCommitExpressions(args: unknown): string[] {
+  const serialized = serializeBoundedToolArgs(args);
+  if (!serialized) return [];
+  return [...new Set(
+    [...serialized.matchAll(/\bgit[ \t]+diff[ \t]+([a-f0-9]{4,40})\.\.\.HEAD\b/gi)]
+      .map((match): string => match[1]!.toLowerCase()),
+  )];
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {
@@ -1445,7 +1467,18 @@ function taskCoversDirtyLaunch(task: string): boolean {
 }
 
 async function resolveLaunchRef(expression: string, launch: AsyncReviewLaunch): Promise<string> {
-  if (/^[a-f0-9]{40}$/i.test(expression)) return gitResolveCommit(launch.cwd, expression.toLowerCase());
+  if (/^[a-f0-9]{4,40}$/i.test(expression)) {
+    const normalized = expression.toLowerCase();
+    const matches = launch.launchCommits.filter((commit): boolean => commit.expression === normalized);
+    if (matches.length !== 1) {
+      throw new Error("Reviewer child task commit base was absent or ambiguous in the launch snapshot");
+    }
+    const current = await gitResolveCommit(launch.cwd, normalized);
+    if (current !== matches[0]!.objectId) {
+      throw new Error("Reviewer child task commit base changed after launch");
+    }
+    return matches[0]!.objectId;
+  }
   if (/^HEAD(?:(?:~[0-9]{1,6})|(?:\^[0-9]{0,6}))*$/.test(expression)) {
     return gitResolveCommit(launch.cwd, `${launch.launchHead}${expression.slice(4)}`);
   }
@@ -1454,7 +1487,12 @@ async function resolveLaunchRef(expression: string, launch: AsyncReviewLaunch): 
   ) throw new Error("Reviewer child task used an unsupported review base expression");
   const matches = launch.launchRefs.filter((ref): boolean => refAliases(ref.name).includes(expression));
   if (matches.length !== 1) throw new Error("Reviewer child task review base was absent or ambiguous in the launch ref snapshot");
-  return gitResolveCommit(launch.cwd, matches[0]!.objectId);
+  const [snapshotCommit, currentCommit] = await Promise.all([
+    gitResolveCommit(launch.cwd, matches[0]!.objectId),
+    gitResolveCommit(launch.cwd, expression),
+  ]);
+  if (currentCommit !== snapshotCommit) throw new Error("Reviewer child task review base ref moved after launch");
+  return snapshotCommit;
 }
 
 function refAliases(name: string): string[] {
