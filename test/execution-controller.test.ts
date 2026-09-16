@@ -36,6 +36,7 @@ import { registerHerdrExtension } from "../src/extension.js";
 import { FileWorkerBridgeTransport } from "../src/file-worker-bridge.js";
 import { LocalControllerDaemon, UnixControllerClient } from "../src/local-daemon.js";
 import { FileNativeEvidenceAdapter } from "../src/native-evidence.js";
+import type { NativeEvidenceFenceOptions } from "../src/native-evidence-fence.js";
 import {
   NATIVE_EVIDENCE_STATE_FILE,
   readNativeEvidenceState,
@@ -54,7 +55,7 @@ import type {
 import { formatPreparationPreview } from "../src/presentation.js";
 import { LocalSetupRuntime } from "../src/setup-runtime.js";
 import { JsonControllerStateStore } from "../src/state-store.js";
-import herdrWorkerBridge from "../src/worker-bridge.js";
+import herdrWorkerBridge, { type HerdrWorkerBridgeOptions } from "../src/worker-bridge.js";
 
 interface TestRepository { root: string; statePath: string; head: string }
 
@@ -1584,6 +1585,8 @@ type ProducedNativeEvidence = Awaited<ReturnType<typeof import("../src/native-ev
 interface DirectEvidenceHarness {
   repo: TestRepository;
   workerRoot: string;
+  bridgeRoot: string;
+  bridgeChannel: WorkerBridgeChannel;
   candidate: Awaited<ReturnType<RealGitWorktreeAdapter["captureCandidate"]>>;
   context: Record<string, unknown>;
   tools: Map<string, { execute: (...args: any[]) => Promise<any> }>;
@@ -1595,36 +1598,64 @@ interface DirectEvidenceHarness {
   readLifecycle: () => Promise<WorkerLifecycleReceipt>;
   settle: () => Promise<void>;
   reload: () => Promise<void>;
+  beginReload: () => Promise<void>;
   recreateRuntime: () => Promise<void>;
   setAppendEntryFailure: (enabled: boolean) => void;
   setPassedAppendFailure: (enabled: boolean) => void;
   restrictEvidenceWrites: () => Promise<void>;
   restoreEvidenceWrites: () => Promise<void>;
+  accept: (records: ProducedNativeEvidence) => Promise<ControllerResult<ExecutionAttempt>>;
   assertPublicAcceptanceBlocked: (records: ProducedNativeEvidence) => Promise<void>;
   dispose: () => Promise<void>;
 }
 
-async function createDirectEvidenceHarness(): Promise<DirectEvidenceHarness> {
+async function createDirectEvidenceHarness(options: {
+  workerFence?: NativeEvidenceFenceOptions;
+  controllerFence?: NativeEvidenceFenceOptions;
+  challenge?: HerdrWorkerBridgeOptions["challenge"];
+  scheduleChallengePoll?: HerdrWorkerBridgeOptions["scheduleChallengePoll"];
+  allowAcceptanceFinalization?: boolean;
+} = {}): Promise<DirectEvidenceHarness> {
   const repo = await repository();
   const worker = new ControlledWorker();
+  let reviewNumber = 0;
   const acceptance: AcceptanceAdapters = {
-    nativeEvidence: new FileNativeEvidenceAdapter(),
+    nativeEvidence: new FileNativeEvidenceAdapter(options.controllerFence),
     checks: { async execute(): Promise<never> { throw new Error("checks must not run while lifecycle evidence is blocked"); } },
-    reviewer: { async review(): Promise<never> { throw new Error("reviews must not run while lifecycle evidence is blocked"); } },
-    nativeVerifier: { async verify(): Promise<never> { throw new Error("verification must not run while lifecycle evidence is blocked"); } },
+    reviewer: {
+      async review(input) {
+        if (!options.allowAcceptanceFinalization) throw new Error("reviews must not run while lifecycle evidence is blocked");
+        reviewNumber += 1;
+        return {
+          kind: input.kind,
+          verdict: "passed",
+          candidateCommit: input.candidateCommit,
+          reviewBase: input.reviewBase,
+          freshSessionId: `reload-race-review-${reviewNumber}`,
+          findings: [],
+          evidenceReference: `/evidence/reload-race-${reviewNumber}.json`,
+          completedAt: "2026-09-12T14:00:00.000Z",
+        };
+      },
+    },
+    nativeVerifier: { async verify(): Promise<never> { throw new Error("verification must not run for content-identical staging"); } },
   };
   const running = await start(repo, worker, acceptance);
   const workerRoot = running.attempt.worktree!.path;
-  const bridgeDirectory = join(repo.root, ".git", "herdr", "native-producer");
-  await mkdir(bridgeDirectory, { recursive: true });
+  const bridgeRoot = join(repo.root, ".git", "herdr", "native-producer");
+  const bridgeTransport = new FileWorkerBridgeTransport(bridgeRoot, {
+    generateNonce: (): string => "native-producer-nonce",
+  });
+  const bridgeChannel = await bridgeTransport.openChannel("native-producer");
+  const bridgeDirectory = dirname(bridgeChannel.endpoint);
   const previousEndpoint = process.env.HERDR_WORKER_BRIDGE_ENDPOINT;
   const previousNonce = process.env.HERDR_WORKER_BRIDGE_NONCE;
   const previousVerificationEndpoint = process.env.HERDR_WORKER_NATIVE_VERIFICATION_ENDPOINT;
   const previousReviewNonce = process.env.HERDR_WORKER_REVIEW_NONCE;
   const previousPiSubagentsTempRoot = process.env.PI_SUBAGENTS_TEMP_ROOT;
   const piSubagentsTempRoot = join(bridgeDirectory, "pi-subagents-temp");
-  process.env.HERDR_WORKER_BRIDGE_ENDPOINT = join(bridgeDirectory, "readiness.json");
-  process.env.HERDR_WORKER_BRIDGE_NONCE = "native-producer-nonce";
+  process.env.HERDR_WORKER_BRIDGE_ENDPOINT = bridgeChannel.endpoint;
+  process.env.HERDR_WORKER_BRIDGE_NONCE = bridgeChannel.nonce;
   process.env.HERDR_WORKER_NATIVE_VERIFICATION_ENDPOINT = join(bridgeDirectory, "native-verification.json");
   process.env.HERDR_WORKER_REVIEW_NONCE = "native-verification-nonce";
   process.env.PI_SUBAGENTS_TEMP_ROOT = piSubagentsTempRoot;
@@ -1692,8 +1723,15 @@ async function createDirectEvidenceHarness(): Promise<DirectEvidenceHarness> {
   let evidencePermissionsRestricted = false;
   let acceptanceAttempt: { attemptId: string; candidateDigest: string } | undefined;
 
-  herdrWorkerBridge(fakePi);
+  herdrWorkerBridge(fakePi, {
+    ...(options.workerFence ? { fence: options.workerFence } : {}),
+    ...(options.challenge ? { challenge: options.challenge } : {}),
+    ...(options.scheduleChallengePoll ? { scheduleChallengePoll: options.scheduleChallengePoll } : {}),
+  });
   await hostHandlers.get("session_start")!({ reason: "startup" }, context);
+  if (options.allowAcceptanceFinalization) {
+    await writeFile(join(workerRoot, "reload-race-candidate.js"), "export const reloadRace = true;\n");
+  }
   const candidate = await new RealGitWorktreeAdapter().captureCandidate({
     path: workerRoot,
     sourceBase: running.attempt.worktree!.head,
@@ -1823,14 +1861,22 @@ async function createDirectEvidenceHarness(): Promise<DirectEvidenceHarness> {
     await preparePublicAcceptance();
     return records;
   };
-  const reload = async (): Promise<void> => {
+  const beginReload = async (): Promise<void> => {
     await hostHandlers.get("session_start")!({ reason: "reload" }, context);
+  };
+  const reload = async (): Promise<void> => {
+    await beginReload();
     await settle();
   };
   const recreateRuntime = async (): Promise<void> => {
+    await hostHandlers.get("session_shutdown")?.({ reason: "reload" }, context);
     hostHandlers.clear();
     tools.clear();
-    herdrWorkerBridge(fakePi);
+    herdrWorkerBridge(fakePi, {
+      ...(options.workerFence ? { fence: options.workerFence } : {}),
+      ...(options.challenge ? { challenge: options.challenge } : {}),
+      ...(options.scheduleChallengePoll ? { scheduleChallengePoll: options.scheduleChallengePoll } : {}),
+    });
     await hostHandlers.get("session_start")!({ reason: "reload" }, context);
     await settle();
   };
@@ -1848,14 +1894,17 @@ async function createDirectEvidenceHarness(): Promise<DirectEvidenceHarness> {
     await chmod(evidenceDirectory, 0o700);
     evidencePermissionsRestricted = false;
   };
-  const assertPublicAcceptanceBlocked = async (records: ProducedNativeEvidence): Promise<void> => {
+  const accept = async (records: ProducedNativeEvidence): Promise<ControllerResult<ExecutionAttempt>> => {
     await preparePublicAcceptance();
     if (!acceptanceAttempt) throw new Error("Public acceptance fixture was not prepared");
-    const rejected = await running.controller.acceptCandidate(actor, {
+    return running.controller.acceptCandidate(actor, {
       attemptId: acceptanceAttempt.attemptId,
       candidateDigest: acceptanceAttempt.candidateDigest,
       nativeEvidence: records,
     });
+  };
+  const assertPublicAcceptanceBlocked = async (records: ProducedNativeEvidence): Promise<void> => {
+    const rejected = await accept(records);
     assert.equal(rejected.ok, false);
     if (!rejected.ok) {
       assert.deepEqual(rejected.error.diagnostics, [
@@ -1864,6 +1913,7 @@ async function createDirectEvidenceHarness(): Promise<DirectEvidenceHarness> {
     }
   };
   const dispose = async (): Promise<void> => {
+    await hostHandlers.get("session_shutdown")?.({ reason: "quit" }, context);
     if (evidencePermissionsRestricted) await chmod(evidenceDirectory, 0o700);
     if (previousEndpoint === undefined) delete process.env.HERDR_WORKER_BRIDGE_ENDPOINT;
     else process.env.HERDR_WORKER_BRIDGE_ENDPOINT = previousEndpoint;
@@ -1880,6 +1930,8 @@ async function createDirectEvidenceHarness(): Promise<DirectEvidenceHarness> {
   return {
     repo,
     workerRoot,
+    bridgeRoot,
+    bridgeChannel,
     candidate,
     context,
     tools,
@@ -1891,11 +1943,13 @@ async function createDirectEvidenceHarness(): Promise<DirectEvidenceHarness> {
     readLifecycle,
     settle,
     reload,
+    beginReload,
     recreateRuntime,
     setAppendEntryFailure,
     setPassedAppendFailure,
     restrictEvidenceWrites,
     restoreEvidenceWrites,
+    accept,
     assertPublicAcceptanceBlocked,
     dispose,
   };
@@ -1988,6 +2042,240 @@ test("runtime recreation rejects passing evidence from the previous lifecycle ge
       /stale|lifecycle|obligation/i,
     );
   } finally {
+    await harness.dispose();
+  }
+});
+
+test("a fresh generation publishes required-obligation blockers before reporting a settled lifecycle", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness();
+  try {
+    await harness.settle();
+
+    const lifecycle = await harness.readLifecycle();
+    assert.equal(lifecycle.state, "settled");
+    assert.ok(lifecycle.outstandingJobs.includes("native-evidence-obligation:tests:required"));
+    assert.ok(lifecycle.outstandingJobs.includes("native-evidence-obligation:reviews:required"));
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("only fresh same-generation obligations recover public acceptance after reload", async (): Promise<void> => {
+  const harness = await createDirectEvidenceHarness({ allowAcceptanceFinalization: true });
+  try {
+    const cachedRecords = await harness.publishPassingEvidence();
+    await harness.reload();
+    assert.equal((await harness.accept(cachedRecords)).ok, false);
+
+    await harness.completeReview("fresh-review-after-generation-rotation", "passed");
+    await harness.completeBash(
+      "fresh-test-after-generation-rotation",
+      "node --import tsx --test test/execution-controller.test.ts",
+      false,
+    );
+    await harness.settle();
+    const freshRecords = await harness.readEvidence();
+
+    assert.equal(value(await harness.accept(freshRecords)).lifecycle, "accepted");
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("reload-owned lifecycle fencing prevents public acceptance from advancing the batch branch", async (): Promise<void> => {
+  let fenceArmed = false;
+  let announceFence!: () => void;
+  const fenceAcquired = new Promise<void>((resolve): void => { announceFence = resolve; });
+  let releaseFence!: () => void;
+  const holdFence = new Promise<void>((resolve): void => { releaseFence = resolve; });
+  let controllerNow = 0;
+  const harness = await createDirectEvidenceHarness({
+    allowAcceptanceFinalization: true,
+    workerFence: {
+      onAcquired: async (): Promise<void> => {
+        if (!fenceArmed) return;
+        announceFence();
+        await holdFence;
+      },
+    },
+    controllerFence: {
+      deadlineMs: 1,
+      now: (): number => controllerNow,
+      wait: async (): Promise<void> => { controllerNow += 1; },
+    },
+  });
+  try {
+    const cachedRecords = await harness.publishPassingEvidence();
+    fenceArmed = true;
+    const reconstruction = harness.beginReload();
+    await fenceAcquired;
+
+    const blocked = value(await harness.accept(cachedRecords));
+
+    assert.equal(blocked.lifecycle, "integration-blocked");
+    const receipt = blocked.candidateReceipts![0]!;
+    assert.ok(receipt.integration, receipt.findings.join("\n"));
+    assert.equal(git(receipt.integration.worktree.path, "rev-parse", "HEAD"), harness.repo.head);
+    releaseFence();
+    await reconstruction;
+  } finally {
+    releaseFence();
+    await harness.dispose();
+  }
+});
+
+test("acceptance-owned lifecycle fencing advances and persists before reload rotates the generation", async (): Promise<void> => {
+  let announceAcceptanceFence!: () => void;
+  const acceptanceFenceAcquired = new Promise<void>((resolve): void => { announceAcceptanceFence = resolve; });
+  let releaseAcceptanceFence!: () => void;
+  const holdAcceptanceFence = new Promise<void>((resolve): void => { releaseAcceptanceFence = resolve; });
+  let announceReloadWait!: () => void;
+  const reloadWaiting = new Promise<void>((resolve): void => { announceReloadWait = resolve; });
+  let retryReload!: () => void;
+  const allowReloadRetry = new Promise<void>((resolve): void => { retryReload = resolve; });
+  let reloadWaitAnnounced = false;
+  const harness = await createDirectEvidenceHarness({
+    allowAcceptanceFinalization: true,
+    controllerFence: {
+      onAcquired: async (): Promise<void> => {
+        announceAcceptanceFence();
+        await holdAcceptanceFence;
+      },
+    },
+    workerFence: {
+      wait: async (): Promise<void> => {
+        if (!reloadWaitAnnounced) {
+          reloadWaitAnnounced = true;
+          announceReloadWait();
+        }
+        await allowReloadRetry;
+      },
+    },
+  });
+  try {
+    const records = await harness.publishPassingEvidence();
+    const statePath = join(dirname(process.env.HERDR_WORKER_BRIDGE_ENDPOINT!), NATIVE_EVIDENCE_STATE_FILE);
+    const generationBefore = (await readNativeEvidenceState(statePath)).generation;
+    const accepting = harness.accept(records);
+    await acceptanceFenceAcquired;
+
+    const reconstruction = harness.beginReload();
+    await reloadWaiting;
+    assert.equal((await readNativeEvidenceState(statePath)).generation, generationBefore);
+
+    releaseAcceptanceFence();
+    const accepted = value(await accepting);
+    retryReload();
+    await reconstruction;
+
+    assert.equal(accepted.lifecycle, "accepted");
+    assert.equal(git(accepted.candidateReceipts![0]!.integration!.worktree.path, "rev-parse", "HEAD"), accepted.acceptedCommit);
+    assert.notEqual((await readNativeEvidenceState(statePath)).generation, generationBefore);
+  } finally {
+    releaseAcceptanceFence();
+    retryReload();
+    await harness.dispose();
+  }
+});
+
+test("a reconstructing worker does not answer a public lifecycle challenge", async (): Promise<void> => {
+  let pollChallenge: (() => void) | undefined;
+  let fenceArmed = false;
+  let announceFence!: () => void;
+  const fenceAcquired = new Promise<void>((resolve): void => { announceFence = resolve; });
+  let releaseFence!: () => void;
+  const holdFence = new Promise<void>((resolve): void => { releaseFence = resolve; });
+  const harness = await createDirectEvidenceHarness({
+    scheduleChallengePoll: (poll): (() => void) => {
+      pollChallenge = poll;
+      return (): void => {};
+    },
+    workerFence: {
+      onAcquired: async (): Promise<void> => {
+        if (!fenceArmed) return;
+        announceFence();
+        await holdFence;
+      },
+    },
+  });
+  try {
+    await harness.publishPassingEvidence();
+    fenceArmed = true;
+    const reconstruction = harness.beginReload();
+    await fenceAcquired;
+    let now = 0;
+    const transport = new FileWorkerBridgeTransport(harness.bridgeRoot, {
+      generateNonce: (): string => "reconstructing-challenge",
+      now: (): number => now,
+      pollIntervalMs: 1,
+      sleep: async (): Promise<void> => {
+        pollChallenge!();
+        await Promise.resolve();
+        now += 1;
+      },
+    });
+
+    await assert.rejects(
+      transport.challengeLifecycle(harness.bridgeChannel, process.pid, 2),
+      /timed out without a live bridge response/,
+    );
+    releaseFence();
+    await reconstruction;
+  } finally {
+    releaseFence();
+    await harness.dispose();
+  }
+});
+
+test("a lifecycle response already reading a challenge is discarded across reload", async (): Promise<void> => {
+  let pollChallenge: (() => void) | undefined;
+  let announceRead!: () => void;
+  const challengeRead = new Promise<void>((resolve): void => { announceRead = resolve; });
+  let releaseRead!: () => void;
+  const holdRead = new Promise<void>((resolve): void => { releaseRead = resolve; });
+  let releaseTransport!: () => void;
+  const holdTransport = new Promise<void>((resolve): void => { releaseTransport = resolve; });
+  const harness = await createDirectEvidenceHarness({
+    scheduleChallengePoll: (poll): (() => void) => {
+      pollChallenge = poll;
+      return (): void => {};
+    },
+    challenge: {
+      afterRead: async (): Promise<void> => {
+        announceRead();
+        await holdRead;
+      },
+    },
+  });
+  try {
+    await harness.publishPassingEvidence();
+    let now = 0;
+    let firstSleep = true;
+    const transport = new FileWorkerBridgeTransport(harness.bridgeRoot, {
+      generateNonce: (): string => "inflight-challenge",
+      now: (): number => now,
+      pollIntervalMs: 1,
+      sleep: async (): Promise<void> => {
+        if (firstSleep) {
+          firstSleep = false;
+          pollChallenge!();
+          await challengeRead;
+          await holdTransport;
+        }
+        now += 1;
+      },
+    });
+    const challenged = transport.challengeLifecycle(harness.bridgeChannel, process.pid, 1);
+    await challengeRead;
+
+    await harness.beginReload();
+    releaseRead();
+    releaseTransport();
+
+    await assert.rejects(challenged, /timed out without a live bridge response/);
+  } finally {
+    releaseRead();
+    releaseTransport();
     await harness.dispose();
   }
 });
@@ -2191,7 +2479,7 @@ test("a session append failure blocks controller acceptance immediately", async 
 
 test("a newer sidecar pending state is not overwritten by an older session pass", async (): Promise<void> => {
   const harness = await createDirectEvidenceHarness();
-  const statePath = join(harness.repo.root, ".git", "herdr", "native-producer", NATIVE_EVIDENCE_STATE_FILE);
+  const statePath = join(dirname(harness.bridgeChannel.endpoint), NATIVE_EVIDENCE_STATE_FILE);
   try {
     await harness.publishPassingEvidence();
     harness.setAppendEntryFailure(true);
@@ -2267,7 +2555,7 @@ test("newer test proof recovers after a failed passed-state append", async (): P
 
 test("a sidecar write failure immediately rejects earlier passing test evidence", async (): Promise<void> => {
   const harness = await createDirectEvidenceHarness();
-  const statePath = join(harness.repo.root, ".git", "herdr", "native-producer", NATIVE_EVIDENCE_STATE_FILE);
+  const statePath = join(dirname(harness.bridgeChannel.endpoint), NATIVE_EVIDENCE_STATE_FILE);
   try {
     const cachedRecords = await harness.publishPassingEvidence();
     await rm(statePath);
@@ -2288,7 +2576,7 @@ test("a sidecar write failure immediately rejects earlier passing test evidence"
 
 test("a newer session pending test state survives sidecar failure and runtime recreation", async (): Promise<void> => {
   const harness = await createDirectEvidenceHarness();
-  const statePath = join(harness.repo.root, ".git", "herdr", "native-producer", NATIVE_EVIDENCE_STATE_FILE);
+  const statePath = join(dirname(harness.bridgeChannel.endpoint), NATIVE_EVIDENCE_STATE_FILE);
   try {
     const cachedRecords = await harness.publishPassingEvidence();
     await rm(statePath);
@@ -2332,7 +2620,7 @@ test("restored session append I/O allows fresh same-generation evidence recovery
 
 test("same-sequence pending and passed store conflict restores as pending", async (): Promise<void> => {
   const harness = await createDirectEvidenceHarness();
-  const statePath = join(harness.repo.root, ".git", "herdr", "native-producer", NATIVE_EVIDENCE_STATE_FILE);
+  const statePath = join(dirname(harness.bridgeChannel.endpoint), NATIVE_EVIDENCE_STATE_FILE);
   try {
     await harness.publishPassingEvidence();
     const priorPassed = await readNativeEvidenceState(statePath);
@@ -2362,7 +2650,7 @@ test("same-sequence pending and passed store conflict restores as pending", asyn
 
 test("a malformed sidecar rejects cached evidence after runtime recreation", async (): Promise<void> => {
   const harness = await createDirectEvidenceHarness();
-  const statePath = join(harness.repo.root, ".git", "herdr", "native-producer", NATIVE_EVIDENCE_STATE_FILE);
+  const statePath = join(dirname(harness.bridgeChannel.endpoint), NATIVE_EVIDENCE_STATE_FILE);
   try {
     const cachedRecords = await harness.publishPassingEvidence();
     await writeFile(statePath, "{malformed\n");

@@ -4,6 +4,11 @@ import { dirname, isAbsolute, join } from "node:path";
 import { readBoundedRegularFile } from "./bounded-regular-file.js";
 import type { CandidateGitState, NativeEvidencePort, NativeEvidenceRecord } from "./contracts.js";
 import {
+  NativeEvidenceFence,
+  NativeEvidenceFenceContentionError,
+  type NativeEvidenceFenceOptions,
+} from "./native-evidence-fence.js";
+import {
   NATIVE_EVIDENCE_STATE_FILE,
   isNativeEvidenceLifecycleBinding,
   readNativeEvidenceState,
@@ -34,35 +39,72 @@ export async function readProducedNativeEvidence(
   return structuredClone(records);
 }
 
-/** Resolves a retained native-skill receipt and verifies its immutable code-state binding. */
+/** Resolves retained native-skill receipts and fences final acceptance against lifecycle rotation. */
 export class FileNativeEvidenceAdapter implements NativeEvidencePort {
+  private readonly fence: NativeEvidenceFence;
+
+  constructor(fenceOptions: NativeEvidenceFenceOptions = {}) {
+    this.fence = new NativeEvidenceFence(fenceOptions);
+  }
+
   async verify(input: { record: NativeEvidenceRecord; candidate: CandidateGitState }): Promise<void> {
-    const { record, candidate } = input;
-    if (!isAbsolute(record.evidenceReference)) throw new Error("Native evidence reference must be an absolute local artifact");
-    const bytes = await readNativeEvidenceFile(record.evidenceReference);
-    if (hash(bytes) !== record.evidenceDigest) throw new Error("Native evidence artifact digest changed");
-    const parsed: unknown = JSON.parse(bytes.toString("utf8"));
-    if (!isReceipt(parsed) || parsed.kind !== record.kind || parsed.status !== record.status ||
-      parsed.codeStateDigest !== candidate.codeStateDigest || parsed.codeStateDigest !== record.codeStateDigest ||
-      parsed.completedAt !== record.completedAt || parsed.lifecycle.obligation !== record.kind ||
-      parsed.lifecycle.reference !== join(dirname(dirname(record.evidenceReference)), NATIVE_EVIDENCE_STATE_FILE)
-    ) throw new Error("Native evidence artifact is malformed, stale, or candidate-mismatched");
-    const lifecycle = await readNativeEvidenceState(parsed.lifecycle.reference);
-    const obligation = lifecycle.obligations[record.kind];
-    if (lifecycle.sessionId !== parsed.lifecycle.sessionId || lifecycle.generation !== parsed.lifecycle.generation ||
-      obligation.sequence !== parsed.lifecycle.sequence || obligation.status !== "passed" ||
-      obligation.proof?.codeStateDigest !== parsed.codeStateDigest || obligation.proof.completedAt !== parsed.completedAt
-    ) throw new Error("Native evidence obligation lifecycle is stale or unresolved");
-    for (const artifact of parsed.artifacts) {
-      if (!isAbsolute(artifact.reference) || artifact.reference === record.evidenceReference) {
-        throw new Error("Native evidence source artifact reference is unsafe");
-      }
-      const retained = await readNativeEvidenceFile(artifact.reference);
-      if (hash(retained) !== artifact.digest || !isProducerReceipt(JSON.parse(retained.toString("utf8")), parsed, candidate)) {
-        throw new Error("Native evidence source artifact is missing, changed, or candidate-mismatched");
-      }
+    await verifyRecord(input.record, input.candidate);
+  }
+
+  async guardFinalization<T>(input: {
+    records: NativeEvidenceRecord[];
+    candidate: CandidateGitState;
+    finalize: () => Promise<T>;
+  }): Promise<{ verified: false } | { verified: true; value: T }> {
+    const lifecyclePaths = new Set(input.records.map(lifecyclePathForRecord));
+    if (lifecyclePaths.size !== 1) return { verified: false };
+    const lifecyclePath = [...lifecyclePaths][0]!;
+    try {
+      return await this.fence.run(lifecyclePath, async (): Promise<{ verified: false } | { verified: true; value: T }> => {
+        try {
+          for (const record of input.records) await verifyRecord(record, input.candidate);
+        } catch {
+          return { verified: false };
+        }
+        return { verified: true, value: await input.finalize() };
+      });
+    } catch (error) {
+      if (error instanceof NativeEvidenceFenceContentionError) return { verified: false };
+      throw error;
     }
   }
+}
+
+async function verifyRecord(record: NativeEvidenceRecord, candidate: CandidateGitState): Promise<void> {
+  if (!isAbsolute(record.evidenceReference)) throw new Error("Native evidence reference must be an absolute local artifact");
+  const bytes = await readNativeEvidenceFile(record.evidenceReference);
+  if (hash(bytes) !== record.evidenceDigest) throw new Error("Native evidence artifact digest changed");
+  const parsed: unknown = JSON.parse(bytes.toString("utf8"));
+  if (!isReceipt(parsed) || parsed.kind !== record.kind || parsed.status !== record.status ||
+    parsed.codeStateDigest !== candidate.codeStateDigest || parsed.codeStateDigest !== record.codeStateDigest ||
+    parsed.completedAt !== record.completedAt || parsed.lifecycle.obligation !== record.kind ||
+    parsed.lifecycle.reference !== lifecyclePathForRecord(record)
+  ) throw new Error("Native evidence artifact is malformed, stale, or candidate-mismatched");
+  const lifecycle = await readNativeEvidenceState(parsed.lifecycle.reference);
+  const obligation = lifecycle.obligations[record.kind];
+  if (lifecycle.sessionId !== parsed.lifecycle.sessionId || lifecycle.generation !== parsed.lifecycle.generation ||
+    obligation.sequence !== parsed.lifecycle.sequence || obligation.status !== "passed" ||
+    obligation.proof?.codeStateDigest !== parsed.codeStateDigest || obligation.proof.completedAt !== parsed.completedAt
+  ) throw new Error("Native evidence obligation lifecycle is stale or unresolved");
+  for (const artifact of parsed.artifacts) {
+    if (!isAbsolute(artifact.reference) || artifact.reference === record.evidenceReference) {
+      throw new Error("Native evidence source artifact reference is unsafe");
+    }
+    const retained = await readNativeEvidenceFile(artifact.reference);
+    if (hash(retained) !== artifact.digest || !isProducerReceipt(JSON.parse(retained.toString("utf8")), parsed, candidate)) {
+      throw new Error("Native evidence source artifact is missing, changed, or candidate-mismatched");
+    }
+  }
+}
+
+function lifecyclePathForRecord(record: NativeEvidenceRecord): string {
+  if (!isAbsolute(record.evidenceReference)) throw new Error("Native evidence reference must be an absolute local artifact");
+  return join(dirname(dirname(record.evidenceReference)), NATIVE_EVIDENCE_STATE_FILE);
 }
 
 function isNativeEvidenceRecord(value: unknown): value is NativeEvidenceRecord {

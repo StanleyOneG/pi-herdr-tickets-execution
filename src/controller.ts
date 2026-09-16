@@ -843,7 +843,7 @@ export class PreparationController {
   ): Promise<ControllerResult<ExecutionAttempt>> {
     const current = await this.acceptanceContext(lease);
     if (!current.ok) return current;
-    const { state, attempt, receipt, preparation, execution } = current.value;
+    const { state, attempt, receipt, preparation, execution, acceptance } = current.value;
     const integration = receipt.integration;
     if (!integration) return this.blockAcceptance(state, attempt, receipt, "Integration staging evidence is incomplete");
     if (!preparation.proposal!.policy.requiredReviews.every((kind): boolean => receipt.reviews.some(
@@ -876,51 +876,75 @@ export class PreparationController {
     if (currentIntegration.head !== preparation.batchIntegration?.head) {
       return this.blockAcceptance(state, attempt, receipt, "Batch integration worktree moved outside recorded acceptance");
     }
-    const pendingIntegration: PendingIntegrationEffect = {
-      attemptId: attempt.id,
-      receiptId: receipt.id,
-      worktreePath: integration.worktree.path,
-      branch: integration.worktree.branch,
-      fromCommit: integration.staging.baseCommit,
-      toCommit: integration.staging.candidateCommit,
-      sequence: (preparation.batchIntegration?.sequence ?? 0) + 1,
-    };
-    preparation.pendingIntegration = pendingIntegration;
-    const journalled = await this.saveState(state);
-    if (!journalled.ok) return journalled;
-    let integratedCommit: string;
+    let guardedFinalization:
+      | { verified: false }
+      | { verified: true; value: ControllerResult<ExecutionAttempt> };
     try {
-      integratedCommit = await execution.git.advanceIntegration({
-        integration: integration.worktree,
-        staging: integration.staging,
+      guardedFinalization = await acceptance.nativeEvidence.guardFinalization({
+        records: receipt.nativeEvidence,
+        candidate: receipt.candidate,
+        finalize: async (): Promise<ControllerResult<ExecutionAttempt>> => {
+          const pendingIntegration: PendingIntegrationEffect = {
+            attemptId: attempt.id,
+            receiptId: receipt.id,
+            worktreePath: integration.worktree.path,
+            branch: integration.worktree.branch,
+            fromCommit: integration.staging.baseCommit,
+            toCommit: integration.staging.candidateCommit,
+            sequence: (preparation.batchIntegration?.sequence ?? 0) + 1,
+          };
+          preparation.pendingIntegration = pendingIntegration;
+          const journalled = await this.saveState(state);
+          if (!journalled.ok) return journalled;
+          let integratedCommit: string;
+          try {
+            integratedCommit = await execution.git.advanceIntegration({
+              integration: integration.worktree,
+              staging: integration.staging,
+            });
+          } catch {
+            try {
+              const afterFailure = await execution.git.inspectWorktree(integration.worktree.path);
+              if (afterFailure.head === pendingIntegration.toCommit && afterFailure.branch === pendingIntegration.branch) {
+                integratedCommit = pendingIntegration.toCommit;
+              } else if (afterFailure.head === pendingIntegration.fromCommit && afterFailure.branch === pendingIntegration.branch) {
+                delete preparation.pendingIntegration;
+                return this.blockAcceptance(state, attempt, receipt, "Integration advancement failed before changing the accepted branch");
+              } else {
+                return failure("infrastructure", ["Integration advancement has an ambiguous result and requires restart reconciliation"]);
+              }
+            } catch {
+              return failure("infrastructure", ["Integration advancement has an ambiguous result and requires restart reconciliation"]);
+            }
+          }
+          if (integratedCommit !== integration.staging.candidateCommit) {
+            return failure("infrastructure", ["Integration returned a mismatched commit and requires restart reconciliation"]);
+          }
+          receipt.integration!.integratedCommit = integratedCommit;
+          receipt.integration!.sequence = (preparation.batchIntegration?.sequence ?? 0) + 1;
+          preparation.batchIntegration = { head: integratedCommit, sequence: receipt.integration!.sequence };
+          delete preparation.pendingIntegration;
+          receipt.state = "accepted";
+          receipt.acceptedAt = this.dependencies.now().toISOString();
+          attempt.acceptedCommit = integratedCommit;
+          attempt.lifecycle = "accepted";
+          return this.persistAttempt(state, attempt);
+        },
       });
     } catch {
-      try {
-        const afterFailure = await execution.git.inspectWorktree(integration.worktree.path);
-        if (afterFailure.head === pendingIntegration.toCommit && afterFailure.branch === pendingIntegration.branch) {
-          integratedCommit = pendingIntegration.toCommit;
-        } else if (afterFailure.head === pendingIntegration.fromCommit && afterFailure.branch === pendingIntegration.branch) {
-          delete preparation.pendingIntegration;
-          return this.blockAcceptance(state, attempt, receipt, "Integration advancement failed before changing the accepted branch");
-        } else {
-          return failure("infrastructure", ["Integration advancement has an ambiguous result and requires restart reconciliation"]);
-        }
-      } catch {
-        return failure("infrastructure", ["Integration advancement has an ambiguous result and requires restart reconciliation"]);
-      }
+      return failure("infrastructure", [
+        "Native evidence finalization fencing failed; integration effects may require restart reconciliation",
+      ]);
     }
-    if (integratedCommit !== integration.staging.candidateCommit) {
-      return failure("infrastructure", ["Integration returned a mismatched commit and requires restart reconciliation"]);
+    if (!guardedFinalization.verified) {
+      return this.blockAcceptance(
+        state,
+        attempt,
+        receipt,
+        "Native implementation evidence changed before final batch advancement",
+      );
     }
-    receipt.integration!.integratedCommit = integratedCommit;
-    receipt.integration!.sequence = (preparation.batchIntegration?.sequence ?? 0) + 1;
-    preparation.batchIntegration = { head: integratedCommit, sequence: receipt.integration!.sequence };
-    delete preparation.pendingIntegration;
-    receipt.state = "accepted";
-    receipt.acceptedAt = this.dependencies.now().toISOString();
-    attempt.acceptedCommit = integratedCommit;
-    attempt.lifecycle = "accepted";
-    const integrated = await this.persistAttempt(state, attempt);
+    const integrated = guardedFinalization.value;
     if (!integrated.ok || !execution.worker.close || hasPendingDecision(attempt)) return integrated;
 
     const cleanupCandidate = await execution.git.captureCandidate({

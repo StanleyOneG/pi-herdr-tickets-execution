@@ -477,8 +477,17 @@ export interface GateCheckPort {
   execute(input: { cwd: string; command: string; candidateCommit: string }): Promise<GateCheckRecord>;
 }
 
+export type NativeEvidenceFinalizationGuardResult<T> =
+  | { verified: false }
+  | { verified: true; value: T };
+
 export interface NativeEvidencePort {
   verify(input: { record: NativeEvidenceRecord; candidate: CandidateGitState }): Promise<void>;
+  guardFinalization<T>(input: {
+    records: NativeEvidenceRecord[];
+    candidate: CandidateGitState;
+    finalize: () => Promise<T>;
+  }): Promise<NativeEvidenceFinalizationGuardResult<T>>;
 }
 
 export interface NativeVerificationPort {
