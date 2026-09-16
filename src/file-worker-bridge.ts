@@ -128,6 +128,11 @@ export class FileWorkerBridgeTransport implements WorkerBridgeTransport {
     }
   }
 
+  async invalidateLifecycle(channel: WorkerBridgeChannel): Promise<void> {
+    this.assertOwnedChannel(channel);
+    await removeIfPresent(channel.lifecycleEndpoint!);
+  }
+
   async challengeLifecycle(channel: WorkerBridgeChannel, expectedPiPid: number, timeoutMs: number): Promise<void> {
     this.assertOwnedChannel(channel);
     if (!Number.isSafeInteger(expectedPiPid) || expectedPiPid <= 0) throw new Error("Worker lifecycle challenge PID is invalid");

@@ -197,7 +197,7 @@ class ControlledWorker implements WorkerRuntimePort {
       initialHistoryEntries: 0,
       skillCommands: ["skill:implement", "skill:tdd", "skill:code-review", "skill:handoff"]
         .filter((skill): boolean => skill !== this.missingSkill),
-      toolNames: ["read", "bash", "edit", "write", "subagent"],
+      toolNames: ["read", "grep", "find", "ls", "bash", "edit", "write", "subagent", "herdr_orchestrator_operation"],
       contextFiles: [join(input.cwd, "AGENTS.md")],
     };
     return this.mutateIdentity?.(identity) ?? identity;
@@ -296,6 +296,164 @@ async function start(
     controller: ready.controller,
     attempt: value(await ready.controller.startTicket(actor, { preparationId: ready.preparationId, ticketIdentity: "ticket-4", workspaceId: "workspace-1" })),
   };
+}
+
+test("approved batch starts one fresh reasoning orchestrator without implementation dispatch", async (): Promise<void> => {
+  const repo = await repository();
+  const worker = new ControlledWorker();
+  const packets: string[] = [];
+  const runtime = Object.assign(worker, {
+    async dispatchSupervision(_identity: WorkerIdentity, packet: string): Promise<void> { packets.push(packet); },
+  });
+  const ready = await approved(repo, runtime);
+  const first = value(await ready.controller.startOrchestrator(actor, { preparationId: ready.preparationId, workspaceId: "workspace-1" }));
+  const duplicate = value(await ready.controller.startOrchestrator(actor, { preparationId: ready.preparationId, workspaceId: "workspace-1" }));
+  assert.equal(first.session?.initialHistoryEntries, 0);
+  assert.deepEqual(first.session?.model, proposal(repo).model);
+  assert.equal(duplicate.session?.sessionId, first.session?.sessionId);
+  assert.equal(worker.dispatches, 0);
+  assert.match(packets[0]!, /reasoning orchestrator/);
+  assert.match(packets[0]!, /spec-2/);
+  assert.match(packets[0]!, /ticket-4/);
+  assert.ok(Buffer.byteLength(packets[0]!) <= 32_000);
+  assert.equal(value(await ready.controller.getPreparation(actor, ready.preparationId)).orchestrator?.session?.sessionId, first.session?.sessionId);
+});
+
+test("reasoning orchestrator readiness requires its controller-operation policy without changing implementation readiness", async (): Promise<void> => {
+  const repo = await repository();
+  const worker = Object.assign(new ControlledWorker(), {
+    async dispatchSupervision(): Promise<void> {},
+  });
+  worker.mutateIdentity = (identity): WorkerIdentity => ({
+    ...identity,
+    toolNames: identity.toolNames.filter((name): boolean => name !== "herdr_orchestrator_operation"),
+  });
+  const ready = await approved(repo, worker);
+  const orchestrator = value(await ready.controller.startOrchestrator(actor, { preparationId: ready.preparationId, workspaceId: "workspace-1" }));
+  assert.equal(orchestrator.phase, "needs-attention");
+  assert.match(orchestrator.diagnostic!, /startup failed/);
+
+  const implementation = value(await ready.controller.startTicket(actor, {
+    preparationId: ready.preparationId,
+    ticketIdentity: "ticket-4",
+    workspaceId: "workspace-1",
+  }));
+  assert.equal(implementation.lifecycle, "running");
+});
+
+test("reasoning operations are batch fenced and a ticket boundary replaces only the orchestrator", async (): Promise<void> => {
+  const repo = await repository();
+  const packets: string[] = [];
+  const worker = Object.assign(new ControlledWorker(), {
+    async dispatchSupervision(_identity: WorkerIdentity, packet: string): Promise<void> { packets.push(packet); },
+    async retire(): Promise<void> {},
+  });
+  worker.inspectOverride = async (identity): Promise<WorkerObservation> => ({ identity, status: "idle", settled: true, safeToCheckpoint: true, outstandingJobs: [], artifactReferences: [], context: { tokens: 1_000, contextWindow: 220_000, compactions: 0, observedAt: "2026-09-12T14:00:00.000Z" } });
+  const ready = await approved(repo, worker);
+  const orchestrator = value(await ready.controller.startOrchestrator(actor, { preparationId: ready.preparationId, workspaceId: "workspace-1" }));
+  const lease = { preparationId: ready.preparationId, generation: orchestrator.generation, sessionId: orchestrator.session!.sessionId };
+  assert.equal((await ready.controller.orchestratorOperation(actor, { ...lease, operation: { kind: "start", ticketIdentity: "unapproved", assessment: "Choose work" } })).ok, false);
+  value(await ready.controller.orchestratorOperation(actor, { ...lease, operation: { kind: "start", ticketIdentity: "ticket-4", assessment: "This ticket has no prerequisites" } }));
+  const attempt = value(await ready.controller.status(actor, { limit: 10 })).executionAttempts[0]!;
+  value(await ready.controller.recordWorkerObservation(actor, monitoredObservation(attempt, {
+    identity: attempt.worker!, status: "blocked", artifactReferences: [], decision: { question: "Which behavior?", context: "The spec is ambiguous", options: ["A", "B"], recommendation: "A" },
+  })));
+  assert.equal((await ready.controller.orchestratorOperation(actor, { ...lease, operation: { kind: "wait", assessment: "stale" } })).ok, false);
+  value(await ready.controller.refreshOrchestrator(actor, { preparationId: ready.preparationId }));
+  const refreshed = value(await ready.controller.getPreparation(actor, ready.preparationId)).orchestrator!;
+  assert.notEqual(refreshed.session?.sessionId, orchestrator.session?.sessionId);
+  assert.equal(refreshed.phase, "running");
+  const retained = value(await ready.controller.status(actor, { limit: 10 })).executionAttempts[0]!;
+  assert.equal(retained.worker?.sessionId, attempt.worker?.sessionId);
+  assert.equal(retained.decisions[0]?.question, "Which behavior?");
+  assert.match(packets.at(-1)!, /Which behavior/);
+  assert.doesNotMatch(packets.at(-1)!, /session-1.jsonl/);
+});
+
+test("current context handoff preserves dirty work and persists the two replacement limit", async (): Promise<void> => {
+  const repo = await repository();
+  const prompts: string[][] = [];
+  let requests = 0;
+  const worker = Object.assign(new ControlledWorker(), {
+    async requestHandoff(): Promise<void> { requests += 1; },
+    async captureHandoff(identity: WorkerIdentity, binding: import("../src/coordination-contracts.js").HandoffBinding) {
+      return { ...binding, sessionId: identity.sessionId, sourcePath: "/tmp/actual-checkpoint.md", reference: "/durable/checkpoint.md", contentDigest: "a".repeat(64) };
+    },
+    async retire(): Promise<void> {},
+    async dispatchImplementation(identity: WorkerIdentity, ticket: string, evidence: string[], handoffReference?: string): Promise<WorkerObservation> {
+      prompts.push([ticket, ...evidence, ...(handoffReference ? [handoffReference] : [])]);
+      return { identity, status: "working", artifactReferences: [] };
+    },
+  });
+  worker.inspectOverride = async (identity): Promise<WorkerObservation> => ({ identity, status: "idle", settled: true, safeToCheckpoint: true, outstandingJobs: [], artifactReferences: [], context: { tokens: 190_000, contextWindow: 220_000, compactions: 0, observedAt: "2026-09-12T14:00:00.000Z" } });
+  const started = await start(repo, worker);
+  await writeFile(join(started.attempt.worktree!.path, "unfinished.txt"), "keep this work\n");
+  let instance = started.controller;
+  for (let replacement = 1; replacement <= 2; replacement += 1) {
+    const requested = value(await instance.checkpointWorker(actor, { attemptId: started.attempt.id }));
+    assert.equal(requested.handoff?.phase, "requested");
+    const replaced = value(await instance.checkpointWorker(actor, { attemptId: started.attempt.id }));
+    assert.equal(replaced.handoff?.phase, "complete");
+    assert.equal(replaced.handoff?.replacements, replacement);
+    assert.equal(replaced.worktree?.path, started.attempt.worktree?.path);
+    assert.notEqual(replaced.worker?.sessionId, requested.worker?.sessionId);
+    assert.equal(await readFile(join(replaced.worktree!.path, "unfinished.txt"), "utf8"), "keep this work\n");
+    assert.ok(prompts.at(-1)?.some((line): boolean => line.includes("/durable/checkpoint.md")));
+    instance = controller(repo, worker);
+  }
+  const exhausted = value(await instance.checkpointWorker(actor, { attemptId: started.attempt.id }));
+  assert.equal(exhausted.lifecycle, "pending-decision");
+  assert.match(exhausted.decisions.at(-1)!.question, /replacement limit/);
+  assert.equal(requests, 2);
+  assert.equal(exhausted.handoff?.replacements, 2);
+});
+
+test("orchestrator context rotation preserves its role and requires explicit resume only after controller restart", async (): Promise<void> => {
+  const repo = await repository();
+  const worker = Object.assign(new ControlledWorker(), {
+    async dispatchSupervision(): Promise<void> {}, async retire(): Promise<void> {},
+  });
+  let tokens: number | null = 190_000;
+  worker.inspectOverride = async (identity): Promise<WorkerObservation> => ({ identity, status: "idle", settled: true, safeToCheckpoint: true, outstandingJobs: [], artifactReferences: [], context: { tokens, contextWindow: 220_000, compactions: 1, observedAt: "2026-09-12T14:00:00.000Z" } });
+  const ready = await approved(repo, worker);
+  const first = value(await ready.controller.startOrchestrator(actor, { preparationId: ready.preparationId, workspaceId: "workspace-1" }));
+  const second = value(await ready.controller.refreshOrchestrator(actor, { preparationId: ready.preparationId }));
+  assert.equal(second.reason, "context");
+  assert.notEqual(first.session?.sessionId, second.session?.sessionId);
+  assert.equal(worker.dispatches, 0);
+  value(await ready.controller.controllerRestarted(actor));
+  const stopped = value(await ready.controller.refreshOrchestrator(actor, { preparationId: ready.preparationId }));
+  assert.equal(stopped.phase, "restart-required");
+  const resumed = value(await ready.controller.refreshOrchestrator(actor, { preparationId: ready.preparationId, resume: true }));
+  assert.equal(resumed.reason, "restart");
+  assert.equal(resumed.phase, "running");
+  tokens = null;
+  const uncertain = value(await ready.controller.refreshOrchestrator(actor, { preparationId: ready.preparationId }));
+  assert.equal(uncertain.phase, "needs-attention");
+  assert.match(uncertain.diagnostic!, /occupancy/);
+});
+
+for (const failure of ["missing-artifact", "unsafe-retirement"] as const) {
+  test(`a ${failure} preserves the old worker and raises a handoff decision`, async (): Promise<void> => {
+    const repo = await repository();
+    const worker = Object.assign(new ControlledWorker(), {
+      async requestHandoff(): Promise<void> {},
+      async captureHandoff(identity: WorkerIdentity, binding: import("../src/coordination-contracts.js").HandoffBinding) {
+        if (failure === "missing-artifact") throw new Error("Missing file");
+        return { ...binding, sessionId: identity.sessionId, sourcePath: "/tmp/checkpoint.md", reference: "/durable/checkpoint.md", contentDigest: "a".repeat(64) };
+      },
+      async retire(): Promise<void> { throw new Error("Still writing"); },
+    });
+    worker.inspectOverride = async (identity): Promise<WorkerObservation> => ({ identity, status: "idle", settled: true, safeToCheckpoint: true, outstandingJobs: [], artifactReferences: [], context: { tokens: 190_000, contextWindow: 220_000, compactions: 0, observedAt: "2026-09-12T14:00:00.000Z" } });
+    const running = await start(repo, worker);
+    value(await running.controller.checkpointWorker(actor, { attemptId: running.attempt.id }));
+    const blocked = value(await running.controller.checkpointWorker(actor, { attemptId: running.attempt.id }));
+    assert.equal(blocked.lifecycle, "pending-decision");
+    assert.equal(blocked.worker?.sessionId, running.attempt.worker?.sessionId);
+    assert.equal(blocked.handoff?.replacements, 0);
+    assert.equal(worker.starts, 1);
+    assert.equal(value(await controller(repo, worker).status(actor, { limit: 10 })).executionAttempts[0]?.decisions.length, 1);
+  });
 }
 
 test("approved ticket start creates and persists an exact real Git worktree identity", async (): Promise<void> => {
@@ -805,6 +963,7 @@ test("idle, done, and completion text can only produce completed-unaccepted life
     {
       identity: running.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: ["/evidence/summary.txt"],
       completionText: "Everything is accepted and the issue can close.",
+      context: { tokens: 2_000, contextWindow: 220_000, compactions: 0, observedAt: "2026-09-12T14:00:00.000Z" },
     },
   )));
 
@@ -932,6 +1091,9 @@ class ControlledBridge implements WorkerBridgeTransport {
   reviewReceiptFactory: (() => WorkerReviewReceipt) | undefined;
   nativeVerificationReceiptFactory: (() => WorkerNativeVerificationReceipt) | undefined;
   lifecycleOutstandingJobs: string[] = [];
+  lifecycleAvailable = true;
+  lifecycleInvalidations = 0;
+  lifecycleObservedAt = "2026-09-12T15:00:01.000Z";
   livePiPid = 4242;
   lifecycleChallenges = 0;
 
@@ -954,16 +1116,24 @@ class ControlledBridge implements WorkerBridgeTransport {
     return this.reviewReceiptFactory();
   }
 
-  async readLifecycle(): Promise<WorkerLifecycleReceipt> {
+  async readLifecycle(): Promise<WorkerLifecycleReceipt | undefined> {
+    if (!this.lifecycleAvailable) return undefined;
     return {
       schemaVersion: 1,
       nonce: this.channel.nonce,
       sessionId: "session-1",
       piPid: this.livePiPid,
       state: "settled",
-      observedAt: "2026-09-12T15:00:01.000Z",
+      observedAt: this.lifecycleObservedAt,
       outstandingJobs: [...this.lifecycleOutstandingJobs],
+      safeToCheckpoint: this.lifecycleOutstandingJobs.length === 0,
+      context: { tokens: 2_000, contextWindow: 220_000, compactions: 0, observedAt: this.lifecycleObservedAt },
     };
+  }
+
+  async invalidateLifecycle(): Promise<void> {
+    this.lifecycleInvalidations += 1;
+    this.lifecycleAvailable = false;
   }
 
   async challengeLifecycle(_channel: WorkerBridgeChannel, expectedPiPid: number): Promise<void> {
@@ -980,6 +1150,7 @@ class ControlledHerdr implements HerdrCommandExecutor {
   readonly calls: Array<{ args: string[]; timeoutMs: number }> = [];
   processChecks = 0;
   failImplementationPrompt = false;
+  inspectedAgentStatus: "idle" | "working" | "blocked" | "done" | "unknown" = "idle";
 
   async execute(args: string[], options: { timeoutMs: number }): Promise<HerdrCommandResult> {
     this.calls.push({ args: [...args], timeoutMs: options.timeoutMs });
@@ -994,7 +1165,7 @@ class ControlledHerdr implements HerdrCommandExecutor {
         : { pane_id: "workspace-1:pane-1", shell_pid: 500, foreground_process_group_id: 500, foreground_processes: [{ pid: 500 }] } });
     }
     if (args[0] === "agent" && args[1] === "start") return response({ agent: herdrAgent("idle") });
-    if (args[0] === "agent" && args[1] === "get") return response({ agent: herdrAgent("idle") });
+    if (args[0] === "agent" && args[1] === "get") return response({ agent: herdrAgent(this.inspectedAgentStatus) });
     if (args[0] === "agent" && args[1] === "prompt" && args[3]?.startsWith("/skill:implement")) {
       if (this.failImplementationPrompt) throw new Error("ambiguous timeout");
       return response({ agent: herdrAgent("working") });
@@ -1047,7 +1218,7 @@ function readinessReceipt(cwd: string, agentName: string): WorkerReadinessReceip
       source: "skill",
       sourceInfo: { path: `/skills/${name}/SKILL.md`, source: "skills", scope: "user", origin: "top-level" },
     })),
-    toolNames: ["read", "bash", "edit", "write", "subagent"],
+    toolNames: ["read", "grep", "find", "ls", "bash", "edit", "write", "subagent", "herdr_orchestrator_operation"],
     contextFiles: [join(cwd, "AGENTS.md")],
   };
 }
@@ -1072,6 +1243,173 @@ function herdrRuntime(executor: ControlledHerdr, bridge: ControlledBridge): Herd
     sleep: async (): Promise<void> => {},
   });
 }
+
+test("daemon progresses only the reasoning session's requested work and records its batch question", async (): Promise<void> => {
+  const repo = await repository();
+  const commands: import("../src/coordination-contracts.js").OrchestratorCommand[] = [];
+  const worker = Object.assign(new ControlledWorker(), {
+    async dispatchSupervision(identity: WorkerIdentity, packet: string): Promise<void> {
+      const data = JSON.parse(packet.slice(packet.lastIndexOf("\n\n") + 2));
+      if (commands.length === 0 && worker.starts === 1) commands.push({ preparationId: data.preparationId, generation: data.generation, sessionId: identity.sessionId, operation: { kind: "start", ticketIdentity: "ticket-4", assessment: "No prerequisites; begin this approved ticket" } });
+    },
+    async retire(): Promise<void> {},
+    async nextOrchestratorCommand(): Promise<import("../src/coordination-contracts.js").OrchestratorCommand | undefined> { return commands.shift(); },
+    async nextDecision(): Promise<undefined> { return undefined; },
+    async acknowledgeDecision(): Promise<void> {},
+  });
+  worker.inspectOverride = async (identity): Promise<WorkerObservation> => ({ identity, status: identity.agentName.startsWith("orch-") ? "idle" : "working", settled: identity.agentName.startsWith("orch-"), safeToCheckpoint: identity.agentName.startsWith("orch-"), outstandingJobs: [], artifactReferences: [], context: { tokens: 2_000, contextWindow: 220_000, compactions: 0, observedAt: "2026-09-12T14:00:00.000Z" } });
+  const ready = await approved(repo, worker);
+  const socketPath = join(repo.root, ".git", "herdr", "orchestration.sock");
+  const daemon = new LocalControllerDaemon(ready.controller, actor, socketPath, "test-token", worker);
+  await daemon.start({ markRestarted: false });
+  try {
+    const client = new UnixControllerClient(socketPath, "test-token");
+    const orchestrator = value(await client.startOrchestrator({ preparationId: ready.preparationId, workspaceId: "workspace-1" }));
+    const deadline = Date.now() + 5_000;
+    while (value(await client.status({ limit: 10 })).executionAttempts.length === 0 && Date.now() < deadline) await new Promise((resolve): NodeJS.Timeout => setTimeout(resolve, 50));
+    assert.equal(value(await client.status({ limit: 10 })).executionAttempts[0]?.ticketIdentity, "ticket-4");
+    value(await ready.controller.orchestratorOperation(actor, { preparationId: ready.preparationId, generation: orchestrator.generation, sessionId: orchestrator.session!.sessionId,
+      operation: { kind: "escalate", question: "Which behavior should apply?", context: "The ticket leaves an option unclear", options: ["A", "B"], recommendation: "A" } }));
+    const pending = value(await client.getPreparation(ready.preparationId)).orchestrator!.decisions[0]!;
+    const answered = value(await client.answerOrchestratorDecision({ preparationId: ready.preparationId, decisionId: pending.id, answer: "A", answeredBy: "developer" }));
+    assert.equal(answered.decisions[0]?.state, "answered");
+    assert.equal((await client.answerOrchestratorDecision({ preparationId: ready.preparationId, decisionId: pending.id, answer: "B", answeredBy: "other" })).ok, false);
+  } finally { await daemon.close(); }
+});
+
+test("daemon monitor escalates safe unknown worker occupancy instead of treating idle as completion", async (): Promise<void> => {
+  const repo = await repository();
+  const worker = Object.assign(new ControlledWorker(), {
+    async requestHandoff(): Promise<void> {},
+    async captureHandoff(): Promise<never> { throw new Error("No handoff was requested"); },
+    async retire(): Promise<void> {},
+    async nextDecision(): Promise<undefined> { return undefined; },
+    async acknowledgeDecision(): Promise<void> {},
+    async nextOrchestratorCommand(): Promise<undefined> { return undefined; },
+  });
+  worker.inspectOverride = async (identity): Promise<WorkerObservation> => ({
+    identity,
+    status: "idle",
+    settled: true,
+    safeToCheckpoint: true,
+    outstandingJobs: [],
+    artifactReferences: [],
+    context: { tokens: null, contextWindow: 220_000, compactions: 0, observedAt: "2026-09-12T14:00:00.000Z" },
+  });
+  const running = await start(repo, worker);
+  const knownContext = {
+    tokens: 12_000,
+    contextWindow: 220_000,
+    compactions: 0,
+    observedAt: "2026-09-12T13:59:00.000Z",
+  };
+  const sampled = value(await running.controller.recordWorkerObservation(actor, monitoredObservation(running.attempt, {
+    identity: running.attempt.worker!,
+    status: "working",
+    artifactReferences: [],
+    context: knownContext,
+  })));
+  assert.deepEqual(sampled.context, knownContext);
+  const socketPath = join(repo.root, ".git", "herdr", "unknown-occupancy.sock");
+  const daemon = new LocalControllerDaemon(running.controller, actor, socketPath, "test-token", worker);
+  await daemon.start({ markRestarted: false });
+  try {
+    const client = new UnixControllerClient(socketPath, "test-token");
+    let observed = running.attempt;
+    const deadline = Date.now() + 3_000;
+    while (observed.lifecycle === "running" && Date.now() < deadline) {
+      await new Promise((resolveWait): void => { setTimeout(resolveWait, 25); });
+      observed = value(await client.status({ limit: 10 })).executionAttempts[0]!;
+    }
+    assert.equal(observed.lifecycle, "pending-decision");
+    assert.match(observed.decisions.at(-1)!.question, /occupancy is unavailable/);
+    assert.equal(observed.handoff, undefined);
+  } finally { await daemon.close(); }
+});
+
+test("daemon monitor does not reuse persisted occupancy when the current sample is omitted", async (): Promise<void> => {
+  const repo = await repository();
+  const worker = Object.assign(new ControlledWorker(), {
+    async requestHandoff(): Promise<void> {},
+    async captureHandoff(): Promise<never> { throw new Error("No handoff was requested"); },
+    async retire(): Promise<void> {},
+    async nextDecision(): Promise<undefined> { return undefined; },
+    async acknowledgeDecision(): Promise<void> {},
+    async nextOrchestratorCommand(): Promise<undefined> { return undefined; },
+  });
+  worker.inspectOverride = async (identity): Promise<WorkerObservation> => ({
+    identity,
+    status: "idle",
+    settled: true,
+    safeToCheckpoint: true,
+    outstandingJobs: [],
+    artifactReferences: [],
+  });
+  const running = await start(repo, worker);
+  const knownContext = {
+    tokens: 12_000,
+    contextWindow: 220_000,
+    compactions: 0,
+    observedAt: "2026-09-12T13:59:00.000Z",
+  };
+  const sampled = value(await running.controller.recordWorkerObservation(actor, monitoredObservation(running.attempt, {
+    identity: running.attempt.worker!,
+    status: "working",
+    artifactReferences: [],
+    context: knownContext,
+  })));
+  assert.deepEqual(sampled.context, knownContext);
+  const socketPath = join(repo.root, ".git", "herdr", "missing-occupancy.sock");
+  const daemon = new LocalControllerDaemon(running.controller, actor, socketPath, "test-token", worker);
+  await daemon.start({ markRestarted: false });
+  try {
+    const client = new UnixControllerClient(socketPath, "test-token");
+    let observed = sampled;
+    const deadline = Date.now() + 3_000;
+    while (observed.lifecycle === "running" && Date.now() < deadline) {
+      await new Promise((resolveWait): void => { setTimeout(resolveWait, 25); });
+      observed = value(await client.status({ limit: 10 })).executionAttempts[0]!;
+    }
+    assert.equal(observed.lifecycle, "pending-decision");
+    assert.match(observed.decisions.at(-1)!.question, /occupancy is unavailable/);
+    assert.deepEqual(observed.context, knownContext);
+    assert.equal(observed.handoff, undefined);
+  } finally { await daemon.close(); }
+});
+
+test("authenticated Unix client records current worker occupancy and checkpoint safety", async (): Promise<void> => {
+  const repo = await repository();
+  const worker = new ControlledWorker();
+  const running = await start(repo, worker);
+  const socketPath = join(repo.root, ".git", "herdr", "worker-observation.sock");
+  const daemon = new LocalControllerDaemon(running.controller, actor, socketPath, "test-token");
+  await daemon.start({ markRestarted: false });
+  try {
+    const client = new UnixControllerClient(socketPath, "test-token");
+    const context = {
+      tokens: 12_000,
+      contextWindow: 220_000,
+      compactions: 1,
+      observedAt: "2026-09-12T14:00:00.000Z",
+    };
+    const observed = value(await client.recordWorkerObservation({
+      attemptId: running.attempt.id,
+      controlGeneration: running.attempt.controlGeneration ?? 0,
+      observation: {
+        identity: running.attempt.worker!,
+        status: "working",
+        artifactReferences: [],
+        context,
+        safeToCheckpoint: true,
+      },
+    }));
+
+    assert.deepEqual(observed.context, context);
+    assert.equal(observed.lifecycle, "running");
+  } finally {
+    await daemon.close();
+  }
+});
 
 test("authenticated Unix requests reject malformed method payloads at the daemon boundary", async (): Promise<void> => {
   const repo = await repository();
@@ -1106,6 +1444,17 @@ test("authenticated Unix requests reject malformed method payloads at the daemon
       { method: "recordWorkerObservation", params: [{ attemptId: "attempt-1", controlGeneration: 0, observation: null }] },
       { method: "recordWorkerObservation", params: [{ attemptId: "attempt-1", controlGeneration: -1, observation: {
         identity: running.attempt.worker!, status: "working", artifactReferences: [],
+      } }] },
+      { method: "recordWorkerObservation", params: [{ attemptId: running.attempt.id, controlGeneration: running.attempt.controlGeneration ?? 0, observation: {
+        identity: running.attempt.worker!, status: "working", artifactReferences: [],
+        context: { tokens: -1, contextWindow: 220_000, compactions: 0, observedAt: "2026-09-12T14:00:00.000Z" },
+      } }] },
+      { method: "recordWorkerObservation", params: [{ attemptId: running.attempt.id, controlGeneration: running.attempt.controlGeneration ?? 0, observation: {
+        identity: running.attempt.worker!, status: "working", artifactReferences: [],
+        context: { tokens: 1_000, contextWindow: 220_000, compactions: 0, observedAt: "2026-09-12T14:00:00.000Z", unexpected: true },
+      } }] },
+      { method: "recordWorkerObservation", params: [{ attemptId: running.attempt.id, controlGeneration: running.attempt.controlGeneration ?? 0, observation: {
+        identity: running.attempt.worker!, status: "working", artifactReferences: [], safeToCheckpoint: "yes",
       } }] },
       { method: "status", params: [{ limit: "10" }] },
       ...invalidDecisionIdentities.map((transportId): { method: string; params: unknown[] } => ({
@@ -1844,6 +2193,7 @@ async function createDirectEvidenceHarness(options: {
         artifactReferences: [],
         settled: lifecycle.state === "settled",
         outstandingJobs: lifecycle.outstandingJobs,
+        context: { tokens: 2_000, contextWindow: 220_000, compactions: 0, observedAt: lifecycle.observedAt },
       };
     };
     const completed = value(await running.controller.recordWorkerObservation(actor, monitoredObservation(
@@ -4050,7 +4400,7 @@ test("worker bridge reports ordinary asynchronous subagent and provider work fro
     getAllTools: (): Array<{ name: string }> => [{ name: "subagent" }],
   } as unknown as ExtensionAPI;
   const context = {
-    sessionManager: { getSessionId: (): string => "worker-session" },
+    sessionManager: { getSessionId: (): string => "worker-session", getBranch: (): [] => [] },
     hasPendingMessages: (): boolean => false,
   };
   try {
@@ -4072,6 +4422,73 @@ test("worker bridge reports ordinary asynchronous subagent and provider work fro
     if (previousNonce === undefined) delete process.env.HERDR_WORKER_BRIDGE_NONCE;
     else process.env.HERDR_WORKER_BRIDGE_NONCE = previousNonce;
   }
+});
+
+test("production handoff dispatch uses the native skill and retains the actual bounded artifact", async (): Promise<void> => {
+  const root = await mkdtemp(join(tmpdir(), "herdr-handoff-")); roots.add(root);
+  const executor = new ControlledHerdr();
+  const originalExecute = executor.execute.bind(executor);
+  executor.execute = async (args, options): Promise<HerdrCommandResult> => args[0] === "agent" && args[1] === "prompt" && args[3]?.startsWith("/skill:handoff")
+    ? (executor.calls.push({ args, timeoutMs: options.timeoutMs }), response({ agent: herdrAgent("working") })) : originalExecute(args, options);
+  const bridge = new ControlledBridge();
+  bridge.channel.endpoint = join(root, "ready.json");
+  bridge.receiptFactory = (): WorkerReadinessReceipt => receiptFor(executor);
+  const runtime = herdrRuntime(executor, bridge);
+  const allocation = await runtime.allocate({ workspaceId: "workspace-1", agentName: "worker-1", cwd: root });
+  const identity = await runtime.start({ allocation, cwd: root, model: readinessReceipt(root, "worker-1").model, contextLimit: 180_000 });
+  const binding = { preparationId: "batch-1", attemptId: "attempt-1", specIdentity: "spec-2", ticketIdentity: "ticket-6", worktreePath: root, branch: "herdr/ticket-6", codeStateDigest: "a".repeat(64) };
+  const handoffReceiptPath = join(root, "handoff-receipt.json");
+  await writeFile(handoffReceiptPath, JSON.stringify({ stale: true }));
+  await runtime.requestHandoff(identity, binding);
+  assert.ok(executor.calls.some((call): boolean => call.args[3]?.startsWith("/skill:handoff ") === true));
+  await assert.rejects(readFile(handoffReceiptPath), /ENOENT/);
+  await assert.rejects(runtime.captureHandoff(identity, binding));
+  const source = join(root, "arbitrary-skill-output.md");
+  const content = `${Object.values(binding).join("\n")}\n## Changes\nunfinished edits\n## Checks\ntypecheck passed, tests outstanding\n## Findings\nreview outstanding\n## Decisions\nnone\n## Next\nfinish implementation\npassword=redact-me\n`;
+  await writeFile(source, content);
+  await writeFile(join(root, "handoff-receipt.json"), JSON.stringify({ nonce: bridge.channel.nonce, sessionId: identity.sessionId, nativeCommand: "/skill:handoff", binding, sourcePath: source, sourceDigest: createHash("sha256").update(content).digest("hex") }));
+  const artifact = await runtime.captureHandoff(identity, binding);
+  assert.notEqual(artifact.reference, source);
+  await rm(source);
+  const durable = await readFile(artifact.reference, "utf8");
+  assert.match(durable, /unfinished edits/);
+  assert.match(durable, /tests outstanding/);
+  assert.doesNotMatch(durable, /redact-me/);
+});
+
+test("production monitor ignores a settled lifecycle receipt from before implementation dispatch", async (): Promise<void> => {
+  const repo = await repository();
+  const executor = new ControlledHerdr();
+  const bridge = new ControlledBridge();
+  bridge.channel.endpoint = join(repo.root, ".git", "herdr", "runtime-ready.json");
+  bridge.receiptFactory = (): WorkerReadinessReceipt => receiptFor(executor);
+  const runtime = herdrRuntime(executor, bridge);
+  const running = await start(repo, runtime);
+  assert.equal(bridge.lifecycleInvalidations, 1);
+
+  const socketPath = join(repo.root, ".git", "herdr", "stale-lifecycle.sock");
+  const daemon = new LocalControllerDaemon(running.controller, actor, socketPath, "test-token", runtime);
+  await daemon.start({ markRestarted: false });
+  try {
+    const client = new UnixControllerClient(socketPath, "test-token");
+    await new Promise((resolveWait): void => { setTimeout(resolveWait, 650); });
+    assert.equal(value(await client.status({ limit: 10 })).executionAttempts[0]?.lifecycle, "running");
+
+    bridge.lifecycleObservedAt = new Date(Date.now() + 1_000).toISOString();
+    bridge.lifecycleAvailable = true;
+    executor.inspectedAgentStatus = "working";
+    const activeObservation = await runtime.inspect(running.attempt.worker!);
+    assert.equal(activeObservation.settled, false);
+    assert.equal(activeObservation.safeToCheckpoint, false);
+    executor.inspectedAgentStatus = "idle";
+    const deadline = Date.now() + 3_000;
+    let observed = value(await client.status({ limit: 10 })).executionAttempts[0]!;
+    while (observed.lifecycle === "running" && Date.now() < deadline) {
+      await new Promise((resolveWait): void => { setTimeout(resolveWait, 25); });
+      observed = value(await client.status({ limit: 10 })).executionAttempts[0]!;
+    }
+    assert.equal(observed.lifecycle, "completed-unaccepted");
+  } finally { await daemon.close(); }
 });
 
 test("production Herdr runtime starts only after shell and fresh Pi resource proofs", async (): Promise<void> => {
@@ -4113,7 +4530,7 @@ test("production Herdr runtime rejects a resumed replacement Pi process without 
   const runtime = herdrRuntime(executor, bridge);
   bridge.receiptFactory = (): WorkerReadinessReceipt => receiptFor(executor);
   const allocation = await runtime.allocate({ workspaceId: "workspace-1", agentName: "worker-live-proof", cwd: repo.root });
-  const identity = await runtime.start({ allocation, cwd: repo.root, model: proposal(repo).model });
+  const identity = await runtime.start({ allocation, cwd: repo.root, model: proposal(repo).model, unmanaged: true });
   assert.ok(bridge.lifecycleChallenges > 0);
 
   bridge.livePiPid = identity.piPid + 1;

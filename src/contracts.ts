@@ -1,3 +1,5 @@
+import type { ContextSample, DurableHandoff, HandoffBinding, OrchestratorRecord, WorkerHandoff } from "./coordination-contracts.js";
+
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface CapturedModel {
@@ -138,6 +140,7 @@ export interface PreparationRecord {
   approved?: ApprovalRecord;
   batchIntegration?: { head: string; sequence: number };
   pendingIntegration?: PendingIntegrationEffect;
+  orchestrator?: OrchestratorRecord;
 }
 
 export const MAX_PREPARATIONS = 100;
@@ -246,6 +249,9 @@ export interface WorkerObservation extends WorkerDispatchAcknowledgement {
   /** True only after Pi reports agent_settled, not merely an idle-looking Herdr process. */
   settled?: boolean;
   outstandingJobs?: string[];
+  context?: ContextSample;
+  /** No executing tools, queued messages or external jobs. Failed obligations are retained separately. */
+  safeToCheckpoint?: boolean;
 }
 
 export interface CandidateGitState {
@@ -387,6 +393,9 @@ export interface ExecutionAttempt {
   diagnostics: string[];
   candidateReceipts?: CandidateReceipt[];
   acceptedCommit?: string;
+  context?: ContextSample;
+  handoff?: WorkerHandoff;
+  retiredWorkers?: WorkerIdentity[];
 }
 
 /** True only while an attempt owns one approved implementation-concurrency slot. */
@@ -511,12 +520,20 @@ export interface WorkerRuntimePort {
     allocation: WorkerAllocation;
     cwd: string;
     model: CapturedModel;
+    contextLimit?: number;
+    orchestration?: { preparationId: string; generation: number };
+    unmanaged?: true;
   }): Promise<WorkerIdentity>;
   inspect(identity: WorkerIdentity): Promise<WorkerObservation>;
-  dispatchImplementation(identity: WorkerIdentity, ticketReference: string, prerequisiteEvidence: string[]): Promise<WorkerDispatchAcknowledgement>;
+  dispatchImplementation(identity: WorkerIdentity, ticketReference: string, prerequisiteEvidence: string[], handoffReference?: string): Promise<WorkerDispatchAcknowledgement>;
   deliverDecision(identity: WorkerIdentity, decisionId: string, answer: string): Promise<WorkerObservation>;
   focus(identity: WorkerIdentity): Promise<void>;
   close?(identity: WorkerIdentity): Promise<void>;
+  dispatchSupervision?(identity: WorkerIdentity, packet: string): Promise<void>;
+  requestHandoff?(identity: WorkerIdentity, binding: HandoffBinding): Promise<void>;
+  captureHandoff?(identity: WorkerIdentity, binding: HandoffBinding): Promise<DurableHandoff>;
+  retire?(identity: WorkerIdentity): Promise<void>;
+  readNativeEvidence?(identity: WorkerIdentity, codeStateDigest: string): Promise<NativeEvidenceRecord[]>;
 }
 
 export interface SetupRuntimePort {

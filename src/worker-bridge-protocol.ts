@@ -1,3 +1,4 @@
+import type { ContextSample } from "./coordination-contracts.js";
 import type { CapturedModel } from "./contracts.js";
 
 export const WORKER_BRIDGE_ENDPOINT_ENV = "HERDR_WORKER_BRIDGE_ENDPOINT";
@@ -30,6 +31,9 @@ export interface WorkerLifecycleReceipt {
   state: "working" | "settled";
   observedAt: string;
   outstandingJobs: string[];
+  context?: ContextSample;
+  model?: CapturedModel;
+  safeToCheckpoint?: boolean;
 }
 
 export interface WorkerNativeVerificationReceipt {
@@ -117,6 +121,7 @@ export interface WorkerBridgeTransport {
   acknowledgeDecisionRequest?(channel: WorkerBridgeChannel, decisionId: string): Promise<void>;
   deliverDecision?(channel: WorkerBridgeChannel, answer: WorkerDecisionAnswer): Promise<void>;
   readLifecycle?(channel: WorkerBridgeChannel): Promise<WorkerLifecycleReceipt | undefined>;
+  invalidateLifecycle?(channel: WorkerBridgeChannel): Promise<void>;
   challengeLifecycle?(channel: WorkerBridgeChannel, expectedPiPid: number, timeoutMs: number): Promise<void>;
   waitForReview?(channel: WorkerBridgeChannel, timeoutMs: number): Promise<WorkerReviewReceipt>;
   waitForNativeVerification?(channel: WorkerBridgeChannel, timeoutMs: number): Promise<WorkerNativeVerificationReceipt>;

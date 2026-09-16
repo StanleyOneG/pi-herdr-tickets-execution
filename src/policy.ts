@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { basename, dirname, isAbsolute, normalize, relative } from "node:path";
 
+import { MAX_CONTEXT_REPLACEMENTS } from "./coordination-contracts.js";
+
 import type {
   AdmissionSnapshot,
   ApprovalRequest,
@@ -69,7 +71,7 @@ export function calculateContextLimit(
   requested: { requestedHandoffTokens: number; reserveTokens: number },
 ): { handoffTokens: number; reserveTokens: number } {
   const reserveTokens = Math.max(requested.reserveTokens, 20_000, Math.ceil(contextWindow * 0.1));
-  return { handoffTokens: Math.min(requested.requestedHandoffTokens, contextWindow - reserveTokens), reserveTokens };
+  return { handoffTokens: Math.min(190_000, requested.requestedHandoffTokens, contextWindow - reserveTokens), reserveTokens };
 }
 
 export function validateAdmission(snapshot: AdmissionSnapshot): string[] {
@@ -161,7 +163,7 @@ export function validateProposal(record: PreparationRecord, proposal: BatchPropo
   }
   if (digest(proposal.model) !== digest(record.model)) failures.push("Proposal model or thinking level differs from the captured selection");
   if (!Number.isInteger(proposal.policy.concurrency) || proposal.policy.concurrency < 1) failures.push("Concurrency must be at least one");
-  if (proposal.policy.maxHandoffReplacements !== 2 || proposal.policy.maxRepairCycles !== 2) {
+  if (proposal.policy.maxHandoffReplacements !== MAX_CONTEXT_REPLACEMENTS || proposal.policy.maxRepairCycles !== 2) {
     failures.push("Handoff replacement and repair limits must both be two");
   }
   if (!proposal.policy.requiredReviews.includes("standards") || !proposal.policy.requiredReviews.includes("spec")) {

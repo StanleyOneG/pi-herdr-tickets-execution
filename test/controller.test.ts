@@ -797,6 +797,33 @@ test("failed durable writes remove temporary state fragments", async (): Promise
   );
 });
 
+test("approved context limits reserve small windows and cap large-window requests near 190k", async (): Promise<void> => {
+  for (const [window, reserve, expected] of [[128_000, 1, 108_000], [200_000, 1, 180_000], [1_000_000, 1, 190_000]] as const) {
+    const repo = await repository();
+    const controller = testController(repo.statePath);
+    const admission = admitted(repo.root, repo.head);
+    admission.model.contextWindow = window;
+    const prepared = expectValue(await controller.prepare(TEST_ACTOR_CAPABILITY, { specReference: "tracker:spec-2", controllerName: "example / spec 2" }, admission));
+    const proposal = validProposal(repo.head);
+    proposal.model.contextWindow = window;
+    proposal.policy.context = { requestedHandoffTokens: 250_000, reserveTokens: reserve };
+    const proposed = expectValue(await controller.submitProposal(TEST_ACTOR_CAPABILITY, prepared.id, proposal));
+    assert.equal(proposed.effectiveContextLimit?.handoffTokens, expected);
+    assert.equal(proposed.effectiveContextLimit?.reserveTokens, window === 1_000_000 ? 100_000 : 20_000);
+  }
+});
+
+test("impossible operating budgets fail before execution", async (): Promise<void> => {
+  const repo = await repository();
+  const controller = testController(repo.statePath);
+  const prepared = expectValue(await controller.prepare(TEST_ACTOR_CAPABILITY, { specReference: "tracker:spec-2", controllerName: "example / spec 2" }, admitted(repo.root, repo.head)));
+  const proposal = validProposal(repo.head);
+  proposal.policy.context.reserveTokens = 220_000;
+  const rejected = await controller.submitProposal(TEST_ACTOR_CAPABILITY, prepared.id, proposal);
+  assert.equal(rejected.ok, false);
+  if (!rejected.ok) assert.match(rejected.error.diagnostics.join(" "), /viable context budget/);
+});
+
 test("valid proposal and explicit approval survive controller restart", async (): Promise<void> => {
   const repo = await repository();
   const controller = testController(repo.statePath, { now: "2026-09-12T14:00:00.000Z" });

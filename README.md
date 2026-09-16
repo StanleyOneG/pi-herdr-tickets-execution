@@ -116,6 +116,36 @@ The file bridge transport is constructed with a daemon-owned absolute directory.
 
 Dashboard/client disappearance has no lifecycle effect. An explicit controller-process restart moves executing attempts to `restart-required` without worker action; explicit resume performs minimal Git and worker ownership checks. If restart interrupts startup before an acknowledged implementation dispatch, resume fails closed because a timeout or lost response cannot prove whether the prompt was received. Comprehensive reconciliation and relaunch remain recovery work. Pause and takeover prohibit automated delivery until explicit resume or return. Worker `idle`, `done`, successful dispatch, and completion prose can produce only `completed-unaccepted`, never acceptance, and cannot hide an unresolved local decision.
 
+## Fresh reasoning and context handoffs
+
+After approval, start batch supervision from a Pi session in the intended Herdr workspace:
+
+```text
+/herdr-orchestrate <preparation-id>
+```
+
+The daemon launches a fresh normal Pi TUI as the reasoning orchestrator, using the approved model and thinking level. It receives a bounded decision packet with spec/ticket references, source revisions, batch state, current workers, decisions and evidence links. It does not receive prior transcripts. The model selects work and submits `start`, `assess`, `escalate` or `wait` through `herdr_orchestrator_operation`. `assess` captures the exact candidate and resolves the worker-owned native evidence before using the existing acceptance gate. There is no operation to waive a gate, change scope or policy, or merge a final PR/MR.
+
+Completion and blocking fence the old orchestrator generation immediately. Once its Pi session has settled with no executing tools, queued messages or external jobs, the daemon retires it and launches a fresh reasoning session. Active ticket workers and outstanding questions stay intact. Current-context exhaustion also triggers this role-preserving rotation. The last persisted assessment and current supervisory state form the checkpoint; speculative reasoning not submitted to the controller is not carried forward. Routine rotation is not a daemon restart. After a daemon restart, `/herdr-orchestrate` explicitly resumes supervision, while ticket attempts still require their own explicit resume.
+
+`/herdr-status` shows the orchestrator phase, current occupancy, compactions and batch questions. Answer a batch question with:
+
+```text
+/herdr-batch-answer <preparation-id> <decision-id> <answer>
+```
+
+The first explicit answer and its author are durable. Recording or dispatching an answer does not prove that the model applied it. Worker-specific questions continue to use `/herdr-answer`.
+
+Managed sessions report Pi's current context estimate, not billed token totals. The effective trigger is the minimum of the requested limit, 190,000 tokens, and the model window minus its reserve. The reserve is at least 20,000 tokens or ten percent of the window. Admission rejects an operating budget that cannot exceed its reserve. At the limit, a bridge guard stops new tools at a tool boundary. Existing tools and external jobs must settle before retirement. Missing usage at a safe boundary raises a decision rather than claiming a reserve guarantee. Compactions remain recorded in the saved Pi session and reported in occupancy snapshots; they are not fresh sessions.
+
+For implementation workers, the controller explicitly dispatches `/skill:handoff` with the ticket, worktree and current Git code-state bindings. The native skill chooses its filename. The worker then calls `herdr_submit_handoff` with the actual Markdown path. The bridge requires a native handoff invocation and a bounded document containing those bindings, changes, checks, findings, decisions and next steps. The daemon verifies the receipt and file digest, retains a redacted private copy beside the durable worker bridge state, then verifies safe retirement. Only after the old process is gone can a new Pi TUI start in the same worktree with `/skill:implement`, the ticket and durable handoff reference. Dirty code is neither reset nor discarded.
+
+A ticket has at most two context-driven replacements across controller restarts. The controller persists the counter before replacement startup. Missing artifacts, changed code, ambiguous dispatch, unsafe retirement or an exhausted limit preserve work and raise a decision. Interrupted handoffs require investigation or manual takeover; an answer cannot reset the replacement counter or silently retry an ambiguous launch.
+
+Decision packets are capped at 32 KB and handoff documents at 24 KB. Oversized packets stop supervision for human scoping rather than silently dropping decisions. Detailed logs and saved conversations stay outside routine model input and can be inspected on demand. These limits are best-effort safeguards: provider estimates, a single large result, or concurrent tool output can overshoot a threshold. They do not guarantee exact timing or model quality.
+
+The additional file handling uses bounded regular-file reads, SHA-256 content bindings and private atomic writes. Handoff copies redact common credential formats; no credentials or certificates are added to the package. This remains a trusted-local-user controller, not an OS sandbox or a guarantee that arbitrary prose contains no secrets.
+
 ## Detached daemon and private client
 
 Every installed preparation command and tool connects to the same project daemon before reading or writing controller state. If no daemon answers, `connectOrStartLocalController(statePath)` launches `pi-herdr-controller --state <absolute-state-path>` as a detached Node process and waits for its authenticated Unix socket. The executable loads TypeScript through the package's runtime `tsx` dependency, so it runs outside Pi's extension loader in a production-only package install.

@@ -26,6 +26,8 @@ import type {
   StartTicketRequest,
   RecordWorkerObservationRequest,
 } from "./contracts.js";
+import type { OrchestratorCommand, OrchestratorRecord, StartOrchestratorRequest } from "./coordination-contracts.js";
+import { isContextSample } from "./coordination-validation.js";
 import { PreparationController } from "./controller.js";
 import { isAcceptCandidateCommand, mapAcceptCandidateCommand } from "./presentation-mappers.js";
 import { isBatchProposal, isCapturedModel, isSourceEvidence, isWorkerIdentity } from "./state-validation.js";
@@ -38,6 +40,7 @@ export interface WorkerExecutionMonitor {
   inspect(identity: WorkerIdentity): Promise<WorkerObservation>;
   nextDecision(identity: WorkerIdentity): Promise<WorkerDecisionRequest | undefined>;
   acknowledgeDecision(identity: WorkerIdentity, decisionId: string): Promise<void>;
+  nextOrchestratorCommand?(identity: WorkerIdentity): Promise<OrchestratorCommand | undefined>;
 }
 
 export interface LocalDaemonPaths {
@@ -49,6 +52,9 @@ export interface LocalDaemonPaths {
 }
 
 export interface ControllerClient {
+  startOrchestrator(request: StartOrchestratorRequest): Promise<ControllerResult<OrchestratorRecord>>;
+  refreshOrchestrator(request: { preparationId: string; resume?: boolean }): Promise<ControllerResult<OrchestratorRecord>>;
+  answerOrchestratorDecision(request: { preparationId: string; decisionId: string; answer: string; answeredBy: string }): Promise<ControllerResult<OrchestratorRecord>>;
   prepare(request: PrepareRequest, snapshot: AdmissionSnapshot): Promise<ControllerResult<PreparationRecord>>;
   submitProposal(preparationId: string, proposal: BatchProposal): Promise<ControllerResult<PreparationRecord>>;
   approve(preparationId: string, request: ApprovalRequest): Promise<ControllerResult<PreparationRecord>>;
@@ -77,6 +83,7 @@ export class LocalControllerDaemon {
   private server: Server | undefined;
   private monitorTimer: NodeJS.Timeout | undefined;
   private monitoring = false;
+  private readonly orchestrating = new Set<string>();
   private readonly ownershipId = randomBytes(16).toString("base64url");
   private ownershipHeld = false;
 
@@ -120,7 +127,7 @@ export class LocalControllerDaemon {
       });
       await chmod(this.socketPath, 0o600);
       if (this.workerMonitor) {
-        this.monitorTimer = setInterval((): void => { void this.pollWorkers(); }, 500);
+        this.monitorTimer = setInterval((): void => { void this.pollWorkers(); void this.pollOrchestrators(); }, 500);
         this.monitorTimer.unref();
       }
     } catch (error) {
@@ -183,6 +190,40 @@ export class LocalControllerDaemon {
     }
   }
 
+  private async pollOrchestrators(): Promise<void> {
+    if (!this.workerMonitor?.nextOrchestratorCommand) return;
+    try {
+      let cursor: string | undefined;
+      do {
+        const status = await this.controller.status(this.actor, { limit: 50, ...(cursor ? { cursor } : {}) });
+        if (!status.ok) return;
+        for (const preparation of status.value.preparations) {
+          if (!preparation.orchestrator || !["running", "rotation-pending"].includes(preparation.orchestrator.phase) || this.orchestrating.has(preparation.id)) continue;
+          this.orchestrating.add(preparation.id);
+          void this.pollOrchestrator(preparation.id).catch(async (): Promise<void> => {
+            await this.controller.failOrchestrator(this.actor, { preparationId: preparation.id, generation: preparation.orchestrator!.generation });
+          }).finally((): void => { this.orchestrating.delete(preparation.id); });
+        }
+        cursor = status.value.nextCursor ?? undefined;
+      } while (cursor);
+    } catch { /* State read failure does not authorize a model launch. */ }
+  }
+
+  private async pollOrchestrator(preparationId: string): Promise<void> {
+    const refreshed = await this.controller.refreshOrchestrator(this.actor, { preparationId });
+    if (!refreshed.ok || refreshed.value.phase !== "running" || !refreshed.value.session) return;
+    const session = refreshed.value.session;
+    const observation = await this.workerMonitor!.inspect(session);
+    if (!observation.safeToCheckpoint) return;
+    const command = await this.workerMonitor!.nextOrchestratorCommand!(session);
+    if (!command) return;
+    const outcome = await this.controller.orchestratorOperation(this.actor, command);
+    if (command.operation.kind !== "wait" && command.operation.kind !== "escalate" || !outcome.ok) {
+      await this.controller.continueOrchestrator(this.actor, { preparationId,
+        outcome: outcome.ok ? "Requested operation finished. Inspect durable attempt state and evidence; completion is not acceptance." : `Operation rejected: ${outcome.error.diagnostics.join("; ").slice(0, 2_000)}` });
+    }
+  }
+
   private async pollWorkers(): Promise<void> {
     if (!this.workerMonitor || this.monitoring) return;
     this.monitoring = true;
@@ -230,11 +271,18 @@ export class LocalControllerDaemon {
               continue;
             }
             const observation = await this.workerMonitor.inspect(attempt.worker);
-            await this.controller.recordWorkerObservation(this.actor, {
+            const recorded = await this.controller.recordWorkerObservation(this.actor, {
               attemptId: attempt.id,
               controlGeneration,
               observation,
             });
+            const preparation = status.value.preparations.find((item): boolean => item.id === attempt.preparationId);
+            const observedTokens = observation.context?.tokens;
+            const checkpointNeeded = observedTokens === undefined || observedTokens === null ||
+              observedTokens >= preparation!.effectiveContextLimit!.handoffTokens || recorded.ok && recorded.value.handoff?.phase === "requested";
+            if (recorded.ok && recorded.value.lifecycle === "running" && observation.safeToCheckpoint === true && checkpointNeeded) {
+              await this.controller.checkpointWorker(this.actor, { attemptId: attempt.id });
+            }
           } catch {
             try {
               await this.controller.recordWorkerObservation(this.actor, {
@@ -306,6 +354,9 @@ export class LocalControllerDaemon {
       case "preview": return this.controller.preview(this.actor, params[0] as string);
       case "getPreparation": return this.controller.getPreparation(this.actor, params[0] as string);
       case "validateApproval": return this.controller.validateApproval(this.actor, params[0] as string, params[1] as ApprovalRequest);
+      case "startOrchestrator": return this.controller.startOrchestrator(this.actor, params[0] as StartOrchestratorRequest);
+      case "refreshOrchestrator": return this.controller.refreshOrchestrator(this.actor, params[0] as { preparationId: string; resume?: boolean });
+      case "answerOrchestratorDecision": return this.controller.answerOrchestratorDecision(this.actor, params[0] as { preparationId: string; decisionId: string; answer: string; answeredBy: string });
       case "startTicket": return this.controller.startTicket(this.actor, params[0] as import("./contracts.js").StartTicketRequest);
       case "captureCandidate": return this.controller.captureCandidate(this.actor, params[0] as CaptureCandidateRequest);
       case "acceptCandidate": return this.controller.acceptCandidate(this.actor, mapAcceptCandidateCommand(params[0]));
@@ -325,6 +376,9 @@ export class LocalControllerDaemon {
 export class UnixControllerClient implements ControllerClient {
   constructor(private readonly socketPath: string, private readonly token: string) {}
 
+  startOrchestrator(request: StartOrchestratorRequest): Promise<ControllerResult<OrchestratorRecord>> { return this.call("startOrchestrator", [request]); }
+  refreshOrchestrator(request: { preparationId: string; resume?: boolean }): Promise<ControllerResult<OrchestratorRecord>> { return this.call("refreshOrchestrator", [request]); }
+  answerOrchestratorDecision(request: { preparationId: string; decisionId: string; answer: string; answeredBy: string }): Promise<ControllerResult<OrchestratorRecord>> { return this.call("answerOrchestratorDecision", [request]); }
   prepare(request: PrepareRequest, snapshot: AdmissionSnapshot): Promise<ControllerResult<PreparationRecord>> { return this.call("prepare", [request, snapshot]); }
   submitProposal(preparationId: string, proposal: BatchProposal): Promise<ControllerResult<PreparationRecord>> { return this.call("submitProposal", [preparationId, proposal]); }
   approve(preparationId: string, request: ApprovalRequest): Promise<ControllerResult<PreparationRecord>> { return this.call("approve", [preparationId, request]); }
@@ -442,7 +496,7 @@ function parseRequest(record: string): IpcRequest {
   const methods = new Set<RequestMethod>([
     "ping", "prepare", "submitProposal", "approve", "preview", "getPreparation", "validateApproval",
     "startTicket", "captureCandidate", "acceptCandidate", "attachAttempt", "pauseAttempt", "resumeAttempt", "takeOverAttempt", "returnAttempt", "answerDecision",
-    "recordWorkerObservation", "status",
+    "recordWorkerObservation", "status", "startOrchestrator", "refreshOrchestrator", "answerOrchestratorDecision",
   ]);
   if (typeof request.id !== "string" || request.id.length > 200 || typeof request.token !== "string" ||
     !methods.has(request.method as RequestMethod) || !Array.isArray(request.params)) throw new Error("Malformed IPC request");
@@ -459,6 +513,9 @@ function validateMethodParams(method: RequestMethod, params: unknown[]): void {
     case "validateApproval": valid = params.length === 2 && boundedText(params[0]) && isApprovalRequest(params[1]); break;
     case "preview":
     case "getPreparation": valid = params.length === 1 && boundedText(params[0]); break;
+    case "startOrchestrator": valid = params.length === 1 && isObjectWithKeys(params[0], ["preparationId", "workspaceId"]) && boundedText(params[0].preparationId) && boundedText(params[0].workspaceId); break;
+    case "refreshOrchestrator": valid = params.length === 1 && isObjectWithKeys(params[0], ["preparationId", "resume"]) && boundedText(params[0].preparationId) && (params[0].resume === undefined || typeof params[0].resume === "boolean"); break;
+    case "answerOrchestratorDecision": valid = params.length === 1 && isObjectWithKeys(params[0], ["preparationId", "decisionId", "answer", "answeredBy"]) && [params[0].preparationId, params[0].decisionId, params[0].answer, params[0].answeredBy].every((item): boolean => boundedText(item)); break;
     case "startTicket": valid = params.length === 1 && isStartTicketRequest(params[0]); break;
     case "captureCandidate": valid = params.length === 1 && isAttemptRequest(params[0]); break;
     case "acceptCandidate": valid = params.length === 1 && isAcceptCandidateCommand(params[0]); break;
@@ -527,13 +584,15 @@ function isRecordWorkerObservationRequest(value: unknown): value is RecordWorker
 }
 
 function isWorkerObservation(value: unknown): value is WorkerObservation {
-  if (!isObjectWithKeys(value, ["identity", "status", "artifactReferences", "decision", "diagnostic", "completionText", "settled", "outstandingJobs"])) return false;
+  if (!isObjectWithKeys(value, ["identity", "status", "artifactReferences", "decision", "diagnostic", "completionText", "settled", "outstandingJobs", "context", "safeToCheckpoint"])) return false;
   if (!isWorkerIdentity(value.identity) || !["ready", "working", "idle", "done", "blocked", "missing", "unknown"].includes(value.status as string)) return false;
   if (!boundedStringArray(value.artifactReferences, 50, true)) return false;
   if (value.diagnostic !== undefined && !boundedText(value.diagnostic, 4_096)) return false;
   if (value.completionText !== undefined && !boundedText(value.completionText, 64_000)) return false;
   if (value.settled !== undefined && typeof value.settled !== "boolean") return false;
   if (value.outstandingJobs !== undefined && !boundedStringArray(value.outstandingJobs, 50, true)) return false;
+  if (value.context !== undefined && !isContextSample(value.context)) return false;
+  if (value.safeToCheckpoint !== undefined && typeof value.safeToCheckpoint !== "boolean") return false;
   if (value.decision === undefined) return true;
   const decision = value.decision;
   return isObjectWithKeys(decision, ["transportId", "question", "context", "options", "recommendation"]) &&

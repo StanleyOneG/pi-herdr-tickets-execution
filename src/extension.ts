@@ -283,7 +283,7 @@ function attemptSummary(attempt: ExecutionAttempt, status: ControllerStatus): st
 
 function renderControllerStatus(ctx: ExtensionContext, status: ControllerStatus): void {
   const preparationLines = status.preparations.map(
-    (record): string => `${record.id} ${record.stage} ${record.controllerName}${record.proposalDigest ? ` ${record.proposalDigest.slice(0, 12)}` : ""}`,
+    (record): string => `${record.id} ${record.stage} ${record.controllerName}${record.proposalDigest ? ` ${record.proposalDigest.slice(0, 12)}` : ""}${record.orchestrator ? `\n  Orchestrator ${record.orchestrator.phase}, generation ${record.orchestrator.generation}, current tokens ${record.orchestrator.context?.tokens ?? "unknown"}, compactions ${record.orchestrator.context?.compactions ?? 0}\n  ${record.orchestrator.diagnostic ?? record.orchestrator.checkpoint}\n${record.orchestrator.decisions.filter((decision): boolean => decision.state === "pending").map((decision): string => `  Decision ${decision.id}: ${decision.question}\n  ${decision.context}\n  Options: ${decision.options.join("; ")}\n  Recommendation: ${decision.recommendation}`).join("\n")}` : ""}`,
   );
   const attemptLines = status.executionAttempts.flatMap((attempt): string[] => attemptSummary(attempt, status));
   const lines = [
@@ -480,6 +480,36 @@ export function registerHerdrExtension(
       } catch (error) {
         reportError(ctx, error);
       }
+    },
+  });
+
+  pi.registerCommand("herdr-orchestrate", {
+    description: "Start a fresh reasoning orchestrator for an approved batch, or explicitly resume supervision after daemon restart",
+    handler: async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
+      try {
+        const values = commandArguments(args, 1);
+        const workspaceId = dependencies.workspaceId()?.trim();
+        if (!values || !workspaceId) throw new Error("Usage: /herdr-orchestrate <preparation-id> from a Herdr workspace");
+        const controller = await controllerFor(pi, ctx, dependencies);
+        let record = unwrapResult(await controller.startOrchestrator({ preparationId: values[0]!, workspaceId }));
+        if (record.phase === "restart-required") record = unwrapResult(await controller.refreshOrchestrator({ preparationId: values[0]!, resume: true }));
+        ctx.ui.notify(`Orchestrator ${record.phase}, generation ${record.generation}. ${record.diagnostic ?? "Ticket ownership and acceptance remain controller-managed."}`, record.phase === "needs-attention" ? "warning" : "info");
+      } catch (error) { reportError(ctx, error); }
+    },
+  });
+
+  pi.registerCommand("herdr-batch-answer", {
+    description: "Record an explicit human answer to an orchestrator's batch-level question",
+    handler: async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
+      try {
+        const match = /^(\S+)\s+(\S+)\s+([\s\S]+)$/.exec(args.trim());
+        if (!match) throw new Error("Usage: /herdr-batch-answer <preparation-id> <decision-id> <answer>");
+        const answeredBy = await ctx.ui.input("Decision author", "");
+        if (!answeredBy?.trim()) return;
+        const controller = await controllerFor(pi, ctx, dependencies);
+        const record = unwrapResult(await controller.answerOrchestratorDecision({ preparationId: match[1]!, decisionId: match[2]!, answer: match[3]!, answeredBy }));
+        ctx.ui.notify(`Answer recorded; orchestrator ${record.phase}. Recording is not proof of model compliance.`, "info");
+      } catch (error) { reportError(ctx, error); }
     },
   });
 

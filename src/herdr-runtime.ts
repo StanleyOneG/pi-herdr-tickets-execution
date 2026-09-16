@@ -1,8 +1,16 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { isAbsolute } from "node:path";
+import { unlink } from "node:fs/promises";
+import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+
+import { atomicWritePrivateFile } from "./atomic-file.js";
+import { readBoundedRegularFile } from "./bounded-regular-file.js";
+import { ORCHESTRATOR_TOOL_NAMES, type DurableHandoff, type HandoffBinding, type OrchestratorCommand } from "./coordination-contracts.js";
+import { isOrchestratorCommand, isContextSample } from "./coordination-validation.js";
+import { retainHandoff } from "./handoff-artifact.js";
+import { readProducedNativeEvidence } from "./native-evidence.js";
 
 import type {
   AcceptanceReviewPort,
@@ -86,6 +94,7 @@ export interface HerdrWorkerRuntimeOptions {
 /** Production WorkerRuntimePort adapter for an owned ordinary interactive Pi TUI in Herdr. */
 export class HerdrWorkerRuntime implements WorkerRuntimePort, AcceptanceReviewPort, NativeVerificationPort {
   private readonly channels = new Map<string, WorkerBridgeChannel>();
+  private readonly dispatchStartedAt = new Map<string, number>();
   private readonly shellReadyTimeoutMs: number;
   private readonly agentStartTimeoutMs: number;
   private readonly bridgeReadyTimeoutMs: number;
@@ -146,9 +155,31 @@ export class HerdrWorkerRuntime implements WorkerRuntimePort, AcceptanceReviewPo
     return allocation;
   }
 
-  async start(input: { allocation: WorkerAllocation; cwd: string; model: CapturedModel }): Promise<WorkerIdentity> {
+  async start(input: {
+    allocation: WorkerAllocation;
+    cwd: string;
+    model: CapturedModel;
+    contextLimit?: number;
+    orchestration?: { preparationId: string; generation: number };
+    unmanaged?: true;
+  }): Promise<WorkerIdentity> {
     const channel = this.channels.get(allocationKey(input.allocation));
     if (!channel) throw new Error("Worker bridge channel is unavailable after allocation");
+    const contextLimit = input.contextLimit;
+    if (input.unmanaged === true) {
+      if (contextLimit !== undefined || input.orchestration) throw new Error("Unmanaged Pi sessions cannot receive managed coordination settings");
+      await atomicWritePrivateFile(join(dirname(channel.endpoint), "coordination.json"), JSON.stringify({ role: "unmanaged" }));
+    } else if (input.orchestration) {
+      if (!Number.isSafeInteger(contextLimit) || contextLimit === undefined || contextLimit <= 0) throw new Error("Orchestrator context limit is invalid");
+      await atomicWritePrivateFile(join(dirname(channel.endpoint), "coordination.json"), JSON.stringify({
+        role: "orchestrator",
+        contextLimit,
+        lease: { ...input.orchestration, sessionId: "pending-readiness" },
+      }));
+    } else {
+      if (!Number.isSafeInteger(contextLimit) || contextLimit === undefined || contextLimit <= 0) throw new Error("Implementation context limit is invalid");
+      await atomicWritePrivateFile(join(dirname(channel.endpoint), "coordination.json"), JSON.stringify({ role: "implementation", contextLimit }));
+    }
     await this.waitForShell(input.allocation.paneId);
 
     const started = await this.command([
@@ -170,7 +201,14 @@ export class HerdrWorkerRuntime implements WorkerRuntimePort, AcceptanceReviewPo
       "agent", "prompt", input.allocation.agentName, WORKER_READINESS_COMMAND,
     ], 10_000);
     const receipt = await this.options.bridge.waitForReadiness(channel, this.bridgeReadyTimeoutMs);
-    const identity = identityFromReceipt(receipt, channel, input.allocation, input.cwd, input.model, sessionFile);
+    const identity = identityFromReceipt(receipt, channel, input.allocation, input.cwd, input.model, sessionFile, input.orchestration ? "orchestrator" : "implementation");
+    if (input.orchestration) {
+      await atomicWritePrivateFile(join(dirname(channel.endpoint), "coordination.json"), JSON.stringify({
+        role: "orchestrator",
+        contextLimit,
+        lease: { ...input.orchestration, sessionId: identity.sessionId },
+      }));
+    }
     const current = parseAgent(await this.command(["agent", "get", input.allocation.agentName], 10_000));
     assertOwnedAgent(current, identity);
     await this.assertLiveBridge(identity, channel);
@@ -185,15 +223,24 @@ export class HerdrWorkerRuntime implements WorkerRuntimePort, AcceptanceReviewPo
       const channel = await this.options.bridge.channelForAgent(identity.agentName);
       await this.assertLiveBridge(identity, channel);
       lifecycle = await this.options.bridge.readLifecycle(channel);
-      if (lifecycle && lifecycle.piPid !== identity.piPid) throw new Error("Worker lifecycle receipt belongs to another Pi process");
+      if (lifecycle && (lifecycle.piPid !== identity.piPid || lifecycle.sessionId !== identity.sessionId)) throw new Error("Worker lifecycle receipt belongs to another Pi process or session");
+      if (lifecycle?.model && !sameModel(lifecycle.model, identity.model)) throw new Error("Managed session changed its approved model or thinking level");
+      if (lifecycle?.context && !isContextSample(lifecycle.context)) throw new Error("Managed session returned invalid context occupancy");
     }
-    const settled = lifecycle?.sessionId === identity.sessionId && lifecycle.state === "settled";
+    const status = agentStatus(current);
+    const dispatchStartedAt = this.dispatchStartedAt.get(allocationKey(identity));
+    const hasFreshLifecycle = lifecycle !== undefined &&
+      (dispatchStartedAt === undefined || Date.parse(lifecycle.observedAt) >= dispatchStartedAt);
+    const settled = hasFreshLifecycle && lifecycle?.sessionId === identity.sessionId && lifecycle.state === "settled" &&
+      (status === "idle" || status === "done");
     return {
       identity: structuredClone(identity),
-      status: agentStatus(current),
+      status,
       artifactReferences: [],
       settled,
       outstandingJobs: settled ? lifecycle!.outstandingJobs : ["Pi has not reported agent_settled"],
+      ...(hasFreshLifecycle && lifecycle?.context && isContextSample(lifecycle.context) ? { context: lifecycle.context } : {}),
+      safeToCheckpoint: settled && lifecycle?.safeToCheckpoint === true,
     };
   }
 
@@ -201,20 +248,120 @@ export class HerdrWorkerRuntime implements WorkerRuntimePort, AcceptanceReviewPo
     identity: WorkerIdentity,
     ticketReference: string,
     prerequisiteEvidence: string[],
+    handoffReference?: string,
   ): Promise<WorkerDispatchAcknowledgement> {
     if (!bounded(ticketReference) || /[\r\n\0]/.test(ticketReference) || !validStringArray(prerequisiteEvidence, 50, false) ||
       prerequisiteEvidence.some((item): boolean => /[\r\0]/.test(item))
     ) throw new Error("Ticket reference or prerequisite evidence is unsafe for interactive dispatch");
+    if (handoffReference !== undefined && (!bounded(handoffReference) || !isAbsolute(handoffReference) || /[\r\n\0]/.test(handoffReference))) throw new Error("Invalid durable handoff reference");
+    const channel = await this.coordinationChannel(identity);
     await this.assertDispatchable(identity);
-    const prompt = prerequisiteEvidence.length === 0
+    await this.beginDispatch(identity, channel);
+    const implementationPrompt = prerequisiteEvidence.length === 0
       ? `/skill:implement ${ticketReference}`
       : `/skill:implement ${ticketReference}\n\nThe controller verified these in-batch prerequisites as accepted and present on the batch branch even though tracker issues may remain open:\n${prerequisiteEvidence.map((item): string => `- ${item}`).join("\n")}`;
+    const prompt = handoffReference
+      ? `${implementationPrompt}\n\nContinue this ticket in this same worktree from the bounded handoff at ${handoffReference}. Re-read relevant code and evidence; preserve outstanding checks, findings and decisions. Do not import the prior transcript.`
+      : implementationPrompt;
     const result = await this.command([
       "agent", "prompt", identity.agentName, prompt,
     ], this.promptTimeoutMs);
     const agent = parseAgent(result);
     assertOwnedAgent(agent, identity);
     return { identity: structuredClone(identity), status: agentStatus(agent), artifactReferences: [] };
+  }
+
+  async dispatchSupervision(identity: WorkerIdentity, packet: string): Promise<void> {
+    if (Buffer.byteLength(packet) > 32_000) throw new Error("Supervisory packet exceeds context bound");
+    const data = JSON.parse(packet.slice(packet.lastIndexOf("\n\n") + 2)) as { preparationId: string; generation: number; contextLimit: { handoffTokens: number } };
+    const channel = await this.coordinationChannel(identity);
+    await atomicWritePrivateFile(join(dirname(channel.endpoint), "coordination.json"), JSON.stringify({
+      role: "orchestrator", contextLimit: data.contextLimit.handoffTokens,
+      lease: { preparationId: data.preparationId, generation: data.generation, sessionId: identity.sessionId },
+    }));
+    await this.assertDispatchable(identity);
+    await this.removeCoordinationRecord(channel, "orchestrator-operation.json");
+    await this.beginDispatch(identity, channel);
+    const result = parseAgent(await this.command(["agent", "prompt", identity.agentName, packet], this.promptTimeoutMs));
+    assertOwnedAgent(result, identity);
+  }
+
+  async nextOrchestratorCommand(identity: WorkerIdentity): Promise<OrchestratorCommand | undefined> {
+    const channel = await this.coordinationChannel(identity);
+    const path = join(dirname(channel.endpoint), "orchestrator-operation.json");
+    try {
+      const raw = JSON.parse((await readBoundedRegularFile(path, 32_000, "Orchestrator operation")).toString("utf8")) as Record<string, unknown>;
+      if (raw.nonce !== channel.nonce || !isOrchestratorCommand(raw.command) || raw.command.sessionId !== identity.sessionId) throw new Error("Stale orchestration operation");
+      // Ownership generation in the controller fences any in-flight command across rotations.
+      await unlink(path);
+      return raw.command;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+  }
+
+  async requestHandoff(identity: WorkerIdentity, binding: HandoffBinding): Promise<void> {
+    const channel = await this.coordinationChannel(identity);
+    await atomicWritePrivateFile(join(dirname(channel.endpoint), "coordination.json"), JSON.stringify({ role: "handoff", binding }));
+    await this.assertDispatchable(identity);
+    await this.removeCoordinationRecord(channel, "handoff-receipt.json");
+    await this.beginDispatch(identity, channel);
+    const prompt = [
+      "/skill:handoff Continue this ticket's implementation in a fresh Pi session in the same worktree.",
+      "Write a bounded redacted Markdown checkpoint, not a conversation transcript. Do not change code or commit.",
+      `Include these exact controller bindings: ${JSON.stringify(binding)}`,
+      "Include changes, completed and outstanding checks, review findings, unresolved decisions and the next implementation action.",
+      "Use the installed skill's actual output path, then call herdr_submit_handoff with that path. Do not invent a filename or claim receipt without a file.",
+    ].join("\n\n");
+    const result = parseAgent(await this.command(["agent", "prompt", identity.agentName, prompt], this.promptTimeoutMs));
+    assertOwnedAgent(result, identity);
+  }
+
+  async captureHandoff(identity: WorkerIdentity, binding: HandoffBinding): Promise<DurableHandoff> {
+    const channel = await this.coordinationChannel(identity);
+    return retainHandoff(dirname(channel.endpoint), channel.nonce, identity.sessionId, binding);
+  }
+
+  async readNativeEvidence(identity: WorkerIdentity, codeStateDigest: string): Promise<import("./contracts.js").NativeEvidenceRecord[]> {
+    const channel = await this.coordinationChannel(identity);
+    return readProducedNativeEvidence(join(dirname(channel.endpoint), "native-evidence", "latest.json"), { sessionId: identity.sessionId, codeStateDigest });
+  }
+
+  async retire(identity: WorkerIdentity): Promise<void> {
+    const observation = await this.inspect(identity);
+    if (!observation.safeToCheckpoint || !["idle", "done"].includes(observation.status)) throw new Error("Worker is not at a safe retirement boundary");
+    await this.command(["tab", "close", identity.tabId], 10_000);
+    const deadline = this.now() + 10_000;
+    for (;;) {
+      try { process.kill(identity.piPid, 0); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return; throw error; }
+      if (this.now() >= deadline) throw new Error("Worker retirement is not confirmed");
+      await this.sleep(this.pollIntervalMs);
+    }
+  }
+
+  private async beginDispatch(identity: WorkerIdentity, channel: WorkerBridgeChannel): Promise<void> {
+    if (!this.options.bridge.invalidateLifecycle) throw new Error("Worker lifecycle invalidation transport is unavailable");
+    await this.options.bridge.invalidateLifecycle(channel);
+    this.dispatchStartedAt.set(allocationKey(identity), this.now());
+  }
+
+  private async removeCoordinationRecord(channel: WorkerBridgeChannel, name: string): Promise<void> {
+    try {
+      await unlink(join(dirname(channel.endpoint), name));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+
+  private async coordinationChannel(identity: WorkerIdentity): Promise<WorkerBridgeChannel> {
+    const current = parseAgent(await this.command(["agent", "get", identity.agentName], 10_000));
+    assertOwnedAgent(current, identity);
+    const channel = this.channels.get(allocationKey(identity)) ?? await this.options.bridge.channelForAgent?.(identity.agentName);
+    if (!channel) throw new Error("Owned coordination channel is unavailable");
+    await this.assertLiveBridge(identity, channel);
+    return channel;
   }
 
   async deliverDecision(identity: WorkerIdentity, decisionId: string, answer: string): Promise<WorkerObservation> {
@@ -369,7 +516,7 @@ export class HerdrWorkerRuntime implements WorkerRuntimePort, AcceptanceReviewPo
     let identity: WorkerIdentity | undefined;
     let shouldClose = false;
     try {
-      identity = await this.start({ allocation, cwd: input.cwd, model: input.model });
+      identity = await this.start({ allocation, cwd: input.cwd, model: input.model, unmanaged: true });
       const channel = this.channels.get(allocationKey(allocation));
       if (!channel) throw new Error(input.missingChannelMessage);
       await this.command([
@@ -457,6 +604,7 @@ function identityFromReceipt(
   cwd: string,
   model: CapturedModel,
   herdrSessionFile: string,
+  role: "implementation" | "orchestrator",
 ): WorkerIdentity {
   if (!validReceipt(receipt) || receipt.nonce !== channel.nonce || receipt.sessionStartReason !== "startup") {
     throw new Error("Pi worker readiness receipt is malformed, stale, or not a fresh startup");
@@ -471,8 +619,9 @@ function identityFromReceipt(
   if (!REQUIRED_SKILLS.every((name): boolean => skills.some((command): boolean => validSkillSource(command, name)))) {
     throw new Error("Pi worker is missing a required native skill or source provenance");
   }
-  if (!REQUIRED_TOOLS.every((name): boolean => receipt.toolNames.includes(name)) || receipt.contextFiles.length === 0) {
-    throw new Error("Pi worker is missing normal tools or project instruction resources");
+  const requiredTools = role === "orchestrator" ? ORCHESTRATOR_TOOL_NAMES : REQUIRED_TOOLS;
+  if (!requiredTools.every((name): boolean => receipt.toolNames.includes(name)) || receipt.contextFiles.length === 0) {
+    throw new Error("Pi managed session is missing required capability tools or project instruction resources");
   }
   return {
     ...structuredClone(allocation),

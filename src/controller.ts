@@ -1,5 +1,9 @@
 import { isAbsolute } from "node:path";
 
+import { MAX_CONTEXT_REPLACEMENTS, type HandoffBinding, type OrchestratorCommand, type OrchestratorRecord, type StartOrchestratorRequest } from "./coordination-contracts.js";
+import { isBoundedCoordinationText, isContextSample, isOrchestratorCommand } from "./coordination-validation.js";
+import { blockOrchestrator, decisionPacket, launchOrchestrator, requireFreshIdentity } from "./orchestration.js";
+
 import type {
   AcceptCandidateRequest,
   AdmissionSnapshot,
@@ -305,6 +309,283 @@ export class PreparationController {
     return saved.ok ? success(structuredClone(record)) : saved;
   }
 
+  async startOrchestrator(actor: LocalActorCapability, request: StartOrchestratorRequest): Promise<ControllerResult<OrchestratorRecord>> {
+    return this.serializeMutation(async (): Promise<ControllerResult<OrchestratorRecord>> => {
+      const denied = this.authorizationFailure<OrchestratorRecord>(actor);
+      if (denied) return denied;
+      if (!this.dependencies.execution?.worker.dispatchSupervision) return failure("infrastructure", ["Reasoning runtime is unavailable"]);
+      if (!validBoundedText(request.preparationId, 4_096) || !validBoundedText(request.workspaceId, 4_096)) {
+        return failure("execution-validation", ["Bounded preparation and workspace identities are required"]);
+      }
+      const loaded = await this.loadState();
+      if (!loaded.ok) return loaded;
+      const preparation = loaded.value.preparations.find((item): boolean => item.id === request.preparationId);
+      if (!preparation || preparation.stage !== "approved") return failure("execution-validation", ["An approved batch is required"]);
+      if (preparation.orchestrator) return success(structuredClone(preparation.orchestrator));
+      try {
+        const launched = await launchOrchestrator(loaded.value, preparation, request.workspaceId, this.dependencies,
+          (): Promise<void> => this.store.save(loaded.value));
+        return success(launched);
+      } catch { return failure("storage", ["Orchestrator state could not be persisted"]); }
+    });
+  }
+
+  async orchestratorOperation(actor: LocalActorCapability, command: OrchestratorCommand): Promise<ControllerResult<unknown>> {
+    const begun = await this.serializeMutation(async (): Promise<ControllerResult<{ lease?: AcceptanceLease; result?: unknown }>> => {
+      const denied = this.authorizationFailure<{ lease?: AcceptanceLease; result?: unknown }>(actor);
+      if (denied) return denied;
+      if (!isOrchestratorCommand(command)) return failure("execution-validation", ["Invalid bounded orchestration operation"]);
+      const loaded = await this.loadState();
+      if (!loaded.ok) return loaded;
+      const preparation = loaded.value.preparations.find((item): boolean => item.id === command.preparationId);
+      const record = preparation?.orchestrator;
+      if (!record?.session || record.phase !== "running" || record.generation !== command.generation || record.session.sessionId !== command.sessionId) {
+        return failure("execution-conflict", ["Superseded or inactive orchestrator session"]);
+      }
+      const worker = this.dependencies.execution!.worker;
+      try {
+        const observation = await worker.inspect(record.session);
+        if (!sameWorker(observation.identity, record.session)) return failure("execution-conflict", ["Orchestrator occupant changed"]);
+      } catch { return failure("infrastructure", ["Orchestrator ownership could not be verified"]); }
+      const operation = command.operation;
+      record.checkpoint = operation.kind === "escalate" ? operation.context : operation.assessment;
+      if (operation.kind === "escalate") {
+        if (record.decisions.length >= MAX_ATTEMPT_DECISIONS) return failure("execution-conflict", ["Batch decision capacity reached"]);
+        record.decisions.push({ id: this.dependencies.generateId(), state: "pending", requestedAt: this.dependencies.now().toISOString(),
+          question: operation.question, context: operation.context, options: operation.options, recommendation: operation.recommendation });
+      }
+      const saved = await this.saveState(loaded.value);
+      if (!saved.ok) return saved;
+      if (operation.kind === "start") {
+        const started = await this.startTicketOperation(actor, { preparationId: preparation!.id, workspaceId: record.workspaceId, ticketIdentity: operation.ticketIdentity });
+        return started.ok ? success({ result: started.value }) : started;
+      }
+      if (operation.kind === "assess") {
+        const attempt = loaded.value.executionAttempts.find((item): boolean => item.id === operation.attemptId && item.preparationId === preparation!.id);
+        if (!attempt?.worker) return failure("execution-validation", ["Attempt is outside this batch"]);
+        const captured = await this.captureCandidateOperation(actor, { attemptId: attempt.id });
+        if (!captured.ok) return captured;
+        if (!worker.readNativeEvidence) return failure("infrastructure", ["Native evidence reader is unavailable"]);
+        try {
+          const nativeEvidence = await worker.readNativeEvidence(attempt.worker, captured.value.candidate.codeStateDigest);
+          const begun = await this.beginAcceptanceOperation(actor, { attemptId: attempt.id, candidateDigest: captured.value.candidate.candidateDigest, nativeEvidence });
+          return begun.ok ? success({ lease: begun.value }) : begun;
+        } catch { return failure("execution-validation", ["Candidate evidence is missing or invalid"]); }
+      }
+      return success({ result: structuredClone(record) });
+    });
+    if (!begun.ok) return begun;
+    return begun.value.lease ? this.serializeAcceptance(() => this.continueAcceptanceOperation(begun.value.lease!)) : success(begun.value.result);
+  }
+
+  async refreshOrchestrator(actor: LocalActorCapability, request: { preparationId: string; resume?: boolean }): Promise<ControllerResult<OrchestratorRecord>> {
+    return this.serializeMutation(async (): Promise<ControllerResult<OrchestratorRecord>> => {
+      const denied = this.authorizationFailure<OrchestratorRecord>(actor);
+      if (denied) return denied;
+      const loaded = await this.loadState();
+      if (!loaded.ok) return loaded;
+      const preparation = loaded.value.preparations.find((item): boolean => item.id === request.preparationId);
+      const record = preparation?.orchestrator;
+      if (!record?.session || !preparation) return failure("execution-validation", ["No owned orchestrator session"]);
+      if (record.phase === "restart-required" && request.resume !== true) return success(structuredClone(record));
+      if (record.phase === "needs-attention" || record.phase === "starting") return success(structuredClone(record));
+      const worker = this.dependencies.execution!.worker;
+      try {
+        const observation = await worker.inspect(record.session);
+        if (!sameWorker(observation.identity, record.session)) throw new Error("Owner changed");
+        if (observation.context !== undefined) {
+          if (!isContextSample(observation.context) || observation.context.contextWindow !== preparation.model.contextWindow) throw new Error("Invalid occupancy");
+          record.context = observation.context;
+          if (observation.context.tokens === null && observation.safeToCheckpoint) throw new Error("Unknown occupancy");
+          if (observation.context.tokens !== null && observation.context.tokens >= preparation.effectiveContextLimit!.handoffTokens && record.phase === "running") {
+            record.phase = "rotation-pending";
+            record.reason = "context";
+            record.generation += 1;
+          }
+        } else if (record.phase === "running" && observation.safeToCheckpoint) throw new Error("Missing occupancy");
+        if (record.phase === "restart-required") {
+          record.reason = "restart";
+          record.phase = "rotation-pending";
+        }
+        const saved = await this.saveState(loaded.value);
+        if (!saved.ok) return saved;
+        if (record.phase !== "rotation-pending" || !observation.safeToCheckpoint) return success(structuredClone(record));
+        if (!worker.retire) throw new Error("Safe retirement unavailable");
+        // Checkpoint supervisory state before retirement. Active ticket workers remain untouched.
+        await worker.retire(record.session);
+        return success(await launchOrchestrator(loaded.value, preparation, record.workspaceId, this.dependencies, (): Promise<void> => this.store.save(loaded.value)));
+      } catch {
+        blockOrchestrator(record, "Orchestrator occupancy, ownership or retirement is uncertain; preserve work and reconcile", this.dependencies);
+        const saved = await this.saveState(loaded.value);
+        return saved.ok ? success(structuredClone(record)) : saved;
+      }
+    });
+  }
+
+  async failOrchestrator(actor: LocalActorCapability, request: { preparationId: string; generation: number }): Promise<ControllerResult<OrchestratorRecord>> {
+    return this.serializeMutation(async (): Promise<ControllerResult<OrchestratorRecord>> => {
+      const denied = this.authorizationFailure<OrchestratorRecord>(actor);
+      if (denied) return denied;
+      const loaded = await this.loadState();
+      if (!loaded.ok) return loaded;
+      const record = loaded.value.preparations.find((item): boolean => item.id === request.preparationId)?.orchestrator;
+      if (!record || record.generation !== request.generation) return failure("execution-conflict", ["Superseded orchestrator monitor result"]);
+      blockOrchestrator(record, "Orchestrator transport or monitoring failed; inspect the retained session before continuing", this.dependencies);
+      const saved = await this.saveState(loaded.value);
+      return saved.ok ? success(structuredClone(record)) : saved;
+    });
+  }
+
+  async answerOrchestratorDecision(actor: LocalActorCapability, request: { preparationId: string; decisionId: string; answer: string; answeredBy: string }): Promise<ControllerResult<OrchestratorRecord>> {
+    const recorded = await this.serializeMutation(async (): Promise<ControllerResult<OrchestratorRecord>> => {
+      const denied = this.authorizationFailure<OrchestratorRecord>(actor);
+      if (denied) return denied;
+      if (![request.preparationId, request.decisionId, request.answer, request.answeredBy].every((item): boolean => isBoundedCoordinationText(item))) return failure("execution-validation", ["Invalid batch decision answer"]);
+      const loaded = await this.loadState();
+      if (!loaded.ok) return loaded;
+      const record = loaded.value.preparations.find((item): boolean => item.id === request.preparationId)?.orchestrator;
+      const decision = record?.decisions.find((item): boolean => item.id === request.decisionId);
+      if (!record || !decision) return failure("execution-validation", ["Unknown batch decision"]);
+      if (decision.state !== "pending") return failure("execution-conflict", ["The first explicit answer is already recorded"]);
+      decision.state = "answered";
+      decision.answer = request.answer;
+      decision.answeredBy = request.answeredBy;
+      decision.answeredAt = this.dependencies.now().toISOString();
+      const saved = await this.saveState(loaded.value);
+      return saved.ok ? success(structuredClone(record)) : saved;
+    });
+    if (!recorded.ok || recorded.value.phase !== "running") return recorded;
+    return this.continueOrchestrator(actor, { preparationId: request.preparationId });
+  }
+
+  async continueOrchestrator(actor: LocalActorCapability, request: { preparationId: string; outcome?: string }): Promise<ControllerResult<OrchestratorRecord>> {
+    return this.serializeMutation(async (): Promise<ControllerResult<OrchestratorRecord>> => {
+      const denied = this.authorizationFailure<OrchestratorRecord>(actor);
+      if (denied) return denied;
+      const loaded = await this.loadState();
+      if (!loaded.ok) return loaded;
+      const preparation = loaded.value.preparations.find((item): boolean => item.id === request.preparationId);
+      const record = preparation?.orchestrator;
+      if (!record?.session || record.phase !== "running") return failure("execution-conflict", ["No active orchestrator"]);
+      try {
+        if (request.outcome !== undefined) {
+          if (!isBoundedCoordinationText(request.outcome)) return failure("execution-validation", ["Invalid operation outcome"]);
+          record.lastOutcome = request.outcome;
+          const saved = await this.saveState(loaded.value);
+          if (!saved.ok) return saved;
+        }
+        await this.dependencies.execution!.worker.dispatchSupervision!(record.session, decisionPacket(loaded.value, preparation!));
+        return success(structuredClone(record));
+      } catch {
+        blockOrchestrator(record, "Supervisory dispatch failed; do not retry an ambiguous prompt", this.dependencies);
+        const saved = await this.saveState(loaded.value);
+        return saved.ok ? success(structuredClone(record)) : saved;
+      }
+    });
+  }
+
+  async checkpointWorker(actor: LocalActorCapability, request: AttemptRequest): Promise<ControllerResult<ExecutionAttempt>> {
+    return this.serializeMutation(async (): Promise<ControllerResult<ExecutionAttempt>> => {
+      const context = await this.mutableAttempt(actor, request.attemptId);
+      if (!context.ok) return context;
+      const { state, attempt, execution } = context.value;
+      if (attempt.lifecycle !== "running" || !attempt.worker || !attempt.worktree) return success(structuredClone(attempt));
+      const preparation = state.preparations.find((item): boolean => item.id === attempt.preparationId)!;
+      const worker = execution.worker;
+      if (!worker.requestHandoff || !worker.captureHandoff || !worker.retire) return failure("infrastructure", ["Handoff runtime is unavailable"]);
+      const guarded = await this.verifyOwnedWorkerAndGit(state, attempt);
+      if (!guarded.ok || guarded.value.lifecycle === "needs-attention") return guarded;
+      try {
+        const observation = await worker.inspect(attempt.worker);
+        if (!sameWorker(observation.identity, attempt.worker)) throw new Error("Worker ownership changed");
+        if (!isContextSample(observation.context) || observation.context.contextWindow !== preparation.model.contextWindow || observation.context.tokens === null) {
+          if (!observation.safeToCheckpoint) return success(structuredClone(attempt));
+          return this.handoffDecision(state, attempt, "Current context occupancy is unavailable; no reserve guarantee is possible");
+        }
+        attempt.context = observation.context;
+        const activeHandoff = attempt.handoff && attempt.handoff.phase !== "complete";
+        if (!activeHandoff && observation.context.tokens < preparation.effectiveContextLimit!.handoffTokens) return this.persistAttempt(state, attempt);
+        if (!observation.safeToCheckpoint) return this.persistAttempt(state, attempt);
+        if (attempt.handoff?.phase === "blocked" || attempt.handoff?.phase === "retiring" || attempt.handoff?.phase === "starting") {
+          return this.handoffDecision(state, attempt, "Interrupted handoff requires explicit reconciliation of the preserved worker");
+        }
+        const replacements = attempt.handoff?.replacements ?? 0;
+        if (!activeHandoff) {
+          if (replacements >= preparation.proposal!.policy.maxHandoffReplacements || replacements >= MAX_CONTEXT_REPLACEMENTS) {
+            return this.handoffDecision(state, attempt, "Context replacement limit reached; preserve this ticket and choose the next action");
+          }
+          const candidate = await execution.git.captureCandidate({ path: attempt.worktree.path, sourceBase: attempt.worktree.head });
+          const binding: HandoffBinding = { preparationId: preparation.id, attemptId: attempt.id,
+            ticketIdentity: attempt.ticketIdentity, specIdentity: preparation.specReference,
+            worktreePath: attempt.worktree.path, branch: attempt.worktree.branch, codeStateDigest: candidate.codeStateDigest };
+          attempt.handoff = { replacements, phase: "requested", binding, previousWorker: structuredClone(attempt.worker) };
+          advanceControlGeneration(attempt);
+          const saved = await this.persistAttempt(state, attempt);
+          if (!saved.ok) return saved;
+          await worker.requestHandoff(attempt.worker, binding);
+          return this.persistAttempt(state, attempt);
+        }
+        const handoff = attempt.handoff!;
+        const artifact = await worker.captureHandoff(attempt.worker, handoff.binding);
+        const { sessionId, sourcePath, reference, contentDigest, ...binding } = artifact;
+        if (digest(binding) !== digest(handoff.binding) || sessionId !== attempt.worker.sessionId ||
+          !isAbsolute(sourcePath) || !isAbsolute(reference) || !/^[a-f0-9]{64}$/.test(contentDigest)) throw new Error("Handoff receipt is mismatched");
+        const candidate = await execution.git.captureCandidate({ path: attempt.worktree.path, sourceBase: attempt.worktree.head });
+        if (candidate.codeStateDigest !== binding.codeStateDigest) throw new Error("Checkpoint changed ticket code");
+        handoff.artifact = artifact;
+        handoff.phase = "retiring";
+        attempt.artifactReferences = uniqueReferences([...attempt.artifactReferences, reference]);
+        const retained = await this.persistAttempt(state, attempt);
+        if (!retained.ok) return retained;
+        await worker.retire(attempt.worker);
+        handoff.phase = "starting";
+        handoff.replacements += 1;
+        advanceControlGeneration(attempt);
+        const reserved = await this.persistAttempt(state, attempt);
+        if (!reserved.ok) return reserved;
+        const allocation = await worker.allocate({ workspaceId: attempt.workspaceId,
+          agentName: `${workerAgentName(attempt.id).slice(0, 27)}-h${handoff.replacements}`, cwd: attempt.worktree.path });
+        // Retain old worker identity in the handoff and never resume/fork its conversation.
+        handoff.replacementAllocation = allocation;
+        const allocated = await this.persistAttempt(state, attempt);
+        if (!allocated.ok) return allocated;
+        const replacement = await worker.start({ allocation, cwd: attempt.worktree.path, model: preparation.model,
+          contextLimit: preparation.effectiveContextLimit!.handoffTokens });
+        requireFreshIdentity(replacement, allocation, attempt.worktree.path, preparation);
+        if (replacement.sessionId === handoff.previousWorker.sessionId) throw new Error("Replacement inherited old session");
+        attempt.retiredWorkers = [...(attempt.retiredWorkers ?? []), handoff.previousWorker];
+        attempt.workerAllocation = allocation;
+        attempt.worker = replacement;
+        delete attempt.workerActiveAt;
+        attempt.candidateReceipts = [];
+        const ready = await this.persistAttempt(state, attempt);
+        if (!ready.ok) return ready;
+        const guardedBeforeDispatch = await this.verifyOwnedWorkerAndGit(state, attempt);
+        if (!guardedBeforeDispatch.ok || guardedBeforeDispatch.value.lifecycle === "needs-attention") return guardedBeforeDispatch;
+        const acknowledgement = await worker.dispatchImplementation(replacement, attempt.ticketIdentity, [], artifact.reference);
+        handoff.phase = "complete";
+        return this.applyDispatchAcknowledgement(state, attempt, acknowledgement);
+      } catch {
+        return this.handoffDecision(state, attempt, "Handoff artifact, retirement or replacement is incomplete or uncertain; preserved work requires a decision");
+      }
+    });
+  }
+
+  private async handoffDecision(state: ControllerState, attempt: ExecutionAttempt, question: string): Promise<ControllerResult<ExecutionAttempt>> {
+    if (attempt.handoff) attempt.handoff.phase = "blocked";
+    // A failed startup may no longer have a live worker. Never invent a replacement owner.
+    if (!attempt.worker || attempt.decisions.length >= MAX_ATTEMPT_DECISIONS) return this.attention(state, attempt, question);
+    if (!attempt.decisions.some((item): boolean => item.state === "pending" && item.question === question)) {
+      attempt.decisions.push({ id: this.dependencies.generateId(), state: "pending", requestedAt: this.dependencies.now().toISOString(),
+        question, context: `Ticket ${attempt.ticketIdentity}; worktree ${attempt.worktree!.path}. Saved work and sessions are retained.`,
+        options: ["Investigate the preserved work", "Take over manually"], recommendation: "Investigate before continuing" });
+    }
+    attempt.lifecycle = "pending-decision";
+    advanceControlGeneration(attempt);
+    signalOrchestrator(state, attempt.preparationId);
+    return this.persistAttempt(state, attempt);
+  }
+
   async startTicket(actor: LocalActorCapability, request: StartTicketRequest): Promise<ControllerResult<ExecutionAttempt>> {
     return this.serializeMutation((): Promise<ControllerResult<ExecutionAttempt>> =>
       this.startTicketOperation(actor, request)
@@ -539,7 +820,7 @@ export class PreparationController {
 
       const guardedBeforeStart = await this.verifyGitGuard(loaded.value, attempt);
       if (!guardedBeforeStart.ok || guardedBeforeStart.value.lifecycle === "needs-attention") return guardedBeforeStart;
-      const worker = await execution.worker.start({ allocation, cwd: worktree.path, model: preparation.proposal.model });
+      const worker = await execution.worker.start({ allocation, cwd: worktree.path, model: preparation.proposal.model, contextLimit: preparation.effectiveContextLimit!.handoffTokens });
       const readinessFailure = workerReadinessFailure(worker, allocation, worktree.path, preparation.proposal.model);
       if (readinessFailure) return this.attention(loaded.value, attempt, readinessFailure);
       attempt.worker = structuredClone(worker);
@@ -928,6 +1209,7 @@ export class PreparationController {
           receipt.acceptedAt = this.dependencies.now().toISOString();
           attempt.acceptedCommit = integratedCommit;
           attempt.lifecycle = "accepted";
+          signalOrchestrator(state, attempt.preparationId);
           return this.persistAttempt(state, attempt);
         },
       });
@@ -1014,6 +1296,7 @@ export class PreparationController {
     receipt.state = "blocked";
     receipt.findings = uniqueReferences([...receipt.findings, finding]);
     attempt.lifecycle = "integration-blocked";
+    signalOrchestrator(state, attempt.preparationId);
     return this.persistAttempt(state, attempt);
   }
 
@@ -1251,6 +1534,14 @@ export class PreparationController {
     if (!execution) return failure("infrastructure", ["Execution adapters are not configured"]);
     const loaded = await this.loadState();
     if (!loaded.ok) return loaded;
+    let orchestrationChanged = false;
+    for (const preparation of loaded.value.preparations) {
+      if (!preparation.orchestrator) continue;
+      preparation.orchestrator.phase = "restart-required";
+      preparation.orchestrator.reason = "restart";
+      preparation.orchestrator.generation += 1;
+      orchestrationChanged = true;
+    }
     const changed: ExecutionAttempt[] = [];
     for (const attempt of loaded.value.executionAttempts) {
       if (!isActiveExecutionLifecycle(attempt.lifecycle) && attempt.lifecycle !== "completed-unaccepted" &&
@@ -1269,7 +1560,7 @@ export class PreparationController {
       attempt.updatedAt = this.dependencies.now().toISOString();
       changed.push(structuredClone(attempt));
     }
-    if (changed.length === 0) return success([]);
+    if (changed.length === 0 && !orchestrationChanged) return success([]);
     const saved = await this.saveState(loaded.value);
     return saved.ok ? success(changed) : saved;
   }
@@ -1353,6 +1644,7 @@ export class PreparationController {
     attempt: ExecutionAttempt,
     diagnostic: string,
   ): Promise<ControllerResult<ExecutionAttempt>> {
+    signalOrchestrator(state, attempt.preparationId);
     attempt.lifecycle = "needs-attention";
     delete attempt.suspendedFrom;
     attempt.diagnostics = [diagnostic];
@@ -1489,6 +1781,11 @@ export class PreparationController {
     if (!validReferences(observation.artifactReferences)) {
       return this.attention(state, attempt, "Worker returned invalid or excessive artifact references");
     }
+    const previousLifecycle = attempt.lifecycle;
+    if (observation.context !== undefined) {
+      if (!isContextSample(observation.context) || observation.context.contextWindow !== attempt.worker.model.contextWindow) return this.attention(state, attempt, "Invalid current context occupancy");
+      attempt.context = observation.context;
+    }
     const references = uniqueReferences([...attempt.artifactReferences, ...observation.artifactReferences]);
     if (references.length > MAX_ATTEMPT_REFERENCES) {
       return this.attention(state, attempt, "Attempt artifact reference capacity was reached");
@@ -1535,7 +1832,11 @@ export class PreparationController {
         attempt.workerActiveAt = this.dependencies.now().toISOString();
       }
     }
-    const settledCompletion = observation.settled === true && Array.isArray(observation.outstandingJobs) &&
+    const currentContext = observation.context;
+    const hasUnknownContextOccupancy = currentContext === undefined || currentContext.tokens === null;
+    const checkpointDue = currentContext !== undefined && currentContext.tokens !== null &&
+      currentContext.tokens >= state.preparations.find((item): boolean => item.id === attempt.preparationId)!.effectiveContextLimit!.handoffTokens;
+    const settledCompletion = !hasUnknownContextOccupancy && !checkpointDue && attempt.handoff?.phase !== "requested" && observation.settled === true && Array.isArray(observation.outstandingJobs) &&
       observation.outstandingJobs.length === 0 && (observation.status === "idle" || observation.status === "done");
     if (settledCompletion && attempt.workerActiveAt === undefined) {
       attempt.workerActiveAt = this.dependencies.now().toISOString();
@@ -1549,6 +1850,7 @@ export class PreparationController {
     } else if (attempt.lifecycle !== "paused" && attempt.lifecycle !== "takeover" && attempt.lifecycle !== "restart-required") {
       attempt.lifecycle = hasPendingDecision(attempt) ? "pending-decision" : "running";
     }
+    if (previousLifecycle !== attempt.lifecycle && ["pending-decision", "completed-unaccepted"].includes(attempt.lifecycle)) signalOrchestrator(state, attempt.preparationId);
     return persist ? this.persistAttempt(state, attempt) : success(structuredClone(attempt));
   }
 
@@ -1649,6 +1951,14 @@ function sameAllocation(
 ): boolean {
   return worker.workspaceId === allocation.workspaceId && worker.tabId === allocation.tabId &&
     worker.paneId === allocation.paneId && worker.agentName === allocation.agentName;
+}
+
+function signalOrchestrator(state: ControllerState, preparationId: string): void {
+  const record = state.preparations.find((item): boolean => item.id === preparationId)?.orchestrator;
+  if (record?.phase !== "running") return;
+  record.phase = "rotation-pending";
+  record.reason = "ticket-boundary";
+  record.generation += 1;
 }
 
 function sameWorker(left: WorkerIdentity, right: WorkerIdentity): boolean {

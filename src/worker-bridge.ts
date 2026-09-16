@@ -17,6 +17,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 
+import coordinationBridge from "./coordination-bridge.js";
 import { atomicWritePrivateFile } from "./atomic-file.js";
 import { readBoundedRegularFile as readBoundedFile } from "./bounded-regular-file.js";
 import { NativeEvidenceFence, type NativeEvidenceFenceOptions } from "./native-evidence-fence.js";
@@ -141,6 +142,7 @@ export interface HerdrWorkerBridgeOptions {
 
 export default function herdrWorkerBridge(pi: ExtensionAPI, options: HerdrWorkerBridgeOptions = {}): void {
   sessionStartReason = undefined;
+  coordinationBridge(pi);
   const activeTools = new Set<string>();
   const observedCommandDigests: string[] = [];
   const nativeTestDiagnostics: string[] = [];
@@ -935,6 +937,14 @@ async function writeLifecycle(
     state,
     observedAt: new Date().toISOString(),
     outstandingJobs,
+    ...(ctx.model ? { model: { provider: ctx.model.provider, id: ctx.model.id, contextWindow: ctx.model.contextWindow, thinkingLevel: ctx.thinkingLevel } } : {}),
+    safeToCheckpoint: state === "settled" && outstandingJobs.every((job): boolean => job.startsWith("native-evidence-")),
+    context: {
+      tokens: ctx.getContextUsage?.()?.tokens ?? null,
+      contextWindow: ctx.model?.contextWindow ?? 0,
+      compactions: ctx.sessionManager.getBranch().filter((entry): boolean => entry.type === "compaction").length,
+      observedAt: new Date().toISOString(),
+    },
   })}\n`);
 }
 

@@ -1,5 +1,8 @@
 import { isAbsolute } from "node:path";
 
+import { MAX_CONTEXT_REPLACEMENTS, ORCHESTRATOR_TOOL_NAMES } from "./coordination-contracts.js";
+import { isContextSample, isOrchestratorRecord, isWorkerHandoff } from "./coordination-validation.js";
+
 import type {
   AcceptanceReviewRecord,
   BatchProposal,
@@ -83,6 +86,10 @@ export function isControllerState(value: unknown): value is ControllerState {
       attempt.originalCheckout.branch !== preparation.proposal.target.branch
     )) return false;
     if (attempt.worker && digest(attempt.worker.model) !== digest(preparation.proposal.model)) return false;
+    if (attempt.handoff && (attempt.handoff.replacements > preparation.proposal.policy.maxHandoffReplacements ||
+      attempt.handoff.binding.attemptId !== attempt.id || attempt.handoff.binding.preparationId !== preparation.id ||
+      attempt.handoff.binding.ticketIdentity !== attempt.ticketIdentity || attempt.handoff.binding.specIdentity !== preparation.specReference ||
+      attempt.handoff.binding.worktreePath !== attempt.worktree?.path || attempt.handoff.binding.branch !== attempt.worktree?.branch)) return false;
     const receipts = attempt.candidateReceipts ?? [];
     const receiptIds = receipts.map((receipt): string => receipt.id);
     if (new Set(receiptIds).size !== receiptIds.length) return false;
@@ -168,7 +175,7 @@ function isExecutionAttempt(value: unknown): value is ExecutionAttempt {
     "id", "preparationId", "proposalDigest", "ticketIdentity", "workspaceId", "lifecycle", "owner",
     "createdAt", "updatedAt", "originalCheckout", "worktreePlan", "worktree", "candidateHead", "workerAllocation",
     "worker", "workerActiveAt", "controlGeneration", "setupOperations", "suspendedFrom", "decisions", "artifactReferences", "diagnostics",
-    "candidateReceipts", "acceptedCommit",
+    "candidateReceipts", "acceptedCommit", "context", "handoff", "retiredWorkers",
   ])) return false;
   if (
     !isBoundedString(value.id) || !isBoundedString(value.preparationId) || !isDigest(value.proposalDigest) ||
@@ -176,6 +183,9 @@ function isExecutionAttempt(value: unknown): value is ExecutionAttempt {
     !EXECUTION_LIFECYCLES.has(value.lifecycle as string) || !isControllerOwner(value.owner) ||
     !isTimestamp(value.createdAt) || !isTimestamp(value.updatedAt) || Date.parse(value.updatedAt) < Date.parse(value.createdAt)
   ) return false;
+  if (value.context !== undefined && !isContextSample(value.context)) return false;
+  if (value.handoff !== undefined && !isWorkerHandoff(value.handoff)) return false;
+  if (value.retiredWorkers !== undefined && (!Array.isArray(value.retiredWorkers) || value.retiredWorkers.length > MAX_CONTEXT_REPLACEMENTS || !value.retiredWorkers.every(isWorkerIdentity))) return false;
   if (value.originalCheckout !== undefined && !isOriginalCheckout(value.originalCheckout)) return false;
   if (!isWorktreePlan(value.worktreePlan)) return false;
   if (value.worktree !== undefined && !isWorktreeIdentity(value.worktree)) return false;
@@ -388,7 +398,7 @@ function isWorkerAllocation(value: unknown): value is WorkerAllocation {
     isBoundedString(value.paneId) && isBoundedString(value.agentName);
 }
 
-export function isWorkerIdentity(value: unknown): value is WorkerIdentity {
+function isManagedSessionIdentity(value: unknown): value is WorkerIdentity {
   if (!isObject(value) || !hasOnlyKeys(value, [
     "workspaceId", "tabId", "paneId", "agentName", "piPid", "sessionId", "sessionFile", "cwd",
     "model", "mode", "initialHistoryEntries", "skillCommands", "toolNames", "contextFiles",
@@ -402,13 +412,17 @@ export function isWorkerIdentity(value: unknown): value is WorkerIdentity {
     !isBoundedStringArray(value.toolNames, 100) || !isBoundedStringArray(value.contextFiles, 100) ||
     value.contextFiles.length === 0 || !value.contextFiles.every(isAbsolute)
   ) return false;
-  if (
-    new Set(value.skillCommands).size !== value.skillCommands.length ||
-    new Set(value.toolNames).size !== value.toolNames.length ||
-    new Set(value.contextFiles).size !== value.contextFiles.length
-  ) return false;
-  const toolNames = value.toolNames;
-  return REQUIRED_WORKER_TOOLS.every((tool): boolean => toolNames.includes(tool));
+  return new Set(value.skillCommands).size === value.skillCommands.length &&
+    new Set(value.toolNames).size === value.toolNames.length &&
+    new Set(value.contextFiles).size === value.contextFiles.length;
+}
+
+export function isWorkerIdentity(value: unknown): value is WorkerIdentity {
+  return isManagedSessionIdentity(value) && REQUIRED_WORKER_TOOLS.every((tool): boolean => value.toolNames.includes(tool));
+}
+
+export function isOrchestratorIdentity(value: unknown): value is WorkerIdentity {
+  return isManagedSessionIdentity(value) && ORCHESTRATOR_TOOL_NAMES.every((tool): boolean => value.toolNames.includes(tool));
 }
 
 function sameAllocation(worker: WorkerIdentity, allocation: WorkerAllocation): boolean {
@@ -442,6 +456,8 @@ function isDecision(value: unknown): value is DecisionRecord {
 function isPreparationRecord(value: unknown): value is PreparationRecord {
   if (!isObject(value)) return false;
   if (!isNonemptyString(value.id) || !PREPARATION_STAGES.has(value.stage as string)) return false;
+  if (value.orchestrator !== undefined && (value.stage !== "approved" || !isOrchestratorRecord(value.orchestrator) ||
+    !value.orchestrator.decisions.every(isDecision) || (value.orchestrator.session && digest(value.orchestrator.session.model) !== digest(value.model)))) return false;
   if (!isNonemptyString(value.specReference) || !isNonemptyString(value.controllerName)) return false;
   if (!isProject(value.project) || !isCapturedModel(value.model) || !isTimestamp(value.createdAt)) return false;
 

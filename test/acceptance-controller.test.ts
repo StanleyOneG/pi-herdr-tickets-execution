@@ -119,7 +119,15 @@ class SettledWorker implements WorkerRuntimePort {
   }
   async inspect(identity: WorkerIdentity): Promise<WorkerObservation> {
     this.inspections += 1;
-    return { identity, status: "done", settled: this.settled, outstandingJobs: this.outstandingJobs, artifactReferences: [] };
+    return {
+      identity,
+      status: "done",
+      settled: this.settled,
+      safeToCheckpoint: this.outstandingJobs.length === 0,
+      outstandingJobs: this.outstandingJobs,
+      artifactReferences: [],
+      context: { tokens: 2_000, contextWindow: 220_000, compactions: 0, observedAt: "2026-10-01T14:00:00.000Z" },
+    };
   }
   async dispatchImplementation(identity: WorkerIdentity): Promise<WorkerObservation> { return { identity, status: "working", artifactReferences: [] }; }
   async deliverDecision(identity: WorkerIdentity): Promise<WorkerObservation> { return { identity, status: "working", artifactReferences: [] }; }
@@ -166,6 +174,18 @@ class PassingAcceptance implements AcceptanceReviewPort, GateCheckPort, NativeVe
 function value<T>(result: ControllerResult<T>): T {
   assert.equal(result.ok, true, result.ok ? undefined : result.error.diagnostics.join("\n"));
   return result.value;
+}
+
+function settledObservation(identity: WorkerIdentity, artifactReferences: string[] = []): WorkerObservation {
+  return {
+    identity,
+    status: "done",
+    settled: true,
+    safeToCheckpoint: true,
+    outstandingJobs: [],
+    artifactReferences,
+    context: { tokens: 2_000, contextWindow: 220_000, compactions: 0, observedAt: "2026-10-01T14:00:00.000Z" },
+  };
 }
 
 async function running(
@@ -302,7 +322,7 @@ test("candidate acceptance denies a caller without capability before Git or life
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const captured = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
   const beforeState = await readFile(repo.statePath, "utf8");
@@ -351,7 +371,7 @@ test("missing and stale native implementation evidence cannot start integration"
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const captured = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
 
@@ -390,7 +410,7 @@ test("rewrapping stale native artifacts with the current code identity cannot au
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const obsolete = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
   const relabelled = nativeEvidence(obsolete);
@@ -424,7 +444,7 @@ test("oversized native evidence artifacts are rejected at the acceptance boundar
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const captured = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
   const evidence = nativeEvidence(captured);
@@ -451,7 +471,7 @@ test("nonregular native evidence artifacts are rejected at the acceptance bounda
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const captured = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
   const evidence = nativeEvidence(captured);
@@ -509,7 +529,7 @@ test("content-equivalent staging and later commits retain native evidence throug
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const beforeCommit = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
   const retainedEvidence = nativeEvidence(beforeCommit);
@@ -539,7 +559,7 @@ test("changed code state cannot reuse otherwise valid native evidence", async ()
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const first = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
   const staleEvidence = nativeEvidence(first);
@@ -566,7 +586,7 @@ test("candidate changes after capture invalidate native evidence before staging"
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const captured = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
   await writeFile(join(active.attempt.worktree!.path, "candidate.js"), "export const version = 2;\n");
@@ -593,7 +613,7 @@ test("a failed approved check leaves the accepted batch branch unchanged and pre
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: ["/evidence/worker.json"] },
+    observation: settledObservation(active.attempt.worker!, ["/evidence/worker.json"]),
   }));
   const captured = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
 
@@ -622,7 +642,7 @@ test("standards and spec reviews cannot reuse one reviewer session", async (): P
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const captured = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
 
@@ -647,7 +667,7 @@ test("an unresolved standards review leaves the accepted batch branch unchanged"
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const captured = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
 
@@ -677,7 +697,7 @@ test("an in-batch successor starts after its prerequisite commit is accepted on 
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const captured = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
   const accepted = value(await active.controller.acceptCandidate(actor, {
@@ -712,7 +732,7 @@ test("acceptance serializes against the persisted integration head rather than a
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const second = value(await active.controller.startTicket(actor, {
     preparationId: active.attempt.preparationId,
@@ -723,7 +743,7 @@ test("acceptance serializes against the persisted integration head rather than a
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: second.id,
     controlGeneration: second.controlGeneration ?? 0,
-    observation: { identity: second.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(second.worker!, []),
   }));
   const firstCapture = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
   const secondCapture = value(await active.controller.captureCandidate(actor, { attemptId: second.id }));
@@ -755,7 +775,7 @@ test("acceptance serializes against the persisted integration head rather than a
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: third.id,
     controlGeneration: third.controlGeneration ?? 0,
-    observation: { identity: third.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(third.worker!, []),
   }));
   const thirdCapture = value(await active.controller.captureCandidate(actor, { attemptId: third.id }));
 
@@ -783,7 +803,7 @@ test("a real integration conflict preserves the last accepted branch and both ti
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const firstCapture = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
   const first = value(await active.controller.acceptCandidate(actor, {
@@ -800,7 +820,7 @@ test("a real integration conflict preserves the last accepted branch and both ti
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: second.id,
     controlGeneration: second.controlGeneration ?? 0,
-    observation: { identity: second.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(second.worker!, []),
   }));
   const secondCapture = value(await active.controller.captureCandidate(actor, { attemptId: second.id }));
 
@@ -830,7 +850,7 @@ test("staged changes during required native re-verification block batch advancem
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const second = value(await active.controller.startTicket(actor, {
     preparationId: active.attempt.preparationId,
@@ -841,7 +861,7 @@ test("staged changes during required native re-verification block batch advancem
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: second.id,
     controlGeneration: second.controlGeneration ?? 0,
-    observation: { identity: second.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(second.worker!, []),
   }));
   const firstCapture = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
   const first = value(await active.controller.acceptCandidate(actor, {
@@ -878,7 +898,7 @@ test("untracked add/add collisions block integration without overwriting accepte
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const second = value(await active.controller.startTicket(actor, {
     preparationId: active.attempt.preparationId,
@@ -889,7 +909,7 @@ test("untracked add/add collisions block integration without overwriting accepte
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: second.id,
     controlGeneration: second.controlGeneration ?? 0,
-    observation: { identity: second.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(second.worker!, []),
   }));
   const firstCapture = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
   const first = value(await active.controller.acceptCandidate(actor, {
@@ -932,7 +952,7 @@ test("a moving accepted base invalidates collected reviews instead of reusing th
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const captured = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
 
@@ -957,7 +977,7 @@ test("the authenticated daemon client exposes candidate capture and acceptance",
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const socketPath = join(repo.root, ".git", "herdr", "acceptance.sock");
   const daemon = new LocalControllerDaemon(active.controller, actor, socketPath, "test-token");
@@ -998,7 +1018,7 @@ test("approved gate commands execute independently in staging and retain their r
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const captured = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
 
@@ -1042,7 +1062,7 @@ test("original checkout changes during acceptance prevent batch advancement", as
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const captured = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
 
@@ -1071,7 +1091,7 @@ test("implementation worker follow-up work appearing during reviews prevents int
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const captured = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
 
@@ -1105,7 +1125,7 @@ test("takeover remains prompt during a delayed acceptance gate and prevents adva
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const captured = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
   const accepting = active.controller.acceptCandidate(actor, {
@@ -1155,7 +1175,7 @@ test("explicit restart resume reconciles a durably journaled batch advancement",
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const captured = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
 
@@ -1208,7 +1228,7 @@ test("final batch advancement disables project Git hooks", async (): Promise<voi
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const captured = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
 
@@ -1274,7 +1294,7 @@ test("acceptance integration does not consume implementation concurrency while a
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const captured = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
   const second = value(await active.controller.startTicket(actor, {
@@ -1320,7 +1340,7 @@ test("completed candidates require explicit resume after controller restart", as
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const replacement = new PreparationController(new JsonControllerStateStore(repo.statePath), {
     actorCapability: actor,
@@ -1358,7 +1378,7 @@ test("integration-blocked attempts regain ownership only through restart reconci
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const captured = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
   const blocked = value(await active.controller.acceptCandidate(actor, {
@@ -1413,7 +1433,7 @@ test("cleanup closes only an unchanged clean candidate with exact settled owners
   value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: [] },
+    observation: settledObservation(active.attempt.worker!, []),
   }));
   const captured = value(await active.controller.captureCandidate(actor, { attemptId: active.attempt.id }));
 
@@ -1437,7 +1457,7 @@ test("settled uncommitted candidate is reviewed, checked, integrated, persisted,
   const completed = value(await active.controller.recordWorkerObservation(actor, {
     attemptId: active.attempt.id,
     controlGeneration: active.attempt.controlGeneration ?? 0,
-    observation: { identity: active.attempt.worker!, status: "done", settled: true, outstandingJobs: [], artifactReferences: ["/evidence/implementation.json"] },
+    observation: settledObservation(active.attempt.worker!, ["/evidence/implementation.json"]),
   }));
   assert.equal(completed.lifecycle, "completed-unaccepted", completed.diagnostics.join("\n"));
 
