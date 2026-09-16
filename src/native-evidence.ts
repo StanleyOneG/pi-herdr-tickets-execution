@@ -3,9 +3,10 @@ import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 
-import type { NativeEvidencePort, NativeEvidenceRecord } from "./contracts.js";
+import type { CandidateGitState, NativeEvidencePort, NativeEvidenceRecord } from "./contracts.js";
 
 const MAX_NATIVE_EVIDENCE_BYTES = 1024 * 1024;
+const EMPTY_SHA256 = createHash("sha256").update(Buffer.alloc(0)).digest("hex");
 
 export async function readProducedNativeEvidence(
   path: string,
@@ -30,7 +31,7 @@ export async function readProducedNativeEvidence(
 
 /** Resolves a retained native-skill receipt and verifies its immutable code-state binding. */
 export class FileNativeEvidenceAdapter implements NativeEvidencePort {
-  async verify(input: { record: NativeEvidenceRecord; candidate: { codeStateDigest: string } }): Promise<void> {
+  async verify(input: { record: NativeEvidenceRecord; candidate: CandidateGitState }): Promise<void> {
     const { record, candidate } = input;
     if (!isAbsolute(record.evidenceReference)) throw new Error("Native evidence reference must be an absolute local artifact");
     const bytes = await readBoundedRegularFile(record.evidenceReference);
@@ -45,7 +46,7 @@ export class FileNativeEvidenceAdapter implements NativeEvidencePort {
         throw new Error("Native evidence source artifact reference is unsafe");
       }
       const retained = await readBoundedRegularFile(artifact.reference);
-      if (hash(retained) !== artifact.digest || !isProducerReceipt(JSON.parse(retained.toString("utf8")), parsed)) {
+      if (hash(retained) !== artifact.digest || !isProducerReceipt(JSON.parse(retained.toString("utf8")), parsed, candidate)) {
         throw new Error("Native evidence source artifact is missing, changed, or candidate-mismatched");
       }
     }
@@ -85,11 +86,13 @@ function isReceipt(value: unknown): value is {
 function isProducerReceipt(
   value: unknown,
   manifest: { kind: "tests" | "reviews"; status: "passed"; codeStateDigest: string; completedAt: string },
+  candidate: CandidateGitState,
 ): boolean {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const receipt = value as Record<string, unknown>;
   const hasReviewArtifacts = Object.hasOwn(receipt, "reviewArtifacts");
   const hasWorkflowReceipt = Object.hasOwn(receipt, "workflowReceipt");
+  const hasReviewBinding = Object.hasOwn(receipt, "reviewBinding");
   const reviewArtifactsValid = !hasReviewArtifacts || (receipt.kind === "reviews" &&
     Array.isArray(receipt.reviewArtifacts) && receipt.reviewArtifacts.length === 2 &&
     receipt.reviewArtifacts.every(isRetainedReviewArtifact) &&
@@ -100,13 +103,55 @@ function isProducerReceipt(
     !Array.isArray(workflowReceipt) && Object.keys(workflowReceipt).length === 2 &&
     typeof workflowReceipt.reference === "string" && isAbsolute(workflowReceipt.reference) && workflowReceipt.reference.length <= 4_096 &&
     typeof workflowReceipt.digest === "string" && /^[a-f0-9]{64}$/i.test(workflowReceipt.digest));
-  return Object.keys(receipt).length === 7 + Number(hasReviewArtifacts) + Number(hasWorkflowReceipt) &&
-    hasReviewArtifacts === hasWorkflowReceipt && receipt.schemaVersion === 1 && receipt.producer === "pi-native-skill" &&
+  const reviewBindingValid = !hasReviewBinding || (receipt.kind === "reviews" &&
+    isReviewBinding(receipt.reviewBinding, receipt.reviewArtifacts, candidate, manifest));
+  return Object.keys(receipt).length === 7 + Number(hasReviewArtifacts) + Number(hasWorkflowReceipt) + Number(hasReviewBinding) &&
+    hasReviewArtifacts === hasWorkflowReceipt && hasWorkflowReceipt === hasReviewBinding &&
+    receipt.schemaVersion === 1 && receipt.producer === "pi-native-skill" &&
     receipt.kind === manifest.kind && receipt.status === manifest.status && receipt.codeStateDigest === manifest.codeStateDigest &&
     receipt.completedAt === manifest.completedAt && Array.isArray(receipt.executionReferences) &&
     receipt.executionReferences.length > 0 && receipt.executionReferences.length <= 20 &&
     receipt.executionReferences.every((reference): boolean => typeof reference === "string" &&
-      reference.trim().length > 0 && reference.length <= 4_096) && reviewArtifactsValid && workflowReceiptValid;
+      reference.trim().length > 0 && reference.length <= 4_096) && reviewArtifactsValid && workflowReceiptValid && reviewBindingValid;
+}
+
+function isReviewBinding(
+  value: unknown,
+  artifactsValue: unknown,
+  candidate: CandidateGitState,
+  manifest: { codeStateDigest: string },
+): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !Array.isArray(artifactsValue)) return false;
+  const binding = value as Record<string, unknown>;
+  if (Object.keys(binding).length !== 6 || typeof binding.launchHead !== "string" ||
+    !/^[a-f0-9]{40}$/i.test(binding.launchHead) || binding.launchCodeStateDigest !== manifest.codeStateDigest ||
+    binding.launchCodeStateDigest !== candidate.codeStateDigest || typeof binding.launchStatusDigest !== "string" ||
+    !/^[a-f0-9]{64}$/i.test(binding.launchStatusDigest) ||
+    binding.launchDirty !== (binding.launchStatusDigest !== EMPTY_SHA256) ||
+    binding.effectiveBase !== candidate.sourceBase || !/^[a-f0-9]{40}$/i.test(String(binding.effectiveBase)) ||
+    !/^[a-f0-9]{40}$/i.test(candidate.head) || !Array.isArray(binding.axes) || binding.axes.length !== 2
+  ) return false;
+  const artifacts = artifactsValue.map((artifact): Record<string, unknown> | undefined =>
+    artifact && typeof artifact === "object" && !Array.isArray(artifact) ? artifact as Record<string, unknown> : undefined);
+  const roles = new Set<string>();
+  const keys = new Set<string>();
+  const resolvedBases = new Set<string>();
+  const validAxes = binding.axes.every((axisValue): boolean => {
+    if (!axisValue || typeof axisValue !== "object" || Array.isArray(axisValue)) return false;
+    const axis = axisValue as Record<string, unknown>;
+    if (Object.keys(axis).length !== 4 || (axis.role !== "standards" && axis.role !== "spec") ||
+      roles.has(axis.role) || typeof axis.workflowKey !== "string" || keys.has(axis.workflowKey) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(axis.workflowKey) ||
+      typeof axis.taskDigest !== "string" || !/^[a-f0-9]{64}$/i.test(axis.taskDigest) ||
+      typeof axis.resolvedBase !== "string" || !/^[a-f0-9]{40}$/i.test(axis.resolvedBase) ||
+      !artifacts.some((artifact): boolean => artifact?.role === axis.role && artifact?.workflowKey === axis.workflowKey)
+    ) return false;
+    roles.add(axis.role);
+    keys.add(axis.workflowKey);
+    resolvedBases.add(axis.resolvedBase);
+    return true;
+  });
+  return validAxes && roles.has("standards") && roles.has("spec") && resolvedBases.size === 1;
 }
 
 function isRetainedReviewArtifact(value: unknown): boolean {

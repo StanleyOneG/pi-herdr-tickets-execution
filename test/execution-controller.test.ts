@@ -1890,6 +1890,10 @@ test("ordinary implementation tool events produce candidate-bound native test an
     );
     await hostHandlers.get("agent_settled")!({}, context);
     await assert.rejects(nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence), /ENOENT/);
+    const failedTestRerunLifecycle = JSON.parse(await readFile(lifecyclePath, "utf8")) as WorkerLifecycleReceipt;
+    assert.ok(failedTestRerunLifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("failed-test-rerun:execution-failed")));
+    await assertPublicAcceptanceBlocked(firstPublishedRecords);
 
     await hostHandlers.get("tool_result")!({
       toolCallId: "successful-test-rerun",
@@ -1924,6 +1928,10 @@ test("ordinary implementation tool events produce candidate-bound native test an
     );
     await hostHandlers.get("agent_settled")!({}, context);
     await assert.rejects(nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, expectedEvidence), /ENOENT/);
+    const blockingReviewLifecycle = JSON.parse(await readFile(lifecyclePath, "utf8")) as WorkerLifecycleReceipt;
+    assert.ok(blockingReviewLifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("blocking-review-rerun:review-rejected")));
+    await assertPublicAcceptanceBlocked(firstPublishedRecords);
 
     await hostHandlers.get("tool_execution_start")!({
       toolCallId: "passing-review-rerun",
@@ -2032,11 +2040,18 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
   await mkdir(artifactRoot, { recursive: true });
   await writeFile(parentSessionFile, "parent\n");
 
-  // Fixture provenance: pi-subagents 0.67.0 puts each nested child's asyncDir
-  // first in artifactPaths (runs/foreground/subagent-executor.ts:4232-4238),
-  // publishes that path at result.artifactPaths.outputPath (:5721-5732), and
-  // separately retains the report as receipt/result outputReference
-  // (workflows/workflow-receipt.ts:63-65).
+  const reviewTasks = [
+    `Review the candidate against documented standards and identify code smells. Inspect git diff ${repo.head}...HEAD. End with one merge verdict.`,
+    `Review the candidate for missing or partial requirements and scope creep. Inspect git diff ${repo.head}...HEAD. End with one merge verdict.`,
+  ] as const;
+  const dirtyReviewTasks = reviewTasks.map((task): string =>
+    `${task} Review all staged, unstaged, and untracked working-tree content.`) as [string, string];
+  const workflowScriptFor = (tasks: readonly [string, string]): string =>
+    `const reviews = await runs.all([\n  { key: "policy-axis", label: "Review first axis", agent: "reviewer", context: "fresh", task: ${JSON.stringify(tasks[0])} },\n  { key: "requirements-axis", label: "Review second axis", agent: "reviewer", context: "fresh", task: ${JSON.stringify(tasks[1])} }\n]);\nreturn reviews.map((review) => review.output);`;
+  // Fixture provenance: pi-subagents 0.68.0 puts each nested child's asyncDir
+  // first in artifactPaths, publishes that path at result.artifactPaths.outputPath,
+  // separately retains the report as receipt/result outputReference, and persists
+  // the actual `Task: ...` prompt in the child's fresh Pi session.
   const workflowFixture = async (input: {
     runId: string;
     toolCallId: string;
@@ -2045,11 +2060,14 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
     artifactOverride?: string;
     asyncArtifactOverride?: string;
     incomplete?: boolean;
+    dirtyScope?: boolean;
+    sessionTasks?: readonly [string, string];
   }): Promise<{ asyncDir: string; completion: Record<string, unknown>; reports: string[] }> => {
     const asyncDir = join(piSubagentsTempRoot, "async-subagent-runs", input.runId);
     const startedAt = Date.now();
+    const tasks = input.sessionTasks ?? (input.dirtyScope ? dirtyReviewTasks : reviewTasks);
     const keys = ["policy-axis", "requirements-axis"];
-    const labels = ["Standards review", "Specification review"];
+    const labels = ["Specification review", "Standards review"];
     const childRunIds = [`${input.runId}-child-a`, `${input.runId}-child-b`];
     const childAsyncDirs = childRunIds.map((childRunId): string =>
       join(piSubagentsTempRoot, "async-subagent-runs", childRunId));
@@ -2060,9 +2078,19 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
     await Promise.all(childAsyncDirs.map(async (childAsyncDir): Promise<void> => {
       await mkdir(childAsyncDir, { recursive: true });
     }));
-    await Promise.all(sessions.map(async (session): Promise<void> => {
+    await Promise.all(sessions.map(async (session, index): Promise<void> => {
       await mkdir(dirname(session), { recursive: true });
-      await writeFile(session, "fresh reviewer session\n");
+      await writeFile(session, [
+        JSON.stringify({
+          type: "session", version: 3, id: childRunIds[index],
+          timestamp: new Date(startedAt).toISOString(), cwd: repo.root,
+        }),
+        JSON.stringify({
+          type: "message", id: `task-${index}`, parentId: null,
+          timestamp: new Date(startedAt).toISOString(),
+          message: { role: "user", content: [{ type: "text", text: `Task: ${tasks[index]}` }], timestamp: startedAt },
+        }),
+      ].join("\n") + "\n");
     }));
     await Promise.all(reports.map((report, index): Promise<void> => writeFile(
       report,
@@ -2181,12 +2209,11 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
       input: { command: "node --import tsx --test test/execution-controller.test.ts" },
       isError: false,
     }, context);
-    const workflowScript = `return runs.all([\n  { key: "policy-axis", label: "Standards review", agent: "reviewer", context: "fresh", task: "Review standards" },\n  { key: "requirements-axis", label: "Specification review", agent: "reviewer", context: "fresh", task: "Review requirements" }\n]);`;
     const launchReview = async (input: Parameters<typeof workflowFixture>[0]): Promise<Awaited<ReturnType<typeof workflowFixture>>> => {
       await hostHandlers.get("tool_execution_start")!({
         toolCallId: input.toolCallId,
         toolName: "subagent",
-        args: { workflowScript },
+        args: { workflowScript: workflowScriptFor(input.dirtyScope ? dirtyReviewTasks : reviewTasks) },
       }, context);
       const fixture = await workflowFixture(input);
       await hostHandlers.get("tool_execution_end")!({
@@ -2243,6 +2270,37 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
       { sessionId: "native-session", codeStateDigest: candidate.codeStateDigest },
     );
     assert.deepEqual(afterReplay.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+
+    const unrelatedTaskFixture = await launchReview({
+      runId: "unrelated-task-review-run",
+      toolCallId: "unrelated-task-review-tool",
+      completionOwnerId: "unrelated-task-review-owner",
+      sessionTasks: [
+        `Summarize naming choices. Inspect git diff ${repo.head}...HEAD. End with one merge verdict.`,
+        `Review runtime speed. Inspect git diff ${repo.head}...HEAD. End with one merge verdict.`,
+      ],
+    });
+    events.emit("subagent:async-complete", unrelatedTaskFixture.completion);
+    await hostHandlers.get("agent_settled")!({}, context);
+    const unrelatedTaskLifecycle = JSON.parse(await readFile(join(bridgeDirectory, "lifecycle.json"), "utf8")) as {
+      outstandingJobs: string[];
+    };
+    assert.ok(unrelatedTaskLifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("unrelated-task-review-run:review-rejected")));
+    await assert.rejects(
+      nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, {
+        sessionId: "native-session",
+        codeStateDigest: candidate.codeStateDigest,
+      }),
+      /ENOENT/,
+    );
+    const unrelatedTaskRecovery = await launchReview({
+      runId: "unrelated-task-recovery-run",
+      toolCallId: "unrelated-task-recovery-tool",
+      completionOwnerId: "unrelated-task-recovery-owner",
+    });
+    events.emit("subagent:async-complete", unrelatedTaskRecovery.completion);
+    await hostHandlers.get("agent_settled")!({}, context);
 
     await chmod(evidenceDirectory, 0o500);
     evidencePermissionsRestricted = true;
@@ -2332,6 +2390,53 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
       { sessionId: "native-session", codeStateDigest: candidate.codeStateDigest },
     );
 
+    const olderPassingReview = await launchReview({
+      runId: "older-concurrent-passing-run",
+      toolCallId: "older-concurrent-passing-tool",
+      completionOwnerId: "older-concurrent-passing-owner",
+    });
+    await hostHandlers.get("tool_execution_start")!({
+      toolCallId: "newer-direct-blocking-tool",
+      toolName: "subagent",
+      args: { task: "Review the implementation after the asynchronous review launched" },
+    }, context);
+    await hostHandlers.get("tool_execution_end")!({
+      toolCallId: "newer-direct-blocking-tool",
+      toolName: "subagent",
+      isError: false,
+      result: { details: { runId: "newer-direct-blocking-run", results: [{
+        agent: "reviewer",
+        task: "Review the implementation after the asynchronous review launched",
+        exitCode: 0,
+        structuredAcceptanceReport: {
+          criteriaSatisfied: [{ id: "review", status: "not-satisfied", evidence: "A newer blocker remains" }],
+          reviewFindings: ["blocker: newer review rejected the candidate"],
+          residualRisks: ["acceptance bypass"],
+        },
+      }] } },
+    }, context);
+    events.emit("subagent:async-complete", olderPassingReview.completion);
+    await hostHandlers.get("agent_settled")!({}, context);
+    const reverseCompletionLifecycle = JSON.parse(await readFile(join(bridgeDirectory, "lifecycle.json"), "utf8")) as {
+      outstandingJobs: string[];
+    };
+    assert.ok(reverseCompletionLifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("newer-direct-blocking-tool:review-rejected")));
+    await assert.rejects(
+      nativeEvidenceModule.readProducedNativeEvidence(latestEvidencePath, {
+        sessionId: "native-session",
+        codeStateDigest: candidate.codeStateDigest,
+      }),
+      /ENOENT/,
+    );
+    const reverseCompletionRecovery = await launchReview({
+      runId: "reverse-completion-recovery-run",
+      toolCallId: "reverse-completion-recovery-tool",
+      completionOwnerId: "reverse-completion-recovery-owner",
+    });
+    events.emit("subagent:async-complete", reverseCompletionRecovery.completion);
+    await hostHandlers.get("agent_settled")!({}, context);
+
     const preRepairFailure = await launchReview({
       runId: "pre-repair-failure-run",
       toolCallId: "pre-repair-failure-tool",
@@ -2340,7 +2445,19 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
     });
     events.emit("subagent:async-complete", preRepairFailure.completion);
     await hostHandlers.get("agent_settled")!({}, context);
+    const preMutationReview = await launchReview({
+      runId: "pre-mutation-review-run",
+      toolCallId: "pre-mutation-review-tool",
+      completionOwnerId: "pre-mutation-review-owner",
+    });
     await writeFile(join(repo.root, "README.md"), "project\nrepaired\n");
+    events.emit("subagent:async-complete", preMutationReview.completion);
+    await hostHandlers.get("agent_settled")!({}, context);
+    const contentMutationLifecycle = JSON.parse(await readFile(join(bridgeDirectory, "lifecycle.json"), "utf8")) as {
+      outstandingJobs: string[];
+    };
+    assert.ok(contentMutationLifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("pre-mutation-review-run:review-rejected")));
     await hostHandlers.get("tool_result")!({
       toolCallId: "repaired-native-tests",
       toolName: "bash",
@@ -2360,10 +2477,23 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
       }),
       /ENOENT/,
     );
+    const omittedDirtyScopeReview = await launchReview({
+      runId: "omitted-dirty-scope-run",
+      toolCallId: "omitted-dirty-scope-tool",
+      completionOwnerId: "omitted-dirty-scope-owner",
+    });
+    events.emit("subagent:async-complete", omittedDirtyScopeReview.completion);
+    await hostHandlers.get("agent_settled")!({}, context);
+    const omittedDirtyScopeLifecycle = JSON.parse(await readFile(join(bridgeDirectory, "lifecycle.json"), "utf8")) as {
+      outstandingJobs: string[];
+    };
+    assert.ok(omittedDirtyScopeLifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("omitted-dirty-scope-run:review-rejected")));
     const repairedReview = await launchReview({
       runId: "repaired-candidate-run",
       toolCallId: "repaired-candidate-tool",
       completionOwnerId: "repaired-candidate-owner",
+      dirtyScope: true,
     });
     events.emit("subagent:async-complete", repairedReview.completion);
     await hostHandlers.get("agent_settled")!({}, context);
@@ -2372,6 +2502,28 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
       { sessionId: "native-session", codeStateDigest: repairedCandidate.codeStateDigest },
     );
     assert.deepEqual(repairedRecords.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+    for (const record of repairedRecords) {
+      await new nativeEvidenceModule.FileNativeEvidenceAdapter().verify({ record, candidate: repairedCandidate });
+    }
+    git(repo.root, "add", "README.md");
+    git(repo.root, "commit", "-qm", "commit reviewed content");
+    const committedReviewedCandidate = await new RealGitWorktreeAdapter().captureCandidate({
+      path: repo.root,
+      sourceBase: repo.head,
+    });
+    assert.equal(committedReviewedCandidate.codeStateDigest, repairedCandidate.codeStateDigest);
+    assert.notEqual(committedReviewedCandidate.head, repairedCandidate.head);
+    for (const record of repairedRecords) {
+      await new nativeEvidenceModule.FileNativeEvidenceAdapter().verify({ record, candidate: committedReviewedCandidate });
+    }
+    const reviewRecord = repairedRecords.find((record): boolean => record.kind === "reviews")!;
+    await assert.rejects(
+      new nativeEvidenceModule.FileNativeEvidenceAdapter().verify({
+        record: reviewRecord,
+        candidate: { ...committedReviewedCandidate, sourceBase: committedReviewedCandidate.head },
+      }),
+      /candidate-mismatched/,
+    );
 
     const foreignReport = join(bridgeDirectory, "foreign-report.md");
     const symlinkedReport = join(artifactRoot, "symlinked-report.md");
@@ -2420,13 +2572,13 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
         completionOwnerId: "unrelated-completion-owner",
         unrelated: true,
       },
-    ];
+    ].map((input) => ({ ...input, dirtyScope: true }));
     const rejectedFixtures: Array<Awaited<ReturnType<typeof workflowFixture>>> = [];
     for (const input of rejectedInputs) {
       await hostHandlers.get("tool_execution_start")!({
         toolCallId: input.toolCallId,
         toolName: "subagent",
-        args: { workflowScript },
+        args: { workflowScript: workflowScriptFor(dirtyReviewTasks) },
       }, context);
       const fixture = await workflowFixture(input);
       if ("stale" in input) fixture.completion.timestamp = 0;
@@ -2447,18 +2599,19 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
           },
         },
       }, context);
+      events.emit("subagent:async-complete", fixture.completion);
+      await hostHandlers.get("agent_settled")!({}, context);
     }
     const passingWhileRevocationBroken = await launchReview({
       runId: "unresolved-revocation-run",
       toolCallId: "unresolved-revocation-tool",
       completionOwnerId: "unresolved-revocation-owner",
+      dirtyScope: true,
     });
     // A directory at the publication path forces unlink(2) revocation to fail while
     // remaining unreadable as evidence. Even a valid review payload must stay blocked.
     await mkdir(latestEvidencePath);
-    for (const fixture of [...rejectedFixtures, passingWhileRevocationBroken]) {
-      events.emit("subagent:async-complete", fixture.completion);
-    }
+    events.emit("subagent:async-complete", passingWhileRevocationBroken.completion);
     let terminalFailures: string[] = [];
     for (let attempt = 0; attempt < 40; attempt += 1) {
       await hostHandlers.get("agent_settled")!({}, context);
@@ -2488,6 +2641,7 @@ test("ordinary asynchronous runs.all reviews accept only canonical complete Stan
       runId: "infrastructure-recovery-run",
       toolCallId: "infrastructure-recovery-tool",
       completionOwnerId: "infrastructure-recovery-owner",
+      dirtyScope: true,
     });
     events.emit("subagent:async-complete", infrastructureRecovery.completion);
     await hostHandlers.get("agent_settled")!({}, context);

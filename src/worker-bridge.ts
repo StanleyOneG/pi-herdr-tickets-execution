@@ -1,8 +1,10 @@
+import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { homedir, tmpdir, userInfo } from "node:os";
 import { mkdir, open, readFile, realpath, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { promisify } from "node:util";
 
 import { StringEnum } from "@earendil-works/pi-ai";
 import type {
@@ -32,6 +34,9 @@ import {
 } from "./worker-bridge-protocol.js";
 
 const HISTORY_ENTRY_TYPES = new Set(["message", "custom_message", "compaction", "branch_summary"]);
+const executeFile = promisify(execFile);
+const MAX_GIT_BINDING_OUTPUT_BYTES = 2 * 1024 * 1024;
+const EMPTY_SHA256 = createHash("sha256").update(Buffer.alloc(0)).digest("hex");
 const REVIEW_SCHEMA = Type.Object({
   kind: StringEnum(["standards", "spec"] as const),
   verdict: StringEnum(["passed", "blocked"] as const),
@@ -62,6 +67,10 @@ interface NativeExecutionProof {
   executionReference: string;
   sourceArtifact?: { reference: string; digest: string };
 }
+interface LaunchRefSnapshot {
+  name: string;
+  objectId: string;
+}
 interface PendingSubagentLaunch {
   toolCallId: string;
   cwd: string;
@@ -69,6 +78,9 @@ interface PendingSubagentLaunch {
   sourceSessionFile?: string;
   sourceSessionIdentities: Set<string>;
   codeStateDigest: string;
+  launchHead: string;
+  launchStatusDigest: string;
+  launchRefs: LaunchRefSnapshot[];
   args: unknown;
   launchedAt: number;
   sequence: number;
@@ -78,10 +90,11 @@ interface AsyncReviewLaunch extends PendingSubagentLaunch {
   mode: "workflow";
   asyncDir: string;
 }
-type TerminalNativeEvidenceFailureKind = "review-rejected" | "capture-failed" | "revocation-failed";
+type NativeEvidenceObligation = "tests" | "reviews";
+type TerminalNativeEvidenceFailureKind = "execution-failed" | "review-rejected" | "capture-failed" | "revocation-failed";
 interface TerminalNativeEvidenceFailure {
   kind: TerminalNativeEvidenceFailureKind;
-  obligation: "tests" | "reviews";
+  obligation: NativeEvidenceObligation;
   reason: string;
   sequence: number;
 }
@@ -101,8 +114,8 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   const activeAsyncReviewCaptures = new Map<string, Promise<void>>();
   const terminalNativeEvidenceFailures = new Map<string, TerminalNativeEvidenceFailure>();
   const nativeExecutions = new Map<string, NativeExecutionProof>();
+  const latestObligationSequence: Record<NativeEvidenceObligation, number> = { tests: 0, reviews: 0 };
   let nativeEvidenceSequence = 0;
-  let latestSuccessfulAsyncReviewSequence = 0;
   let failedBashCommand = false;
   let mutationToolUsed = false;
   let isAgentRunning = false;
@@ -123,7 +136,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   const recordTerminalEvidenceFailure = (
     id: string,
     kind: TerminalNativeEvidenceFailureKind,
-    obligation: "tests" | "reviews",
+    obligation: NativeEvidenceObligation,
     sequence: number,
     error: unknown,
   ): void => {
@@ -134,7 +147,14 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
       sequence,
     });
   };
-  const clearRecoveredEvidenceFailures = (obligation: "tests" | "reviews", sequence: number): void => {
+  const beginObligationAttempt = (obligation: NativeEvidenceObligation, sequence: number): boolean => {
+    if (sequence < latestObligationSequence[obligation]) return false;
+    latestObligationSequence[obligation] = sequence;
+    return true;
+  };
+  const isCurrentObligationAttempt = (obligation: NativeEvidenceObligation, sequence: number): boolean =>
+    sequence === latestObligationSequence[obligation];
+  const clearRecoveredEvidenceFailures = (obligation: NativeEvidenceObligation, sequence: number): void => {
     for (const [failureId, failure] of terminalNativeEvidenceFailures) {
       if (failure.obligation === obligation && failure.sequence <= sequence) {
         terminalNativeEvidenceFailures.delete(failureId);
@@ -143,32 +163,42 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   };
   const invalidateObservedEvidence = async (
     id: string,
-    obligation: "tests" | "reviews",
+    obligation: NativeEvidenceObligation,
     cwd: string,
     sequence: number,
   ): Promise<boolean> => {
+    if (!isCurrentObligationAttempt(obligation, sequence)) return false;
     try {
       await invalidateNativeExecutions(nativeExecutions, obligation, cwd);
-      return true;
+      return isCurrentObligationAttempt(obligation, sequence);
     } catch (error) {
-      recordTerminalEvidenceFailure(id, "revocation-failed", obligation, sequence, error);
+      if (isCurrentObligationAttempt(obligation, sequence)) {
+        recordTerminalEvidenceFailure(id, "revocation-failed", obligation, sequence, error);
+      }
       return false;
     }
   };
   const retainFreshNativeExecution = async (
     toolCallId: string,
-    obligation: "tests" | "reviews",
+    obligation: NativeEvidenceObligation,
     cwd: string,
     sessionId: string,
     detail: string,
     sequence: number,
   ): Promise<void> => {
-    if (!await invalidateObservedEvidence(toolCallId, obligation, cwd, sequence)) return;
+    if (!isCurrentObligationAttempt(obligation, sequence) ||
+      !await invalidateObservedEvidence(toolCallId, obligation, cwd, sequence)) return;
     try {
       await retainNativeExecution(nativeExecutions, toolCallId, obligation, cwd, sessionId, detail);
+      if (!isCurrentObligationAttempt(obligation, sequence)) {
+        nativeExecutions.delete(toolCallId);
+        return;
+      }
       clearRecoveredEvidenceFailures(obligation, sequence);
     } catch (error) {
-      recordTerminalEvidenceFailure(toolCallId, "capture-failed", obligation, sequence, error);
+      if (isCurrentObligationAttempt(obligation, sequence)) {
+        recordTerminalEvidenceFailure(toolCallId, "capture-failed", obligation, sequence, error);
+      }
     }
   };
   const consumeAsyncReviewCompletion = (runId: string, payload: unknown): void => {
@@ -178,27 +208,36 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     asyncReviewLaunches.delete(runId);
     pendingAsyncCompletions.delete(runId);
     const capture = (async (): Promise<void> => {
+      if (!isCurrentObligationAttempt("reviews", launch.sequence)) return;
       try {
         await retainAsyncNativeReview(nativeExecutions, consumedReviewerSessions, launch, payload);
-        latestSuccessfulAsyncReviewSequence = Math.max(latestSuccessfulAsyncReviewSequence, launch.sequence);
+        if (!isCurrentObligationAttempt("reviews", launch.sequence)) {
+          nativeExecutions.delete(launch.toolCallId);
+          return;
+        }
         clearRecoveredEvidenceFailures("reviews", launch.sequence);
       } catch (error) {
         nativeExecutions.delete(launch.toolCallId);
+        if (!isCurrentObligationAttempt("reviews", launch.sequence)) return;
         let kind: TerminalNativeEvidenceFailureKind = isFileSystemError(error) ? "capture-failed" : "review-rejected";
         let reason = error instanceof Error ? error.message : String(error);
+        recordTerminalEvidenceFailure(runId, kind, "reviews", launch.sequence, reason);
         try {
           await revokePublishedNativeEvidence();
         } catch (revocationError) {
           kind = "revocation-failed";
           reason = `${reason}; revocation failed: ${revocationError instanceof Error ? revocationError.message : String(revocationError)}`;
+          if (isCurrentObligationAttempt("reviews", launch.sequence)) {
+            recordTerminalEvidenceFailure(runId, kind, "reviews", launch.sequence, reason);
+          }
         }
-        if (kind !== "revocation-failed" && launch.sequence < latestSuccessfulAsyncReviewSequence) return;
-        recordTerminalEvidenceFailure(runId, kind, "reviews", launch.sequence, reason);
       }
     })().catch((error: unknown): void => {
       // This terminal guard must never reject: lifecycle remains fail-closed until a newer valid review proves capture recovered.
       nativeExecutions.delete(launch.toolCallId);
-      recordTerminalEvidenceFailure(runId, "capture-failed", "reviews", launch.sequence, error);
+      if (isCurrentObligationAttempt("reviews", launch.sequence)) {
+        recordTerminalEvidenceFailure(runId, "capture-failed", "reviews", launch.sequence, error);
+      }
     });
     activeAsyncReviewCaptures.set(runId, capture);
     void capture.then((): void => { activeAsyncReviewCaptures.delete(runId); });
@@ -230,8 +269,9 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     consumedReviewerSessions.clear();
     activeAsyncReviewCaptures.clear();
     terminalNativeEvidenceFailures.clear();
+    latestObligationSequence.tests = 0;
+    latestObligationSequence.reviews = 0;
     nativeEvidenceSequence = 0;
-    latestSuccessfulAsyncReviewSequence = 0;
     observedCommandDigests.length = 0;
     nativeTestDiagnostics.length = 0;
     failedBashCommand = false;
@@ -249,13 +289,17 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
       const sourceSessionId = ctx.sessionManager.getSessionId();
       if (sourceSessionId) {
         const sessionFile = ctx.sessionManager.getSessionFile?.();
+        const launchGit = await captureReviewLaunchGitState(ctx.cwd, looksLikeReviewRequest(event.args));
         pendingSubagentLaunches.set(event.toolCallId, {
           toolCallId: event.toolCallId,
           cwd: ctx.cwd,
           sourceSessionId,
           ...(sessionFile ? { sourceSessionFile: sessionFile } : {}),
           sourceSessionIdentities: new Set([sourceSessionId, ...(sessionFile ? [sessionFile] : [])]),
-          codeStateDigest: await captureCodeStateDigest(ctx.cwd),
+          codeStateDigest: launchGit.codeStateDigest,
+          launchHead: launchGit.head,
+          launchStatusDigest: launchGit.statusDigest,
+          launchRefs: launchGit.refs,
           args: event.args,
           launchedAt: Date.now(),
           sequence: ++nativeEvidenceSequence,
@@ -277,6 +321,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     const testCommand = classifyNativeTestCommand(command);
     if (testCommand.status === "supported") {
       const sequence = ++nativeEvidenceSequence;
+      beginObligationAttempt("tests", sequence);
       if (!event.isError) {
         await retainFreshNativeExecution(
           event.toolCallId,
@@ -287,6 +332,13 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
           sequence,
         );
       } else {
+        recordTerminalEvidenceFailure(
+          event.toolCallId,
+          "execution-failed",
+          "tests",
+          sequence,
+          "The directly executed native test command failed according to Pi's tool execution result",
+        );
         await invalidateObservedEvidence(event.toolCallId, "tests", ctx.cwd, sequence);
         nativeTestDiagnostics.push("The directly executed native test command failed according to Pi's tool execution result; rerun it successfully after the final edit");
       }
@@ -300,26 +352,45 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     const reviewSequence = pendingLaunch?.sequence ??
       (event.toolName === "subagent" ? ++nativeEvidenceSequence : nativeEvidenceSequence);
     if (event.toolName === "subagent" && event.isError && pendingLaunch && looksLikeAnyReviewRequest(pendingLaunch.args)) {
-      await invalidateObservedEvidence(event.toolCallId, "reviews", ctx.cwd, reviewSequence);
+      if (beginObligationAttempt("reviews", reviewSequence)) {
+        recordTerminalEvidenceFailure(
+          event.toolCallId,
+          "review-rejected",
+          "reviews",
+          reviewSequence,
+          "The review launch failed according to Pi's tool execution result",
+        );
+        await invalidateObservedEvidence(event.toolCallId, "reviews", ctx.cwd, reviewSequence);
+      }
     }
     if (event.toolName === "subagent" && !event.isError) {
       const asyncResult = parseAsyncLaunchResult(event.result);
       if (pendingLaunch && looksLikeReviewRequest(pendingLaunch.args) && (asyncResult || isAsyncLaunchLike(event.result))) {
-        await invalidateObservedEvidence(event.toolCallId, "reviews", ctx.cwd, reviewSequence);
-        if (asyncResult && await isBoundAsyncReviewLaunch(pendingLaunch, asyncResult)) {
-          activeSubagentRuns.add(asyncResult.runId);
-          asyncReviewLaunches.set(asyncResult.runId, {
-            ...pendingLaunch,
-            runId: asyncResult.runId,
-            mode: asyncResult.mode,
-            asyncDir: asyncResult.asyncDir,
-          });
-          const pendingCompletion = pendingAsyncCompletions.get(asyncResult.runId);
-          if (pendingCompletion) consumeAsyncReviewCompletion(asyncResult.runId, pendingCompletion);
+        if (beginObligationAttempt("reviews", reviewSequence)) {
+          await invalidateObservedEvidence(event.toolCallId, "reviews", ctx.cwd, reviewSequence);
+          if (asyncResult && await isBoundAsyncReviewLaunch(pendingLaunch, asyncResult)) {
+            activeSubagentRuns.add(asyncResult.runId);
+            asyncReviewLaunches.set(asyncResult.runId, {
+              ...pendingLaunch,
+              runId: asyncResult.runId,
+              mode: asyncResult.mode,
+              asyncDir: asyncResult.asyncDir,
+            });
+            const pendingCompletion = pendingAsyncCompletions.get(asyncResult.runId);
+            if (pendingCompletion) consumeAsyncReviewCompletion(asyncResult.runId, pendingCompletion);
+          } else if (isCurrentObligationAttempt("reviews", reviewSequence)) {
+            recordTerminalEvidenceFailure(
+              event.toolCallId,
+              "review-rejected",
+              "reviews",
+              reviewSequence,
+              "The asynchronous review launch was not bound to its native workflow run",
+            );
+          }
         }
       } else {
         const reviewResult = classifyNativeReviewResult(event.result);
-        if (reviewResult === "passed") {
+        if (reviewResult === "passed" && beginObligationAttempt("reviews", reviewSequence)) {
           await retainFreshNativeExecution(
             event.toolCallId,
             "reviews",
@@ -328,7 +399,14 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
             "subagent:structured-acceptance:no-blockers",
             reviewSequence,
           );
-        } else if (reviewResult === "blocked") {
+        } else if (reviewResult === "blocked" && beginObligationAttempt("reviews", reviewSequence)) {
+          recordTerminalEvidenceFailure(
+            event.toolCallId,
+            "review-rejected",
+            "reviews",
+            reviewSequence,
+            "The directly executed review reported a blocking finding",
+          );
           await invalidateObservedEvidence(event.toolCallId, "reviews", ctx.cwd, reviewSequence);
         }
       }
@@ -770,6 +848,40 @@ async function captureCodeStateDigest(cwd: string): Promise<string> {
   return candidate.codeStateDigest;
 }
 
+async function captureReviewLaunchGitState(cwd: string, includeRefs: boolean): Promise<{
+  head: string;
+  codeStateDigest: string;
+  statusDigest: string;
+  refs: LaunchRefSnapshot[];
+}> {
+  const git = new RealGitWorktreeAdapter();
+  const worktree = await git.inspectWorktree(cwd);
+  const [candidate, refsOutput] = await Promise.all([
+    git.captureCandidate({ path: cwd, sourceBase: worktree.head }),
+    includeRefs
+      ? executeFile("git", ["show-ref", "--head"], {
+        cwd,
+        encoding: "utf8",
+        maxBuffer: MAX_GIT_BINDING_OUTPUT_BYTES,
+      }).then(({ stdout }): string => stdout)
+      : Promise.resolve(""),
+  ]);
+  const refs = refsOutput.trim().split("\n").filter(Boolean).map((line): LaunchRefSnapshot => {
+    const match = /^([a-f0-9]{40}) ([^\s]{1,1024})$/i.exec(line);
+    if (!match) throw new Error("Git review ref snapshot was malformed");
+    return { objectId: match[1]!.toLowerCase(), name: match[2]! };
+  });
+  if ((includeRefs && refs.length === 0) || refs.length > 20_000) {
+    throw new Error("Git review ref snapshot was empty or exceeded its bound");
+  }
+  return {
+    head: candidate.head,
+    codeStateDigest: candidate.codeStateDigest,
+    statusDigest: candidate.statusDigest,
+    refs,
+  };
+}
+
 function objectRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -901,6 +1013,14 @@ async function retainAsyncNativeReview(
     verdict: "OK" | "OK with notes";
     report: string;
   }> = [];
+  const reviewAxes: Array<{
+    role: "standards" | "spec";
+    workflowKey: string;
+    taskDigest: string;
+    resolvedBase: string;
+  }> = [];
+  let resolvedReviewBase: string | undefined;
+  let effectiveBase: string | undefined;
   for (const stepValue of steps) {
     const step = stepValue!;
     const key = typeof step.workflowKey === "string" ? step.workflowKey : "";
@@ -910,10 +1030,9 @@ async function retainAsyncNativeReview(
     const continuation = objectRecord(entry?.continuation);
     const runIds = Array.isArray(continuation?.runIds) ? continuation.runIds : [];
     const childRunId = runIds.at(-1);
-    const role = reviewRole(`${key} ${String(step.label ?? "")}`);
     const workflowChild = (workflowChildren!.children as unknown[]).map(objectRecord)
       .find((child): boolean => child?.childId === key);
-    if (!entry || !result || !workflowChild || !role || roles.has(role) || entry.key !== key || entry.agent !== "reviewer" ||
+    if (!entry || !result || !workflowChild || entry.key !== key || entry.agent !== "reviewer" ||
       entry.requestedContext !== "fresh" || entry.resolvedContext !== "fresh" ||
       step.agent !== "reviewer" || step.status !== "completed" || step.parentWorkflowRunId !== launch.runId ||
       typeof childRunId !== "string" || eventIdentity({ id: childRunId }) !== childRunId ||
@@ -931,7 +1050,19 @@ async function retainAsyncNativeReview(
       throw new Error("Asynchronous native review child artifact did not identify its installed async run");
     }
     await assertCanonicalDirectory(artifactPaths.outputPath, join(piSubagentsTempRoot(), "async-subagent-runs"));
-    const canonicalSession = await assertCanonicalRegularFile(step.sessionFile, [sessionRoot]);
+    const session = await readCanonicalBoundedFile(step.sessionFile, [sessionRoot], 16 * 1024 * 1024);
+    const task = parseFreshReviewerTask(session.content, launch);
+    const role = reviewRoleFromTask(task);
+    if (!role || roles.has(role)) {
+      throw new Error("Asynchronous native review child task did not prove a distinct Standards or Spec contract");
+    }
+    const taskBase = await resolveTaskReviewBase(task, launch);
+    if ((resolvedReviewBase !== undefined && taskBase.resolvedBase !== resolvedReviewBase) ||
+      (effectiveBase !== undefined && taskBase.effectiveBase !== effectiveBase)
+    ) throw new Error("Asynchronous native review axes did not use the same review base");
+    resolvedReviewBase = taskBase.resolvedBase;
+    effectiveBase = taskBase.effectiveBase;
+    const canonicalSession = session.canonicalPath;
     if (reviewerSessions.has(canonicalSession) || consumedReviewerSessions.has(canonicalSession)) {
       throw new Error("Asynchronous native review reused a reviewer session");
     }
@@ -947,6 +1078,12 @@ async function retainAsyncNativeReview(
     reviewerSessions.add(canonicalSession);
     consumedReviewerSessions.add(canonicalSession);
     roles.add(role);
+    reviewAxes.push({
+      role,
+      workflowKey: key,
+      taskDigest: createHash("sha256").update(task).digest("hex"),
+      resolvedBase: taskBase.resolvedBase,
+    });
     reviewArtifacts.push({
       role,
       workflowKey: key,
@@ -957,7 +1094,7 @@ async function retainAsyncNativeReview(
       report,
     });
   }
-  if (roles.size !== 2 || !roles.has("standards") || !roles.has("spec")) {
+  if (roles.size !== 2 || !roles.has("standards") || !roles.has("spec") || !resolvedReviewBase || !effectiveBase) {
     throw new Error("Asynchronous native review did not prove distinct Standards and Spec reviewers");
   }
 
@@ -979,6 +1116,14 @@ async function retainAsyncNativeReview(
     completedAt,
     executionReferences: [executionReference],
     workflowReceipt: { reference: receiptPath, digest: createHash("sha256").update(receiptFile.content).digest("hex") },
+    reviewBinding: {
+      launchHead: launch.launchHead,
+      launchCodeStateDigest: launch.codeStateDigest,
+      launchStatusDigest: launch.launchStatusDigest,
+      launchDirty: launch.launchStatusDigest !== EMPTY_SHA256,
+      effectiveBase,
+      axes: reviewAxes,
+    },
     reviewArtifacts,
   })}\n`;
   await atomicWritePrivateFile(sourcePath, source);
@@ -989,6 +1134,122 @@ async function retainAsyncNativeReview(
     executionReference,
     sourceArtifact: { reference: sourcePath, digest: createHash("sha256").update(source).digest("hex") },
   });
+}
+
+function parseFreshReviewerTask(session: string, launch: AsyncReviewLaunch): string {
+  const lines = session.split("\n").filter((line): boolean => line.length > 0);
+  if (lines.length < 2 || lines.length > 100_000) throw new Error("Reviewer session JSONL was incomplete or exceeded its bound");
+  let header: Record<string, unknown> | undefined;
+  const userMessages: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    let entry: Record<string, unknown> | undefined;
+    try {
+      entry = objectRecord(JSON.parse(lines[index]!));
+    } catch {
+      throw new Error("Reviewer session JSONL was malformed");
+    }
+    if (!entry) throw new Error("Reviewer session JSONL entry was malformed");
+    if (index === 0) {
+      header = entry;
+      continue;
+    }
+    if (entry.type !== "message") continue;
+    const message = objectRecord(entry.message);
+    if (message?.role !== "user") continue;
+    const content = message.content;
+    if (typeof content === "string") {
+      userMessages.push(content);
+      continue;
+    }
+    if (!Array.isArray(content)) throw new Error("Reviewer user task content was malformed");
+    const text = content.map((part): string => {
+      const block = objectRecord(part);
+      if (!block || block.type !== "text" || typeof block.text !== "string") {
+        throw new Error("Reviewer user task contained unsupported content");
+      }
+      return block.text;
+    }).join("");
+    userMessages.push(text);
+  }
+  if (!header || header.type !== "session" || header.version !== 3 || header.cwd !== launch.cwd ||
+    typeof header.id !== "string" || !/^[A-Za-z0-9-]{16,128}$/.test(header.id) ||
+    typeof header.timestamp !== "string" || !Number.isFinite(Date.parse(header.timestamp)) ||
+    Date.parse(header.timestamp) < launch.launchedAt || Object.hasOwn(header, "parentSession")
+  ) throw new Error("Reviewer session metadata did not prove a fresh launch in the candidate worktree");
+  const taskMessages = userMessages.filter((message): boolean => message.startsWith("Task: "));
+  if (userMessages[0] !== taskMessages[0] || taskMessages.length !== 1 || taskMessages[0]!.length > 128 * 1024) {
+    throw new Error("Reviewer session did not retain exactly one initial child task");
+  }
+  return taskMessages[0]!.slice("Task: ".length);
+}
+
+function reviewRoleFromTask(task: string): "standards" | "spec" | undefined {
+  const standards = /(?:\bdocumented\s+standards?\b|\bcoding\s+standards?\b|CODING_STANDARDS)/i.test(task) &&
+    /\b(?:code\s+smells?|smell\s+baseline)\b/i.test(task);
+  const spec = /(?:\b(?:missing|partial(?:ly implemented)?)\b.{0,60}\brequirements?\b|\brequirements?\b.{0,60}\b(?:missing|partial(?:ly implemented)?)\b)/is.test(task) &&
+    /\bscope[ -]creep\b/i.test(task);
+  return standards === spec ? undefined : standards ? "standards" : "spec";
+}
+
+async function resolveTaskReviewBase(
+  task: string,
+  launch: AsyncReviewLaunch,
+): Promise<{ resolvedBase: string; effectiveBase: string }> {
+  const diffMentions = [...task.matchAll(/\bgit[ \t]+diff\b/gi)];
+  const scopes = [...task.matchAll(/\bgit[ \t]+diff[ \t]+([^\s`'";&|<>$()]+)\.\.\.HEAD\b/gi)];
+  if (diffMentions.length !== 1 || scopes.length !== 1) {
+    throw new Error("Reviewer child task did not contain exactly one supported git diff <base>...HEAD scope");
+  }
+  if (launch.launchStatusDigest !== EMPTY_SHA256 && !taskCoversDirtyLaunch(task)) {
+    throw new Error("Reviewer child task omitted staged, unstaged, or untracked launch content");
+  }
+  const baseExpression = scopes[0]![1]!;
+  const resolvedBase = await resolveLaunchRef(baseExpression, launch);
+  const effectiveBase = await gitCommitOutput(launch.cwd, ["merge-base", resolvedBase, launch.launchHead]);
+  return { resolvedBase, effectiveBase };
+}
+
+function taskCoversDirtyLaunch(task: string): boolean {
+  return /\ball\b/i.test(task) && /\bstaged\b/i.test(task) && /\bunstaged\b/i.test(task) &&
+    /\buntracked\b/i.test(task) && /\b(?:working[ -]?tree|worktree)\b/i.test(task) &&
+    /\b(?:content|state|changes?)\b/i.test(task);
+}
+
+async function resolveLaunchRef(expression: string, launch: AsyncReviewLaunch): Promise<string> {
+  if (/^[a-f0-9]{40}$/i.test(expression)) return gitResolveCommit(launch.cwd, expression.toLowerCase());
+  if (/^HEAD(?:(?:~[0-9]{1,6})|(?:\^[0-9]{0,6}))*$/.test(expression)) {
+    return gitResolveCommit(launch.cwd, `${launch.launchHead}${expression.slice(4)}`);
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$/.test(expression) || expression.includes("..") ||
+    expression.includes("//") || expression.endsWith("/")
+  ) throw new Error("Reviewer child task used an unsupported review base expression");
+  const matches = launch.launchRefs.filter((ref): boolean => refAliases(ref.name).includes(expression));
+  if (matches.length !== 1) throw new Error("Reviewer child task review base was absent or ambiguous in the launch ref snapshot");
+  return gitResolveCommit(launch.cwd, matches[0]!.objectId);
+}
+
+function refAliases(name: string): string[] {
+  if (name === "HEAD") return [];
+  const aliases = [name];
+  for (const prefix of ["refs/heads/", "refs/tags/", "refs/remotes/"] as const) {
+    if (name.startsWith(prefix)) aliases.push(name.slice(prefix.length));
+  }
+  return aliases;
+}
+
+async function gitResolveCommit(cwd: string, value: string): Promise<string> {
+  return gitCommitOutput(cwd, ["rev-parse", "--verify", `${value}^{commit}`]);
+}
+
+async function gitCommitOutput(cwd: string, args: string[]): Promise<string> {
+  const { stdout } = await executeFile("git", args, {
+    cwd,
+    encoding: "utf8",
+    maxBuffer: MAX_GIT_BINDING_OUTPUT_BYTES,
+  });
+  const output = stdout.trim();
+  if (!/^[a-f0-9]{40}$/i.test(output)) throw new Error("Git review base did not resolve to one commit");
+  return output.toLowerCase();
 }
 
 function isCompleteWorkflowChildren(value: Record<string, unknown> | undefined, launch: AsyncReviewLaunch): boolean {
@@ -1003,12 +1264,6 @@ function isCompleteWorkflowChildren(value: Record<string, unknown> | undefined, 
     ids.add(child.childId);
     return typeof child.runId === "string" && Boolean(child.runId) && child.agent === "reviewer";
   });
-}
-
-function reviewRole(value: string): "standards" | "spec" | undefined {
-  const standards = /\bstandards?\b/i.test(value);
-  const spec = /\b(?:spec|specification|requirements?)\b/i.test(value);
-  return standards === spec ? undefined : standards ? "standards" : "spec";
 }
 
 function parseJsonRecord(input: { content: string }): Record<string, unknown> | undefined {
@@ -1066,11 +1321,6 @@ async function assertCanonicalDirectory(path: string, trustedRoot: string): Prom
     await file.close();
   }
   return canonicalPath;
-}
-
-async function assertCanonicalRegularFile(path: string, trustedRoots: string[]): Promise<string> {
-  const result = await readCanonicalBoundedFile(path, trustedRoots, 16 * 1024 * 1024, false);
-  return result.canonicalPath;
 }
 
 async function readCanonicalBoundedFile(
