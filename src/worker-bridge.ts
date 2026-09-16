@@ -21,6 +21,14 @@ import { atomicWritePrivateFile } from "./atomic-file.js";
 import type { CapturedModel, NativeEvidenceRecord, ThinkingLevel } from "./contracts.js";
 import { RealGitWorktreeAdapter } from "./git-worktrees.js";
 import {
+  NATIVE_EVIDENCE_STATE_ENTRY,
+  NATIVE_EVIDENCE_STATE_FILE,
+  isNativeEvidenceState,
+  type NativeEvidenceObligation,
+  type NativeEvidenceProofState,
+  type NativeEvidenceState,
+} from "./native-evidence-state.js";
+import {
   WORKER_BRIDGE_AGENT_ENV,
   WORKER_BRIDGE_ENDPOINT_ENV,
   WORKER_BRIDGE_NONCE_ENV,
@@ -61,13 +69,7 @@ const DECISION_SCHEMA = Type.Object({
   recommendation: Type.String({ minLength: 1, maxLength: 4_000 }),
 });
 type DecisionInput = Static<typeof DECISION_SCHEMA>;
-interface NativeExecutionProof {
-  kind: "tests" | "reviews";
-  codeStateDigest: string;
-  completedAt: string;
-  executionReference: string;
-  sourceArtifact?: { reference: string; digest: string };
-}
+type NativeExecutionProof = NativeEvidenceProofState;
 interface LaunchRefSnapshot {
   name: string;
   objectId: string;
@@ -93,8 +95,12 @@ interface AsyncReviewLaunch extends PendingSubagentLaunch {
   mode: "workflow";
   asyncDir: string;
 }
-type NativeEvidenceObligation = "tests" | "reviews";
-type TerminalNativeEvidenceFailureKind = "execution-failed" | "review-rejected" | "capture-failed" | "revocation-failed";
+type TerminalNativeEvidenceFailureKind =
+  | "execution-failed"
+  | "review-rejected"
+  | "capture-failed"
+  | "revocation-failed"
+  | "persistence-failed";
 interface TerminalNativeEvidenceFailure {
   kind: TerminalNativeEvidenceFailureKind;
   obligation: NativeEvidenceObligation;
@@ -118,6 +124,8 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
   const terminalNativeEvidenceFailures = new Map<string, TerminalNativeEvidenceFailure>();
   const nativeExecutions = new Map<string, NativeExecutionProof>();
   const latestObligationSequence: Record<NativeEvidenceObligation, number> = { tests: 0, reviews: 0 };
+  let nativeEvidenceState: NativeEvidenceState | undefined;
+  let stateWriteQueue: Promise<void> = Promise.resolve();
   let nativeEvidenceSequence = 0;
   let failedBashCommand = false;
   let mutationToolUsed = false;
@@ -150,10 +158,57 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
       sequence,
     });
   };
-  const beginObligationAttempt = (obligation: NativeEvidenceObligation, sequence: number): boolean => {
+  const writeNativeEvidenceState = async (next: NativeEvidenceState): Promise<void> => {
+    pi.appendEntry(NATIVE_EVIDENCE_STATE_ENTRY, structuredClone(next));
+    const statePath = nativeEvidenceStatePath();
+    await mkdir(dirname(statePath), { recursive: true, mode: 0o700 });
+    await atomicWritePrivateFile(statePath, `${JSON.stringify(next)}\n`);
+    nativeEvidenceState = structuredClone(next);
+  };
+  const enqueueStateWrite = async <T>(operation: () => Promise<T>): Promise<T> => {
+    const result = stateWriteQueue.then(operation);
+    stateWriteQueue = result.then((): void => {}, (): void => {});
+    return result;
+  };
+  const persistNativeEvidenceState = (next: NativeEvidenceState): Promise<void> =>
+    enqueueStateWrite((): Promise<void> => writeNativeEvidenceState(next));
+  const transitionObligation = (
+    obligation: NativeEvidenceObligation,
+    sequence: number,
+    status: "pending" | "passed",
+    proof?: NativeExecutionProof,
+  ): Promise<boolean> => enqueueStateWrite(async (): Promise<boolean> => {
+    if (!nativeEvidenceState || sequence < nativeEvidenceState.obligations[obligation].sequence) return false;
+    const next = structuredClone(nativeEvidenceState);
+    next.obligations[obligation] = status === "passed" && proof
+      ? { sequence, status, proof: structuredClone(proof) }
+      : { sequence, status: "pending" };
+    try {
+      await writeNativeEvidenceState(next);
+    } catch (error) {
+      if (status === "passed") {
+        const blocked = structuredClone(next);
+        blocked.obligations[obligation] = { sequence, status: "pending" };
+        nativeEvidenceState = blocked;
+        try {
+          pi.appendEntry(NATIVE_EVIDENCE_STATE_ENTRY, structuredClone(blocked));
+        } catch {
+          // The in-memory pending state still blocks publication for the rest of this process.
+        }
+      }
+      throw error;
+    }
+    return true;
+  });
+  const beginObligationAttempt = async (obligation: NativeEvidenceObligation, sequence: number): Promise<boolean> => {
     if (sequence < latestObligationSequence[obligation]) return false;
     latestObligationSequence[obligation] = sequence;
-    return true;
+    try {
+      return await transitionObligation(obligation, sequence, "pending");
+    } catch (error) {
+      recordTerminalEvidenceFailure(`${obligation}-${sequence}`, "persistence-failed", obligation, sequence, error);
+      return false;
+    }
   };
   const isCurrentObligationAttempt = (obligation: NativeEvidenceObligation, sequence: number): boolean =>
     sequence === latestObligationSequence[obligation];
@@ -192,17 +247,30 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     if (!isCurrentObligationAttempt(obligation, sequence) ||
       !await invalidateObservedEvidence(toolCallId, obligation, cwd, sequence)) return;
     try {
-      await retainNativeExecution(nativeExecutions, toolCallId, obligation, cwd, sessionId, detail);
-      if (!isCurrentObligationAttempt(obligation, sequence)) {
-        nativeExecutions.delete(toolCallId);
-        return;
-      }
-      clearRecoveredEvidenceFailures(obligation, sequence);
+      await retainNativeExecution(nativeExecutions, toolCallId, obligation, cwd, sessionId, detail, sequence);
     } catch (error) {
+      nativeExecutions.delete(toolCallId);
       if (isCurrentObligationAttempt(obligation, sequence)) {
         recordTerminalEvidenceFailure(toolCallId, "capture-failed", obligation, sequence, error);
       }
+      return;
     }
+    const proof = nativeExecutions.get(toolCallId);
+    if (!proof || !isCurrentObligationAttempt(obligation, sequence)) {
+      nativeExecutions.delete(toolCallId);
+      return;
+    }
+    try {
+      if (!await transitionObligation(obligation, sequence, "passed", proof)) {
+        nativeExecutions.delete(toolCallId);
+        return;
+      }
+    } catch (error) {
+      nativeExecutions.delete(toolCallId);
+      recordTerminalEvidenceFailure(toolCallId, "persistence-failed", obligation, sequence, error);
+      return;
+    }
+    clearRecoveredEvidenceFailures(obligation, sequence);
   };
   const consumeAsyncReviewCompletion = (runId: string, payload: unknown): void => {
     const launch = asyncReviewLaunches.get(runId);
@@ -214,11 +282,6 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
       if (!isCurrentObligationAttempt("reviews", launch.sequence)) return;
       try {
         await retainAsyncNativeReview(nativeExecutions, consumedReviewerSessions, launch, payload);
-        if (!isCurrentObligationAttempt("reviews", launch.sequence)) {
-          nativeExecutions.delete(launch.toolCallId);
-          return;
-        }
-        clearRecoveredEvidenceFailures("reviews", launch.sequence);
       } catch (error) {
         nativeExecutions.delete(launch.toolCallId);
         if (!isCurrentObligationAttempt("reviews", launch.sequence)) return;
@@ -234,7 +297,24 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
             recordTerminalEvidenceFailure(runId, kind, "reviews", launch.sequence, reason);
           }
         }
+        return;
       }
+      const proof = nativeExecutions.get(launch.toolCallId);
+      if (!proof || !isCurrentObligationAttempt("reviews", launch.sequence)) {
+        nativeExecutions.delete(launch.toolCallId);
+        return;
+      }
+      try {
+        if (!await transitionObligation("reviews", launch.sequence, "passed", proof)) {
+          nativeExecutions.delete(launch.toolCallId);
+          return;
+        }
+      } catch (error) {
+        nativeExecutions.delete(launch.toolCallId);
+        recordTerminalEvidenceFailure(runId, "persistence-failed", "reviews", launch.sequence, error);
+        return;
+      }
+      clearRecoveredEvidenceFailures("reviews", launch.sequence);
     })().catch((error: unknown): void => {
       // This terminal guard must never reject: lifecycle remains fail-closed until a newer valid review proves capture recovered.
       nativeExecutions.delete(launch.toolCallId);
@@ -261,7 +341,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     }
     consumeAsyncReviewCompletion(id, payload);
   });
-  pi.on("session_start", (event, _ctx): void => {
+  pi.on("session_start", async (event, ctx): Promise<void> => {
     sessionStartReason = event.reason;
     activeTools.clear();
     activeSubagentRuns.clear();
@@ -272,14 +352,61 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     consumedReviewerSessions.clear();
     activeAsyncReviewCaptures.clear();
     terminalNativeEvidenceFailures.clear();
+    nativeExecutions.clear();
     latestObligationSequence.tests = 0;
     latestObligationSequence.reviews = 0;
+    nativeEvidenceState = undefined;
     nativeEvidenceSequence = 0;
     observedCommandDigests.length = 0;
     nativeTestDiagnostics.length = 0;
     failedBashCommand = false;
     mutationToolUsed = false;
     isAgentRunning = false;
+    try {
+      const sessionId = ctx.sessionManager.getSessionId();
+      let restored: NativeEvidenceState | undefined;
+      for (const entry of ctx.sessionManager.getBranch()) {
+        if (entry.type !== "custom" || entry.customType !== NATIVE_EVIDENCE_STATE_ENTRY) continue;
+        if (!isNativeEvidenceState(entry.data)) throw new Error("Persisted native evidence obligation state is malformed");
+        if (entry.data.sessionId === sessionId) restored = structuredClone(entry.data);
+      }
+      if (restored) {
+        const statePath = nativeEvidenceStatePath();
+        await mkdir(dirname(statePath), { recursive: true, mode: 0o700 });
+        await atomicWritePrivateFile(statePath, `${JSON.stringify(restored)}\n`);
+        nativeEvidenceState = restored;
+      } else {
+        await persistNativeEvidenceState({
+          schemaVersion: 1,
+          producer: "herdr-worker-bridge",
+          sessionId,
+          generation: randomUUID(),
+          obligations: {
+            tests: { sequence: 0, status: "required" },
+            reviews: { sequence: 0, status: "required" },
+          },
+        });
+      }
+      for (const obligation of ["tests", "reviews"] as const) {
+        const state = nativeEvidenceState!.obligations[obligation];
+        latestObligationSequence[obligation] = state.sequence;
+        nativeEvidenceSequence = Math.max(nativeEvidenceSequence, state.sequence);
+        if (state.status === "passed") {
+          nativeExecutions.set(`restored:${obligation}:${state.sequence}`, structuredClone(state.proof!));
+        } else if (state.status === "pending") {
+          recordTerminalEvidenceFailure(
+            `restored-${obligation}-${state.sequence}`,
+            "execution-failed",
+            obligation,
+            state.sequence,
+            `The persisted ${obligation} obligation has no newer valid proof`,
+          );
+        }
+      }
+    } catch (error) {
+      recordTerminalEvidenceFailure("restore-tests", "persistence-failed", "tests", 0, error);
+      recordTerminalEvidenceFailure("restore-reviews", "persistence-failed", "reviews", 0, error);
+    }
   });
   pi.on("agent_start", async (_event, ctx): Promise<void> => {
     isAgentRunning = true;
@@ -330,7 +457,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     const testCommand = classifyNativeTestCommand(command);
     if (testCommand.status === "supported") {
       const sequence = ++nativeEvidenceSequence;
-      beginObligationAttempt("tests", sequence);
+      if (!await beginObligationAttempt("tests", sequence)) return;
       if (!event.isError) {
         await retainFreshNativeExecution(
           event.toolCallId,
@@ -361,7 +488,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     const reviewSequence = pendingLaunch?.sequence ??
       (event.toolName === "subagent" ? ++nativeEvidenceSequence : nativeEvidenceSequence);
     if (event.toolName === "subagent" && event.isError && pendingLaunch && looksLikeAnyReviewRequest(pendingLaunch.args)) {
-      if (beginObligationAttempt("reviews", reviewSequence)) {
+      if (await beginObligationAttempt("reviews", reviewSequence)) {
         recordTerminalEvidenceFailure(
           event.toolCallId,
           "review-rejected",
@@ -375,7 +502,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     if (event.toolName === "subagent" && !event.isError) {
       const asyncResult = parseAsyncLaunchResult(event.result);
       if (pendingLaunch && looksLikeReviewRequest(pendingLaunch.args) && (asyncResult || isAsyncLaunchLike(event.result))) {
-        if (beginObligationAttempt("reviews", reviewSequence)) {
+        if (await beginObligationAttempt("reviews", reviewSequence)) {
           await invalidateObservedEvidence(event.toolCallId, "reviews", ctx.cwd, reviewSequence);
           if (asyncResult && await isBoundAsyncReviewLaunch(pendingLaunch, asyncResult)) {
             activeSubagentRuns.add(asyncResult.runId);
@@ -399,7 +526,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
         }
       } else {
         const reviewResult = classifyNativeReviewResult(event.result);
-        if (reviewResult === "passed" && beginObligationAttempt("reviews", reviewSequence)) {
+        if (reviewResult === "passed" && await beginObligationAttempt("reviews", reviewSequence)) {
           await retainFreshNativeExecution(
             event.toolCallId,
             "reviews",
@@ -408,7 +535,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
             "subagent:structured-acceptance:no-blockers",
             reviewSequence,
           );
-        } else if (reviewResult === "blocked" && beginObligationAttempt("reviews", reviewSequence)) {
+        } else if (reviewResult === "blocked" && await beginObligationAttempt("reviews", reviewSequence)) {
           recordTerminalEvidenceFailure(
             event.toolCallId,
             "review-rejected",
@@ -431,7 +558,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
     jobs.push(...await reconcileSubagentWork(pi, activeSubagentRuns));
     if (jobs.length === 0) {
       try {
-        await produceNativeEvidence(nativeExecutions, nativeTestDiagnostics, ctx, false);
+        await produceNativeEvidence(nativeExecutions, nativeTestDiagnostics, nativeEvidenceState, ctx, false);
       } catch {
         jobs.push("native-evidence-capture-failed: the worker could not persist its execution-backed evidence index");
       }
@@ -463,7 +590,7 @@ export default function herdrWorkerBridge(pi: ExtensionAPI): void {
       _onUpdate: AgentToolUpdateCallback<unknown> | undefined,
       ctx: ExtensionContext,
     ): Promise<AgentToolResult<unknown>> {
-      const produced = await produceNativeEvidence(nativeExecutions, nativeTestDiagnostics, ctx, true);
+      const produced = await produceNativeEvidence(nativeExecutions, nativeTestDiagnostics, nativeEvidenceState, ctx, true);
       const nativeEvidence = produced!.nativeEvidence;
       return {
         content: [{ type: "text", text: `Captured immutable native evidence from observed executions:\n${JSON.stringify(nativeEvidence, null, 2)}` }],
@@ -740,19 +867,29 @@ function classifyNativeTestCommand(command: string): NativeTestCommandClassifica
 async function produceNativeEvidence(
   executions: Map<string, NativeExecutionProof>,
   testDiagnostics: string[],
+  state: NativeEvidenceState | undefined,
   ctx: ExtensionContext,
   required: boolean,
 ): Promise<{ codeStateDigest: string; nativeEvidence: NativeEvidenceRecord[] } | undefined> {
   if (!required && (![...executions.values()].some((proof): boolean => proof.kind === "tests") ||
     ![...executions.values()].some((proof): boolean => proof.kind === "reviews"))) return undefined;
+  if (!state || state.sessionId !== ctx.sessionManager.getSessionId()) {
+    if (!required) return undefined;
+    throw new Error("Native evidence obligation state is unavailable or belongs to another session");
+  }
   const git = new RealGitWorktreeAdapter();
   const candidate = await git.captureCandidate({
     path: ctx.cwd,
     sourceBase: (await git.inspectWorktree(ctx.cwd)).head,
   });
-  const selected = (["tests", "reviews"] as const).map((kind) =>
-    [...executions.entries()].reverse().find(([, proof]): boolean =>
-      proof.kind === kind && proof.codeStateDigest === candidate.codeStateDigest));
+  const selected = (["tests", "reviews"] as const).map((kind) => {
+    const obligation = state.obligations[kind];
+    return obligation.status === "passed"
+      ? [...executions.entries()].reverse().find(([, proof]): boolean =>
+        proof.kind === kind && proof.sequence === obligation.sequence &&
+        proof.codeStateDigest === candidate.codeStateDigest)
+      : undefined;
+  });
   if (selected.some((proof): boolean => proof === undefined)) {
     if (!required) return undefined;
     const testDiagnostic = selected[0] === undefined ? testDiagnostics.at(-1) : undefined;
@@ -784,12 +921,19 @@ async function produceNativeEvidence(
     }
     const manifestPath = join(evidenceDirectory, `${proof.kind}-${id}-receipt.json`);
     const manifest = `${JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 2,
       kind: proof.kind,
       status: "passed",
       codeStateDigest: candidate.codeStateDigest,
       completedAt,
       artifacts: [sourceArtifact],
+      lifecycle: {
+        reference: nativeEvidenceStatePath(),
+        sessionId: state.sessionId,
+        generation: state.generation,
+        obligation: proof.kind,
+        sequence: proof.sequence,
+      },
     })}\n`;
     await atomicWritePrivateFile(manifestPath, manifest);
     nativeEvidence.push({
@@ -818,6 +962,7 @@ async function retainNativeExecution(
   cwd: string,
   sessionId: string,
   detail: string,
+  sequence: number,
 ): Promise<void> {
   const codeStateDigest = await captureCodeStateDigest(cwd);
   executions.set(toolCallId, {
@@ -825,6 +970,7 @@ async function retainNativeExecution(
     codeStateDigest,
     completedAt: new Date().toISOString(),
     executionReference: `pi-session:${sessionId}:tool:${toolCallId}:${detail}`,
+    sequence,
   });
 }
 
@@ -838,6 +984,12 @@ async function invalidateNativeExecutions(
     if (proof.kind === kind && proof.codeStateDigest === codeStateDigest) executions.delete(toolCallId);
   }
   await revokePublishedNativeEvidence();
+}
+
+function nativeEvidenceStatePath(): string {
+  const endpoint = process.env[WORKER_BRIDGE_ENDPOINT_ENV];
+  if (!endpoint || !isAbsolute(endpoint)) throw new Error("Attempt-bound worker bridge endpoint is unavailable");
+  return join(dirname(endpoint), NATIVE_EVIDENCE_STATE_FILE);
 }
 
 async function revokePublishedNativeEvidence(): Promise<void> {
@@ -1208,6 +1360,7 @@ async function retainAsyncNativeReview(
     codeStateDigest: launch.codeStateDigest,
     completedAt,
     executionReference,
+    sequence: launch.sequence,
     sourceArtifact: { reference: sourcePath, digest: createHash("sha256").update(source).digest("hex") },
   });
 }

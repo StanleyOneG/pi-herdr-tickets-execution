@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -32,6 +32,7 @@ import {
 import { LocalGateCheckAdapter } from "../src/gate-checks.js";
 import { RealGitWorktreeAdapter } from "../src/git-worktrees.js";
 import { FileNativeEvidenceAdapter } from "../src/native-evidence.js";
+import { NATIVE_EVIDENCE_STATE_FILE } from "../src/native-evidence-state.js";
 import { LocalControllerDaemon, UnixControllerClient } from "../src/local-daemon.js";
 import { digest } from "../src/policy.js";
 import { formatPreparationPreview } from "../src/presentation.js";
@@ -196,9 +197,13 @@ async function running(
 }
 
 function nativeEvidence(receipt: CandidateReceipt): NativeEvidenceRecord[] {
-  const directory = mkdtempSync(join(tmpdir(), "herdr-native-evidence-"));
-  evidenceRoots.add(directory);
-  return (["tests", "reviews"] as const).map((kind, index): NativeEvidenceRecord => {
+  const root = mkdtempSync(join(tmpdir(), "herdr-native-evidence-"));
+  evidenceRoots.add(root);
+  const directory = join(root, "native-evidence");
+  mkdirSync(directory, { mode: 0o700 });
+  const generation = "00000000-0000-4000-8000-000000000001";
+  const proofs = new Map<"tests" | "reviews", Record<string, unknown>>();
+  const records = (["tests", "reviews"] as const).map((kind, index): NativeEvidenceRecord => {
     const completedAt = `2026-10-01T14:3${index}:00.000Z`;
     const retainedReference = join(directory, `${kind}.json`);
     const retainedArtifact = `${JSON.stringify({
@@ -211,16 +216,33 @@ function nativeEvidence(receipt: CandidateReceipt): NativeEvidenceRecord[] {
       executionReferences: [receipt.sessionFile],
     })}\n`;
     writeFileSync(retainedReference, retainedArtifact, { mode: 0o600 });
+    const sequence = index + 1;
+    const proof = {
+      kind,
+      codeStateDigest: receipt.candidate.codeStateDigest,
+      completedAt,
+      executionReference: receipt.sessionFile,
+      sequence,
+      sourceArtifact: {
+        reference: retainedReference,
+        digest: createHash("sha256").update(retainedArtifact).digest("hex"),
+      },
+    };
+    proofs.set(kind, proof);
     const artifact = `${JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 2,
       kind,
       status: "passed",
       codeStateDigest: receipt.candidate.codeStateDigest,
       completedAt,
-      artifacts: [{
-        reference: retainedReference,
-        digest: createHash("sha256").update(retainedArtifact).digest("hex"),
-      }],
+      artifacts: [proof.sourceArtifact],
+      lifecycle: {
+        reference: join(root, NATIVE_EVIDENCE_STATE_FILE),
+        sessionId: receipt.sessionId,
+        generation,
+        obligation: kind,
+        sequence,
+      },
     })}\n`;
     const evidenceReference = join(directory, `${kind}-manifest.json`);
     writeFileSync(evidenceReference, artifact, { mode: 0o600 });
@@ -233,6 +255,17 @@ function nativeEvidence(receipt: CandidateReceipt): NativeEvidenceRecord[] {
       completedAt,
     };
   });
+  writeFileSync(join(root, NATIVE_EVIDENCE_STATE_FILE), `${JSON.stringify({
+    schemaVersion: 1,
+    producer: "herdr-worker-bridge",
+    sessionId: receipt.sessionId,
+    generation,
+    obligations: {
+      tests: { sequence: 1, status: "passed", proof: proofs.get("tests") },
+      reviews: { sequence: 2, status: "passed", proof: proofs.get("reviews") },
+    },
+  })}\n`, { mode: 0o600 });
+  return records;
 }
 
 test("candidate capture denies a caller without capability before receipt, Git, or lifecycle mutation", async (): Promise<void> => {

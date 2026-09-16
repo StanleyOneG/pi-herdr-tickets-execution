@@ -36,6 +36,7 @@ import { registerHerdrExtension } from "../src/extension.js";
 import { FileWorkerBridgeTransport } from "../src/file-worker-bridge.js";
 import { LocalControllerDaemon, UnixControllerClient } from "../src/local-daemon.js";
 import { FileNativeEvidenceAdapter } from "../src/native-evidence.js";
+import { NATIVE_EVIDENCE_STATE_FILE } from "../src/native-evidence-state.js";
 import { digest } from "../src/policy.js";
 import type {
   WorkerBridgeChannel,
@@ -1601,6 +1602,7 @@ test("ordinary implementation tool events produce candidate-bound native test an
   const hostHandlers = new Map<string, (event: any, ctx: any) => unknown>();
   const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
   const eventHandlers = new Map<string, Array<(payload: unknown) => void>>();
+  const sessionEntries: Array<{ type: "custom"; customType: string; data: unknown }> = [];
   const events = {
     on(name: string, handler: (payload: unknown) => void): () => void {
       const handlers = eventHandlers.get(name) ?? [];
@@ -1634,17 +1636,25 @@ test("ordinary implementation tool events produce candidate-bound native test an
     on(name: string, handler: (event: any, ctx: any) => unknown): void { hostHandlers.set(name, handler); },
     registerCommand(): void {},
     registerTool(tool: { name: string; execute: (...args: any[]) => Promise<any> }): void { tools.set(tool.name, tool); },
+    appendEntry(customType: string, data: unknown): void {
+      sessionEntries.push({ type: "custom", customType, data: structuredClone(data) });
+    },
     getAllTools: (): Array<{ name: string }> => [{ name: "subagent" }],
   } as unknown as ExtensionAPI;
   const context = {
     cwd: workerRoot,
-    sessionManager: { getSessionId: (): string => running.attempt.worker!.sessionId },
+    sessionManager: {
+      getSessionId: (): string => running.attempt.worker!.sessionId,
+      getSessionFile: (): string => running.attempt.worker!.sessionFile,
+      getBranch: (): typeof sessionEntries => sessionEntries,
+    },
     hasPendingMessages: (): boolean => false,
   };
   const evidenceDirectory = join(bridgeDirectory, "native-evidence");
   let evidencePermissionsRestricted = false;
   try {
     herdrWorkerBridge(fakePi);
+    await hostHandlers.get("session_start")!({ reason: "startup" }, context);
     assert.ok(tools.has("herdr_capture_native_evidence"));
     await hostHandlers.get("tool_execution_start")!({ toolCallId: "review-call", toolName: "subagent", args: { task: "Review the implementation" } }, context);
     await hostHandlers.get("tool_execution_end")!({
@@ -1893,6 +1903,11 @@ test("ordinary implementation tool events produce candidate-bound native test an
     const failedTestRerunLifecycle = JSON.parse(await readFile(lifecyclePath, "utf8")) as WorkerLifecycleReceipt;
     assert.ok(failedTestRerunLifecycle.outstandingJobs.some((job): boolean =>
       job.includes("failed-test-rerun:execution-failed")));
+    await hostHandlers.get("session_start")!({ reason: "reload" }, context);
+    await hostHandlers.get("agent_settled")!({}, context);
+    const reloadedFailureLifecycle = JSON.parse(await readFile(lifecyclePath, "utf8")) as WorkerLifecycleReceipt;
+    assert.ok(reloadedFailureLifecycle.outstandingJobs.some((job): boolean =>
+      job.includes("restored-tests") && job.includes("execution-failed")));
     await assertPublicAcceptanceBlocked(firstPublishedRecords);
 
     await hostHandlers.get("tool_result")!({
@@ -2004,6 +2019,7 @@ interface AsyncReviewHarness {
   recordPassingTests: () => Promise<void>;
   launchReview: (input: AsyncReviewFixtureInput) => Promise<AsyncReviewFixture>;
   completeAndSettle: (completion: Record<string, unknown>) => Promise<void>;
+  reload: () => Promise<void>;
   settle: () => Promise<void>;
   readLifecycle: () => Promise<{ state?: string; outstandingJobs: string[] }>;
   dispose: () => Promise<void>;
@@ -2025,6 +2041,7 @@ async function createAsyncReviewHarness(options: { configuredDefaultSessionRoot?
   process.env.PI_CODING_AGENT_DIR = piAgentDir;
   const hostHandlers = new Map<string, (event: any, ctx: any) => unknown>();
   const eventHandlers = new Map<string, Array<(payload: unknown) => void>>();
+  const sessionEntries: Array<{ type: "custom"; customType: string; data: unknown }> = [];
   const events = {
     on(name: string, handler: (payload: unknown) => void): () => void {
       const handlers = eventHandlers.get(name) ?? [];
@@ -2061,6 +2078,9 @@ async function createAsyncReviewHarness(options: { configuredDefaultSessionRoot?
     on(name: string, handler: (event: any, ctx: any) => unknown): void { hostHandlers.set(name, handler); },
     registerCommand(): void {},
     registerTool(): void {},
+    appendEntry(customType: string, data: unknown): void {
+      sessionEntries.push({ type: "custom", customType, data: structuredClone(data) });
+    },
     getAllTools: (): Array<{ name: string }> => [{ name: "subagent" }],
   } as unknown as ExtensionAPI;
   const parentSessionFile = join(bridgeDirectory, "parent-session.jsonl");
@@ -2069,6 +2089,7 @@ async function createAsyncReviewHarness(options: { configuredDefaultSessionRoot?
     sessionManager: {
       getSessionId: (): string => "native-session",
       getSessionFile: (): string => parentSessionFile,
+      getBranch: (): typeof sessionEntries => sessionEntries,
     },
     hasPendingMessages: (): boolean => false,
   };
@@ -2247,6 +2268,7 @@ async function createAsyncReviewHarness(options: { configuredDefaultSessionRoot?
   };
 
   herdrWorkerBridge(fakePi);
+  await hostHandlers.get("session_start")!({ reason: "startup" }, context);
 
   const recordPassingTests = async (): Promise<void> => {
     await hostHandlers.get("tool_result")!({
@@ -2292,6 +2314,10 @@ async function createAsyncReviewHarness(options: { configuredDefaultSessionRoot?
     events.emit("subagent:async-complete", completion);
     await settle();
   };
+  const reload = async (): Promise<void> => {
+    await hostHandlers.get("session_start")!({ reason: "reload" }, context);
+    await settle();
+  };
   const readLifecycle = async (): Promise<{ state?: string; outstandingJobs: string[] }> =>
     JSON.parse(await readFile(lifecyclePath, "utf8")) as { state?: string; outstandingJobs: string[] };
   const dispose = async (): Promise<void> => {
@@ -2318,6 +2344,7 @@ async function createAsyncReviewHarness(options: { configuredDefaultSessionRoot?
     recordPassingTests,
     launchReview,
     completeAndSettle,
+    reload,
     settle,
     readLifecycle,
     dispose,
@@ -2581,10 +2608,101 @@ test("a blocking asynchronous review revokes evidence until a same-state review 
   }
 });
 
+test("a blocking review remains durable across reload until newer same-obligation proof recovers", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness();
+  try {
+    await harness.recordPassingTests();
+    const initial = await harness.launchReview({
+      runId: "reload-initial-review-run",
+      toolCallId: "reload-initial-review-tool",
+      completionOwnerId: "reload-initial-review-owner",
+    });
+    await harness.completeAndSettle(initial.completion);
+    const candidate = await asyncReviewCandidate(harness);
+    const cachedRecords = await readAsyncReviewEvidence(harness, candidate);
+
+    const blocking = await harness.launchReview({
+      runId: "reload-blocking-review-run",
+      toolCallId: "reload-blocking-review-tool",
+      completionOwnerId: "reload-blocking-review-owner",
+      blocking: true,
+    });
+    await harness.completeAndSettle(blocking.completion);
+    await harness.reload();
+
+    const cachedReview = cachedRecords.find((record): boolean => record.kind === "reviews")!;
+    await assert.rejects(
+      new FileNativeEvidenceAdapter().verify({ record: cachedReview, candidate }),
+      /stale|lifecycle|obligation/i,
+    );
+
+    const recovery = await harness.launchReview({
+      runId: "reload-review-recovery-run",
+      toolCallId: "reload-review-recovery-tool",
+      completionOwnerId: "reload-review-recovery-owner",
+    });
+    await harness.completeAndSettle(recovery.completion);
+
+    const recoveredRecords = await readAsyncReviewEvidence(harness, candidate);
+    assert.deepEqual(recoveredRecords.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("obligation-state persistence errors reject cached evidence and remain blocked after reload", async (): Promise<void> => {
+  const harness = await createAsyncReviewHarness();
+  const statePath = join(harness.bridgeDirectory, NATIVE_EVIDENCE_STATE_FILE);
+  try {
+    await harness.recordPassingTests();
+    const initial = await harness.launchReview({
+      runId: "persistence-initial-review-run",
+      toolCallId: "persistence-initial-review-tool",
+      completionOwnerId: "persistence-initial-review-owner",
+    });
+    await harness.completeAndSettle(initial.completion);
+    const candidate = await asyncReviewCandidate(harness);
+    const cachedRecords = await readAsyncReviewEvidence(harness, candidate);
+
+    await rm(statePath);
+    await mkdir(statePath);
+    const blocked = await harness.launchReview({
+      runId: "persistence-blocked-review-run",
+      toolCallId: "persistence-blocked-review-tool",
+      completionOwnerId: "persistence-blocked-review-owner",
+    });
+    await harness.completeAndSettle(blocked.completion);
+
+    const lifecycle = await harness.readLifecycle();
+    assert.ok(lifecycle.outstandingJobs.some((job): boolean => job.includes("persistence-failed")));
+    const cachedReview = cachedRecords.find((record): boolean => record.kind === "reviews")!;
+    await assert.rejects(
+      new FileNativeEvidenceAdapter().verify({ record: cachedReview, candidate }),
+      /bounded regular file|obligation state/i,
+    );
+
+    await rm(statePath, { recursive: true });
+    await harness.reload();
+    const reloadedLifecycle = await harness.readLifecycle();
+    assert.ok(reloadedLifecycle.outstandingJobs.some((job): boolean => job.includes("restored-reviews")));
+  } finally {
+    await rm(statePath, { recursive: true, force: true });
+    await harness.dispose();
+  }
+});
+
 test("an older blocking asynchronous completion cannot revoke a newer passing review", async (): Promise<void> => {
   const harness = await createAsyncReviewHarness();
   try {
     await harness.recordPassingTests();
+    const initial = await harness.launchReview({
+      runId: "ordering-initial-review-run",
+      toolCallId: "ordering-initial-review-tool",
+      completionOwnerId: "ordering-initial-review-owner",
+    });
+    await harness.completeAndSettle(initial.completion);
+    const candidate = await asyncReviewCandidate(harness);
+    const cachedRecords = await readAsyncReviewEvidence(harness, candidate);
     const olderBlocking = await harness.launchReview({
       runId: "older-concurrent-blocking-run",
       toolCallId: "older-concurrent-blocking-tool",
@@ -2600,8 +2718,13 @@ test("an older blocking asynchronous completion cannot revoke a newer passing re
     await harness.completeAndSettle(newerPassing.completion);
     await harness.completeAndSettle(olderBlocking.completion);
 
-    const records = await readAsyncReviewEvidence(harness, await asyncReviewCandidate(harness));
+    const records = await readAsyncReviewEvidence(harness, candidate);
     assert.deepEqual(records.map((record): string => record.kind).sort(), ["reviews", "tests"]);
+    const cachedReview = cachedRecords.find((record): boolean => record.kind === "reviews")!;
+    await assert.rejects(
+      new FileNativeEvidenceAdapter().verify({ record: cachedReview, candidate }),
+      /stale|lifecycle|obligation/i,
+    );
   } finally {
     await harness.dispose();
   }
@@ -2638,10 +2761,11 @@ test("an older passing asynchronous completion cannot override a newer direct bl
     }, harness.context);
 
     await harness.completeAndSettle(olderPassing.completion);
+    await harness.reload();
 
     const lifecycle = await harness.readLifecycle();
     assert.ok(lifecycle.outstandingJobs.some((job): boolean =>
-      job.includes("newer-direct-blocking-tool:review-rejected")));
+      job.includes("restored-reviews") && job.includes("execution-failed")));
     await assert.rejects(readAsyncReviewEvidence(harness, await asyncReviewCandidate(harness)), /ENOENT/);
   } finally {
     await harness.dispose();

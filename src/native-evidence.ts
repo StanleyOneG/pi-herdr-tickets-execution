@@ -1,9 +1,15 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
-import { isAbsolute } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 
 import type { CandidateGitState, NativeEvidencePort, NativeEvidenceRecord } from "./contracts.js";
+import {
+  NATIVE_EVIDENCE_STATE_FILE,
+  isNativeEvidenceLifecycleBinding,
+  readNativeEvidenceState,
+  type NativeEvidenceLifecycleBinding,
+} from "./native-evidence-state.js";
 
 const MAX_NATIVE_EVIDENCE_BYTES = 1024 * 1024;
 const EMPTY_SHA256 = createHash("sha256").update(Buffer.alloc(0)).digest("hex");
@@ -39,8 +45,15 @@ export class FileNativeEvidenceAdapter implements NativeEvidencePort {
     const parsed: unknown = JSON.parse(bytes.toString("utf8"));
     if (!isReceipt(parsed) || parsed.kind !== record.kind || parsed.status !== record.status ||
       parsed.codeStateDigest !== candidate.codeStateDigest || parsed.codeStateDigest !== record.codeStateDigest ||
-      parsed.completedAt !== record.completedAt
+      parsed.completedAt !== record.completedAt || parsed.lifecycle.obligation !== record.kind ||
+      parsed.lifecycle.reference !== join(dirname(dirname(record.evidenceReference)), NATIVE_EVIDENCE_STATE_FILE)
     ) throw new Error("Native evidence artifact is malformed, stale, or candidate-mismatched");
+    const lifecycle = await readNativeEvidenceState(parsed.lifecycle.reference);
+    const obligation = lifecycle.obligations[record.kind];
+    if (lifecycle.sessionId !== parsed.lifecycle.sessionId || lifecycle.generation !== parsed.lifecycle.generation ||
+      obligation.sequence !== parsed.lifecycle.sequence || obligation.status !== "passed" ||
+      obligation.proof?.codeStateDigest !== parsed.codeStateDigest || obligation.proof.completedAt !== parsed.completedAt
+    ) throw new Error("Native evidence obligation lifecycle is stale or unresolved");
     for (const artifact of parsed.artifacts) {
       if (!isAbsolute(artifact.reference) || artifact.reference === record.evidenceReference) {
         throw new Error("Native evidence source artifact reference is unsafe");
@@ -64,19 +77,21 @@ function isNativeEvidenceRecord(value: unknown): value is NativeEvidenceRecord {
 }
 
 function isReceipt(value: unknown): value is {
-  schemaVersion: 1;
+  schemaVersion: 2;
   kind: "tests" | "reviews";
   status: "passed";
   codeStateDigest: string;
   completedAt: string;
   artifacts: Array<{ reference: string; digest: string }>;
+  lifecycle: NativeEvidenceLifecycleBinding;
 } {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const receipt = value as Record<string, unknown>;
-  return Object.keys(receipt).length === 6 && receipt.schemaVersion === 1 &&
+  return Object.keys(receipt).length === 7 && receipt.schemaVersion === 2 &&
     (receipt.kind === "tests" || receipt.kind === "reviews") && receipt.status === "passed" &&
     typeof receipt.codeStateDigest === "string" && /^[a-f0-9]{64}$/i.test(receipt.codeStateDigest) &&
     typeof receipt.completedAt === "string" && Number.isFinite(Date.parse(receipt.completedAt)) &&
+    isNativeEvidenceLifecycleBinding(receipt.lifecycle) &&
     Array.isArray(receipt.artifacts) && receipt.artifacts.length > 0 && receipt.artifacts.length <= 20 &&
     receipt.artifacts.every((artifact): boolean => typeof artifact === "object" && artifact !== null &&
       Object.keys(artifact).length === 2 && typeof artifact.reference === "string" && artifact.reference.length <= 4_096 &&
